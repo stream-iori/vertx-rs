@@ -70,6 +70,30 @@ impl<T: Send + 'static> Consumer<T> {
     ///
     /// Returns immediately. If a handler errors, the error is logged and the
     /// loop continues (so one bad message can't kill the subscription).
+    ///
+    /// ## Where to keep state
+    ///
+    /// Pick the *least* powerful tool that works — going further down this
+    /// list trades compile-time guarantees for runtime checks.
+    ///
+    /// 1. **Single handler, owned state** — just `move` it into the closure
+    ///    and use `FnMut`. Zero overhead, fully compile-checked.
+    ///    ```ignore
+    ///    let mut count: u64 = 0;
+    ///    consumer.handler(move |env| {
+    ///        count += 1;
+    ///        async move { env.reply(count) }
+    ///    });
+    ///    ```
+    /// 2. **Multiple handlers sharing a small `Copy` scalar** — `Rc<Cell<T>>`.
+    ///    No borrow guard, no panic possible.
+    /// 3. **Multiple handlers sharing complex state** (`HashMap`, `Vec`, ...)
+    ///    — `Rc<RefCell<T>>`. **Rule:** keep every `borrow()`/`borrow_mut()`
+    ///    scope to a single statement, and never hold a borrow across an
+    ///    `.await`. Violating either invariant turns into a runtime panic
+    ///    (`already borrowed`).
+    /// 4. **Cross-handler coordination that doesn't fit shared state** —
+    ///    route a message through another EventBus address. No shared mutability.
     pub fn handler<F, Fut>(self, handler: F)
     where
         F: FnMut(Envelope<T>) -> Fut + 'static,

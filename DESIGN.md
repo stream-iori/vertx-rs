@@ -273,6 +273,41 @@ impl ReplyHandle {
 
 跨上下文派发不需要任何额外代码 —— `mpsc::Sender` 是 `Send`,publisher 从任意线程 send,receiver 在 Verticle 自己的 EventLoop 上 recv。
 
+### 3.4.2 Handler 状态选型
+
+Vert.x 里 `start()` 注册的 handler 闭包捕获 `this`,所有 handler 共享 verticle 字段——JVM 无借用检查,这是常态。Rust 这边一个 verticle 可能多个 handler 都要可变状态,编译期 `&mut self` 互斥,所以必须做选型。**按力度从弱到强(也是优先级从高到低)选**:
+
+| 场景 | 推荐 | 备注 |
+|---|---|---|
+| 单 handler 独占状态 | `move` + `FnMut`,直接拿可变捕获变量 | 编译期保证,零开销。**首选** |
+| 多 handler 共享 `Copy` 标量 | `Rc<Cell<T>>` | 无 borrow guard,无 panic 风险 |
+| 多 handler 共享复合状态 (`HashMap`/`Vec`) | `Rc<RefCell<T>>` | 单线程 EventLoop 上 borrow 不跨 await 时安全;**borrow scope 越小越好** |
+| 多 handler 需协同但状态可拆 | EventBus 内部地址互发消息 | actor 派系,无共享可变 |
+
+#### `Rc<RefCell<T>>` 的纪律
+
+合理用法存在(图结构、注册中心、跨 handler 共享 cache),但要遵守两条硬规矩:
+
+1. **每个 `borrow()` / `borrow_mut()` 只跨一个语句**,出函数前显式 `drop(guard)` 或用 `{...}` 块限定作用域。
+2. **永远不要跨 `.await` 持有 borrow guard**——`RefMut` 跨 await 不会被编译器拦截(`!Send` 在 `spawn_local` 下合法),但下一个被调度的 handler 一旦 `borrow_mut` 就会 panic。
+
+```rust
+// ✅ 正确:borrow 作用域 = 一个表达式
+let n = {
+    let mut m = counts.borrow_mut();
+    let n = m.entry(key).or_insert(0);
+    *n += 1;
+    *n
+};
+async move { env.reply(n) }.await
+
+// ❌ 错误:borrow 跨 await
+let mut m = counts.borrow_mut();
+m.insert(k, async_compute().await);    // 跨 await,可能 panic
+```
+
+不遵守这两条规矩时,把它当成"程序里埋了一颗运行时炸弹"。Rust 把借用检查推迟到了运行时,失败模式从 cargo build 报错变成了生产 panic。
+
 ### 3.5 Timer 与 Periodic
 
 ```rust

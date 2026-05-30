@@ -687,22 +687,20 @@ async fn builder_overrides() {
 // User Verticle::run just waits for cancellation (or is a no-op start hook).
 // ---------------------------------------------------------------------------
 
-use std::rc::Rc;
-
 struct HandlerPingerV {
     consumer: Consumer<String>,
-    count: Rc<Cell<u64>>,
 }
 
 #[async_trait(?Send)]
 impl Verticle for HandlerPingerV {
     async fn run(self, ctx: Context) -> Result<()> {
-        let count = self.count.clone();
+        // Single-handler state: just `move` the counter into the FnMut.
+        // No Rc, no Cell, no interior mutability — zero overhead, compile-time safe.
+        let mut count: u64 = 0;
         self.consumer.handler(move |env| {
-            let count = count.clone();
+            count += 1;
+            let n = count;
             async move {
-                count.set(count.get() + 1);
-                let n = count.get();
                 env.reply(format!("hpong#{n}"))?;
                 Ok(())
             }
@@ -717,7 +715,6 @@ async fn consumer_handler_dispatches_envelopes() {
     let vx = Vertx::new();
     vx.deploy(|ctx| HandlerPingerV {
         consumer: ctx.event_bus().consumer::<String>("hping").unwrap(),
-        count: Rc::new(Cell::new(0)),
     })
     .await
     .unwrap();
@@ -771,4 +768,71 @@ async fn consumer_handler_unregisters_on_undeploy() {
         .request_with::<_, u64>("hping2", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_millis(100)))
         .await;
     assert!(res.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Reference pattern: when multiple handlers share complex mutable state,
+// `Rc<RefCell<T>>` is the right tool. Discipline: keep borrow scope tiny,
+// never hold a borrow across `.await`.
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+struct StatsV {
+    incr_consumer: Consumer<String>,
+    get_consumer: Consumer<String>,
+    counts: Rc<RefCell<HashMap<String, u64>>>,
+}
+
+#[async_trait(?Send)]
+impl Verticle for StatsV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let counts_incr = self.counts.clone();
+        self.incr_consumer.handler(move |env| {
+            // Borrow scope is exactly one statement — no `.await` between
+            // `borrow_mut()` and drop, so no panic risk.
+            let n = {
+                let mut m = counts_incr.borrow_mut();
+                let n = m.entry(env.body().clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            async move { env.reply(n)?; Ok(()) }
+        });
+
+        let counts_get = self.counts.clone();
+        self.get_consumer.handler(move |env| {
+            let n = counts_get.borrow().get(env.body()).copied().unwrap_or(0);
+            async move { env.reply(n)?; Ok(()) }
+        });
+
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn rc_refcell_shared_state_across_handlers() {
+    let vx = Vertx::new();
+    vx.deploy(|ctx| {
+        let bus = ctx.event_bus();
+        StatsV {
+            incr_consumer: bus.consumer::<String>("stats.incr").unwrap(),
+            get_consumer: bus.consumer::<String>("stats.get").unwrap(),
+            counts: Rc::new(RefCell::new(HashMap::new())),
+        }
+    })
+    .await
+    .unwrap();
+
+    let bus = vx.event_bus();
+    let _: u64 = bus.request("stats.incr", "a".to_string()).await.unwrap();
+    let _: u64 = bus.request("stats.incr", "a".to_string()).await.unwrap();
+    let _: u64 = bus.request("stats.incr", "b".to_string()).await.unwrap();
+    let a: u64 = bus.request("stats.get", "a".to_string()).await.unwrap();
+    let b: u64 = bus.request("stats.get", "b".to_string()).await.unwrap();
+    let c: u64 = bus.request("stats.get", "c".to_string()).await.unwrap();
+    assert_eq!((a, b, c), (2, 1, 0));
 }
