@@ -947,3 +947,133 @@ async fn message_passing_between_handlers() {
     let r3: u64 = bus.request("adder.add", 7u64).await.unwrap();
     assert_eq!((r1, r2, r3), (10, 15, 22));
 }
+
+// ---------------------------------------------------------------------------
+// SharedData escape hatch: Vert.x `Counter` ≈ `Arc<AtomicU64>` for cross-
+// verticle scalar counts. No framework wrapper needed.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicU64;
+
+struct CtrIncrV {
+    consumer: Consumer<u64>,
+    counter: Arc<AtomicU64>,
+}
+#[async_trait(?Send)]
+impl Verticle for CtrIncrV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let c = self.counter.clone();
+        self.consumer.handler(move |env| {
+            let n = c.fetch_add(*env.body(), Ordering::Relaxed) + *env.body();
+            async move { env.reply(n)?; Ok(()) }
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+struct CtrReadV {
+    consumer: Consumer<()>,
+    counter: Arc<AtomicU64>,
+}
+#[async_trait(?Send)]
+impl Verticle for CtrReadV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let c = self.counter.clone();
+        self.consumer.handler(move |env| {
+            let n = c.load(Ordering::Relaxed);
+            async move { env.reply(n)?; Ok(()) }
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn arc_atomic_counter_shared_across_verticles() {
+    let vx = Vertx::new();
+    let counter = Arc::new(AtomicU64::new(0));
+
+    let c1 = counter.clone();
+    vx.deploy(move |ctx| CtrIncrV {
+        consumer: ctx.event_bus().consumer::<u64>("ctr.add").unwrap(),
+        counter: c1,
+    })
+    .await
+    .unwrap();
+
+    let c2 = counter.clone();
+    vx.deploy(move |ctx| CtrReadV {
+        consumer: ctx.event_bus().consumer::<()>("ctr.get").unwrap(),
+        counter: c2,
+    })
+    .await
+    .unwrap();
+
+    let bus = vx.event_bus();
+    let _: u64 = bus.request("ctr.add", 3u64).await.unwrap();
+    let _: u64 = bus.request("ctr.add", 4u64).await.unwrap();
+    let n: u64 = bus.request("ctr.get", ()).await.unwrap();
+    assert_eq!(n, 7);
+}
+
+// ---------------------------------------------------------------------------
+// SharedData escape hatch: Vert.x `LocalMap` (immutable Shareable values)
+// ≈ `Arc<T>` — share a read-only snapshot across verticles.
+// ---------------------------------------------------------------------------
+
+/// Immutable routing table built once at deploy time, shared by reference.
+struct RouteTable {
+    routes: HashMap<String, String>,
+}
+
+struct RouterV {
+    consumer: Consumer<String>,
+    table: Arc<RouteTable>,
+}
+#[async_trait(?Send)]
+impl Verticle for RouterV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let t = self.table.clone();
+        self.consumer.handler(move |env| {
+            // Zero-copy read: just an Arc clone, then map lookup. No EventBus
+            // round-trip for the hot path.
+            let route = t.routes.get(env.body()).cloned().unwrap_or_default();
+            async move { env.reply(route)?; Ok(()) }
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn arc_immutable_snapshot_shared_across_verticles() {
+    let vx = Vertx::new();
+    let table = Arc::new(RouteTable {
+        routes: [("a", "north"), ("b", "south")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    });
+
+    let t1 = table.clone();
+    vx.deploy(move |ctx| RouterV {
+        consumer: ctx.event_bus().consumer::<String>("route.r1").unwrap(),
+        table: t1,
+    })
+    .await
+    .unwrap();
+    let t2 = table.clone();
+    vx.deploy(move |ctx| RouterV {
+        consumer: ctx.event_bus().consumer::<String>("route.r2").unwrap(),
+        table: t2,
+    })
+    .await
+    .unwrap();
+
+    let bus = vx.event_bus();
+    let r1: String = bus.request("route.r1", "a".to_string()).await.unwrap();
+    let r2: String = bus.request("route.r2", "b".to_string()).await.unwrap();
+    let r3: String = bus.request("route.r1", "missing".to_string()).await.unwrap();
+    assert_eq!((r1.as_str(), r2.as_str(), r3.as_str()), ("north", "south", ""));
+}

@@ -308,6 +308,26 @@ m.insert(k, async_compute().await);    // 跨 await,可能 panic
 
 不遵守这两条规矩时,把它当成"程序里埋了一颗运行时炸弹"。Rust 把借用检查推迟到了运行时,失败模式从 cargo build 报错变成了生产 panic。
 
+#### 共享状态的"逃生舱"——对应 Vert.x SharedData
+
+**单一 owner 原则**(state 由一个 verticle/handler 拥有,外部经 EventBus 访问)是默认选择。但少数场景确实需要跨 verticle 共享:极致读热路径、跨 verticle 计数 / 互斥。Vert.x 为此提供 `SharedData`(`LocalMap` / `AsyncMap` / `Counter` / `Lock`)——注意它**故意不提供"共享可变结构"原语**,把"图 / index 这种东西"留给"放进一个 owner verticle"去解决。我们沿用同一立场:
+
+| 需求 | Vert.x SharedData | vertx-rs 推荐 | 备注 |
+|---|---|---|---|
+| 共享只读快照(读热路径,从不变) | `LocalMap` (Shareable) | `Arc<T>` | 标准 Rust 原语,零开销读 |
+| 共享只读快照 + 偶尔整体替换 | 同上 | `arc-swap::ArcSwap<T>` | 读零开销,写换整个 Arc |
+| 跨 verticle 标量计数 | `Counter` | `Arc<AtomicU64>` | 标准库就够,无需框架包装 |
+| 跨 verticle 互斥 | `Lock` | `Arc<tokio::sync::Mutex<()>>` | async 友好,跨 await 安全(`Mutex` guard 是 `Send`) |
+| 跨 verticle 异步 KV / 命名注册 | `AsyncMap` | owner verticle + EventBus 地址 | 本地够用;集群化时再加门面 |
+| 跨 verticle 共享**可变结构** | (Vert.x 不提供) | ⚠️ 反模式 → 改 owner verticle | 跟 Vert.x 立场一致 |
+
+**为什么不实现 `SharedData` 门面**:
+- 上表的 Rust 原语都是 std / tokio 一等公民,框架包一层只是徒增 indirection。
+- Vert.x `SharedData` 的核心价值在**集群化**(同名 `Counter` / `AsyncMap` 跨节点是同一实例);本地版本只是 `ConcurrentHashMap` 的薄包装。
+- 我们现在只跑本地,等真正引入集群再加 `SharedData` 门面——那时门面承载的是"命名注册中心 + 本地 vs 集群实现切换",才有意义。
+
+**`Rc<Cell<T>>` / `Rc<RefCell<T>>` 跟这里的区别**:`Rc` 系列是**单 verticle 内**多 handler 共享;`Arc` 系列是**跨 verticle**(跨线程)共享。两者不可混用。
+
 ### 3.5 Timer 与 Periodic
 
 ```rust
