@@ -1,0 +1,32 @@
+[package]
+name = "vertx-rs"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust + Tokio port of Vert.x core: EventLoop-affine Verticle + WorkerVerticle + EventBus"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "sync", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+dashmap = "6"
+async-trait = "0.1"
+thiserror = "1"
+futures = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "ping_pong"
+path = "examples/ping_pong.rs"
+
+[[example]]
+name = "pipeline"
+path = "examples/pipeline.rs"
+
+[[example]]
+name = "verticle_to_verticle"
+path = "examples/verticle_to_verticle.rs"
