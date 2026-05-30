@@ -4,6 +4,7 @@
 
 mod context;
 mod deployment;
+mod deployment_options;
 mod error;
 mod eventbus;
 mod eventloop;
@@ -15,6 +16,7 @@ mod worker_pool;
 
 pub use context::Context;
 pub use deployment::DeploymentId;
+pub use deployment_options::DeploymentOptions;
 pub use error::{Result, VertxError};
 pub use eventbus::{Consumer, DeliveryOptions, Envelope, EventBus, ReplyHandle};
 pub use eventloop::EventLoopId;

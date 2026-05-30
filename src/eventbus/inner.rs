@@ -55,7 +55,12 @@ impl EventBusInner {
 
     /// Broadcast a clonable message to every subscriber on `address`.
     /// Delivery to each subscriber is best-effort (drop-on-full).
-    pub fn publish<T: Clone + Send + 'static>(&self, address: &str, body: T) -> Result<()> {
+    pub fn publish<T: Clone + Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        headers: HashMap<String, String>,
+    ) -> Result<()> {
         let Some(subs) = self.routes.get(address) else {
             return Ok(()); // publish to non-existent address is silent
         };
@@ -74,7 +79,7 @@ impl EventBusInner {
         for tx in senders {
             let env = ErasedEnvelope {
                 body: Box::new(body.clone()),
-                headers: HashMap::new(),
+                headers: headers.clone(),
                 reply_to: None,
             };
             let _ = tx.try_send(env); // drop-on-full per design
@@ -84,8 +89,13 @@ impl EventBusInner {
 
     /// Async point-to-point. Awaits if the chosen subscriber's queue is full
     /// (cooperative backpressure).
-    pub async fn send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        let (sender, env) = self.prepare_send::<T>(address, body, None)?;
+    pub async fn send<T: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        headers: HashMap<String, String>,
+    ) -> Result<()> {
+        let (sender, env) = self.prepare_send::<T>(address, body, headers, None)?;
         sender
             .send(env)
             .await
@@ -94,8 +104,13 @@ impl EventBusInner {
 
     /// Non-blocking point-to-point. Returns an error if the chosen subscriber's
     /// queue is full or closed.
-    pub fn try_send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        let (sender, env) = self.prepare_send::<T>(address, body, None)?;
+    pub fn try_send<T: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        headers: HashMap<String, String>,
+    ) -> Result<()> {
+        let (sender, env) = self.prepare_send::<T>(address, body, headers, None)?;
         sender
             .try_send(env)
             .map_err(|_| VertxError::Other(format!("channel full or closed: {address}")))
@@ -105,9 +120,10 @@ impl EventBusInner {
         &self,
         address: &str,
         body: T,
+        headers: HashMap<String, String>,
     ) -> Result<oneshot::Receiver<Box<dyn Any + Send>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let (sender, env) = self.prepare_send::<T>(address, body, Some(reply_tx))?;
+        let (sender, env) = self.prepare_send::<T>(address, body, headers, Some(reply_tx))?;
         sender
             .send(env)
             .await
@@ -119,6 +135,7 @@ impl EventBusInner {
         &self,
         address: &str,
         body: T,
+        headers: HashMap<String, String>,
         reply_to: Option<oneshot::Sender<Box<dyn Any + Send>>>,
     ) -> Result<(mpsc::Sender<ErasedEnvelope>, ErasedEnvelope)> {
         let Some(subs) = self.routes.get(address) else {
@@ -140,7 +157,7 @@ impl EventBusInner {
         drop(subs);
         let env = ErasedEnvelope {
             body: Box::new(body),
-            headers: HashMap::new(),
+            headers,
             reply_to,
         };
         Ok((tx, env))

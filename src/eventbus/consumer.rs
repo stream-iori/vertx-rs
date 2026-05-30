@@ -105,10 +105,12 @@ impl<T: Send + 'static> Consumer<T> {
         let address = self.address.clone();
         let mut consumer = self;
         let mut handler = handler;
+        let err_ctx = ctx.clone();
         ctx.spawn_local(async move {
             while let Some(env) = consumer.recv().await {
                 if let Err(e) = handler(env).await {
                     tracing::error!(%address, error = %e, "handler returned error");
+                    err_ctx.report_error(&e);
                 }
             }
         });

@@ -680,6 +680,8 @@ src/
 | 多 EventLoop | `setEventLoopPoolSize`,默认 2*CPU | `VertxBuilder::event_loop_threads`,默认 `available_parallelism` | Vert.x 默认 2x,我们默认 1x,够用 |
 | Worker 池 | `setWorkerPoolSize`,默认 20 | `worker_threads(N)`,默认 20 | ✅ 数值一致 |
 | Verticle 部署 | `deployVerticle(supplier, options)` 有 start/stop 双钩 | `deploy(factory(ctx) -> V)` + Verticle::run(self, ctx) **owned-self** | Rust 化改写,见 §3.1 |
+| 多实例部署 + 配置 | `DeploymentOptions.setInstances(n).setConfig(json)` | `deploy_with(factory, DeploymentOptions::new().instances(n).config::<T>(c))` | 强类型 config,Arc 共享 |
+| 全局异常 hook | `Vertx.exceptionHandler(handler)` | `Vertx::set_exception_handler(fn)` | handler 错误兜底 |
 | Worker Verticle | `DeploymentOptions::setThreadingModel(WORKER)` | `deploy_worker(v)` | 拆成独立 API,更显式 |
 | Context.runOnContext | `void runOnContext(Handler<Void>)` | `run_on_context(f) -> Result<()>` | fire-and-forget 对齐,Result 多一个调度失败信号 |
 | Context.executeBlocking | `Future<T> executeBlocking(Callable<T>)`,回原 context | `async execute_blocking<F,R>(f) -> Result<R>` | LocalSet 天然回原线程 |
@@ -702,11 +704,11 @@ src/
 | 能力 | Vert.x | 我们的选择 | 原因 |
 |---|---|---|---|
 | Verticle 生命周期形态 | `start(Promise<Void>)` + `stop(Promise<Void>)` 两钩,实例由框架持有 | **owned-self `run(self, ctx) -> Result<()>`**,实例 = task | Rust 所有权模型下 owned-self 更自然 —— state 用普通字段(`Cell`、`HashMap`)无需 Rc/RefCell;清理在 fn 末尾,无外部编排 |
-| 用户指定 EventLoop | `DeploymentOptions::setInstances` + 内部分配 | 不暴露,RR 框架内部分派 | 亲和性是运行时不变量 |
+| 用户指定 EventLoop | `DeploymentOptions::setInstances` + 内部分配 | `DeploymentOptions::instances(n)` 多实例,EventLoop RR 框架内部分派 | 实例数可控,亲和性是运行时不变量 |
 | Verticle 跨 EventLoop 启动 task | 通过 `runOnContext(otherCtx)` 间接支持 | 不支持 | 保持亲和性语义清晰 |
 | 老 Timer API | `setTimer(delay, handler) -> long id` + `cancelTimer(id)` | 不提供 | Rust 回调风格不自然,`Timer::cancel` 已覆盖能力 |
 | `executeBlocking(ordered)` | `ordered=true` 同 context 多次调用串行 | 当前全 unordered | 后续可选添加 |
-| `DeliveryOptions` | timeout / headers / codec / localOnly | timeout 已实现;headers 在 Envelope 上;codec/localOnly 暂未实现 | MVP 先 timeout,后续在 DeliveryOptions 内扩展 |
+| `DeliveryOptions` | timeout / headers / codec / localOnly | timeout + headers 已实现;codec/localOnly 暂未实现 | 集群引入时再补 codec/localOnly |
 | `MessageCodec` | 注册编解码器 | 类型擦除走 `Box<dyn Any>` | 集群阶段引入 serde |
 | `WorkerExecutor` 命名池 | `createSharedWorkerExecutor(name, size)` | 仅一个全局 worker pool | 后续可加 |
 | `Context.put/get/remove` | 每 Context 的 KV 存储 | 不提供 | Rust 类型擦除别扭 |
@@ -724,3 +726,89 @@ src/
 | `Vertx.currentContext()` | `Context::current()` | 静态方法位置不同 |
 | `vertx.eventBus()` | `vx.event_bus()` | snake_case |
 | `MessageConsumer<T>.handler(h)` | `Consumer<T>.recv().await` | 推 vs 拉 |
+
+### 10.4 Rust 生态原生覆盖一览
+
+下列 Vert.x 概念在 Rust 异步生态里有一等公民等价物，因此 vertx-rs **故意不再包一层**。如果你正在从 Vert.x 迁移过来，照下表替换即可。
+
+#### Future / Promise / 异步组合
+
+| Vert.x | Rust/Tokio | 例子 |
+|---|---|---|
+| `Future<T>` / `Promise<T>` | `async fn` 返回 `impl Future<Output = T>` | 函数签名即可 |
+| `CompositeFuture.all(a, b)` | `tokio::try_join!(a, b)` | 见下 |
+| `CompositeFuture.any(a, b)` | `tokio::select!` | 见下 |
+| `Future.compose(a -> b(a))` | `let x = a().await; b(x).await` | async/await 原生链式 |
+| `Future.recover(err -> default)` | `a().await.unwrap_or_else(...)` 或 `?` + `map_err` | Result 自然 |
+| `Future.onComplete(handler)` | `tokio::spawn(async move { a.await; ... })` | 不需要回调 |
+
+```rust
+// CompositeFuture.all 等价
+let bus = vx.event_bus();
+let (a, b) = tokio::try_join!(
+    bus.request::<_, String>("svcA", "x".to_string()),
+    bus.request::<_, String>("svcB", "y".to_string()),
+)?;
+
+// CompositeFuture.any 等价
+tokio::select! {
+    r = bus.request::<_, String>("primary", "x".to_string()) => use_result(r?),
+    _ = tokio::time::sleep(Duration::from_millis(50)) => fallback(),
+}
+
+// Future.compose 等价 —— async/await 直接读
+let token = login().await?;
+let user  = fetch_user(token).await?;
+```
+
+#### Buffer / Json / MultiMap
+
+| Vert.x | Rust 等价 | 备注 |
+|---|---|---|
+| `Buffer` | `bytes::Bytes` / `bytes::BytesMut` | 零拷贝切片 + 引用计数 |
+| `JsonObject` / `JsonArray` | 优先 `#[derive(Serialize, Deserialize)]` struct;泛用场景 `serde_json::Value` | 强类型优于动态对象 |
+| `MultiMap`(HTTP headers) | `http::HeaderMap` 或 `Vec<(String,String)>` | Rust 没有 multi-value-map 标准抽象,按场景选 |
+
+```rust
+// JsonObject 风格(动态)
+let v: serde_json::Value = serde_json::json!({ "name": "alice", "age": 30 });
+let name = v["name"].as_str();
+
+// 强类型(推荐)
+#[derive(serde::Deserialize)]
+struct User { name: String, age: u32 }
+let u: User = serde_json::from_str(payload)?;
+```
+
+#### Handler 接口
+
+| Vert.x | Rust |
+|---|---|
+| `Handler<T>` 单方法接口 | 闭包/函数指针。同步 `FnMut(T)` / 异步 `FnMut(T) -> impl Future` |
+| `AsyncResult<T>` 回调 | `async fn ... -> Result<T>` |
+| `Handler<Throwable>` 错误回调 | `?` 操作符 + `Result` |
+
+Vert.x 用 `Handler<T>` 是因为 Java 8 之前没有真函数类型;Rust 闭包是一等公民,直接写就行。
+
+#### 并发/同步原语(对应 SharedData,见 §3.4.2)
+
+| Vert.x SharedData | Rust 等价 |
+|---|---|
+| `Counter` | `Arc<AtomicU64>` (无锁) |
+| `Lock` | `Arc<tokio::sync::Mutex<()>>` (async 友好) |
+| `LocalMap<K,V>`(Shareable) | `Arc<T>` 不可变快照 / `arc-swap::ArcSwap<T>` 整体替换 |
+| `AsyncMap` | owner verticle + EventBus 地址 |
+
+#### 可观测性 SPI
+
+| Vert.x | Rust 生态 |
+|---|---|
+| `VertxMetrics` SPI | [`metrics`](https://crates.io/crates/metrics) crate + `metrics-exporter-prometheus` |
+| `VertxTracer` SPI | [`tracing`](https://crates.io/crates/tracing) + `tracing-subscriber` + `opentelemetry` |
+| 内置 `LoggerHandler` | `tracing::info!` 宏 / 任何 `Subscriber` 实现 |
+
+我们内部已经全程用 `tracing::error!` 等记录,接入 OTel/Jaeger/Prometheus 直接走 subscriber 即可,不需要框架包一层 SPI。
+
+#### 总结
+
+凡是 Vert.x 包了一层"自家接口"的地方,在 Rust 里几乎都对应一个**生态层**的成熟选择。我们的原则:能用 std/tokio/serde/tracing 解决的,vertx-rs 不重复造轮子;只在 Vert.x 特有概念(Verticle / Context / EventBus / SharedData 语义)上保留 API 表面。

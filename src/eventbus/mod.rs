@@ -94,17 +94,47 @@ impl EventBus {
     /// Fire-and-forget broadcast: every subscriber on `address` receives a
     /// clone of `body`. Per-subscriber delivery is best-effort (drop-on-full).
     pub fn publish<T: Clone + Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.publish(address, body)
+        self.inner.publish(address, body, Default::default())
+    }
+
+    /// `publish` with explicit `DeliveryOptions` (today: headers).
+    pub fn publish_with<T: Clone + Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        options: DeliveryOptions,
+    ) -> Result<()> {
+        self.inner.publish(address, body, options.take_headers())
     }
 
     /// Point-to-point with cooperative backpressure.
     pub async fn send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.send(address, body).await
+        self.inner.send(address, body, Default::default()).await
+    }
+
+    /// `send` with explicit `DeliveryOptions` (today: headers).
+    pub async fn send_with<T: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        options: DeliveryOptions,
+    ) -> Result<()> {
+        self.inner.send(address, body, options.take_headers()).await
     }
 
     /// Non-blocking variant of `send`.
     pub fn try_send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.try_send(address, body)
+        self.inner.try_send(address, body, Default::default())
+    }
+
+    /// Non-blocking variant of `send_with`.
+    pub fn try_send_with<T: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        options: DeliveryOptions,
+    ) -> Result<()> {
+        self.inner.try_send(address, body, options.take_headers())
     }
 
     /// Request/response with default `DeliveryOptions` (30s timeout).
@@ -129,8 +159,11 @@ impl EventBus {
         T: Send + 'static,
         R: Send + 'static,
     {
-        let rx = self.inner.send_with_reply(address, body).await?;
         let timeout = options.timeout();
+        let rx = self
+            .inner
+            .send_with_reply(address, body, options.take_headers())
+            .await?;
         let erased = tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| VertxError::Timeout(timeout))?

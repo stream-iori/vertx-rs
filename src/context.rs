@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::future::Future;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use tokio_util::sync::CancellationToken;
 
@@ -14,11 +14,17 @@ thread_local! {
     static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) };
 }
 
+/// Global unhandled-error sink. `Vertx::set_exception_handler(...)` installs
+/// one; framework components (currently `Consumer::handler`) report errors
+/// to it. Mirrors `Vertx.exceptionHandler(...)`.
+pub(crate) type ExceptionHandler = Arc<dyn Fn(&VertxError) + Send + Sync>;
+
 pub(crate) struct ContextShared {
     pub event_bus: EventBus,
     pub event_loops: Arc<EventLoopPool>,
     pub workers: Arc<WorkerPool>,
     pub vertx: Weak<VertxInner>,
+    pub exception_handler: RwLock<Option<ExceptionHandler>>,
 }
 
 #[derive(Clone)]
@@ -105,6 +111,16 @@ impl Context {
     /// Mirrors `Context.isOnVertxThread()`.
     pub fn is_on_vertx_thread() -> bool {
         CURRENT.with(|c| c.borrow().is_some())
+    }
+
+    /// Report `err` to the global Vertx exception handler if one is installed.
+    /// Framework components call this on otherwise-swallowed errors.
+    pub(crate) fn report_error(&self, err: &VertxError) {
+        if let Ok(guard) = self.inner.exception_handler.read() {
+            if let Some(h) = guard.as_ref() {
+                h(err);
+            }
+        }
     }
 
     /// Returns an EventBus handle. When called inside a Verticle, the returned

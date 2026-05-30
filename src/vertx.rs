@@ -67,6 +67,27 @@ impl Vertx {
         crate::Periodic::new(initial_delay, period, None)
     }
 
+    /// Install a global exception handler. Framework components that would
+    /// otherwise swallow an error (e.g. `Consumer::handler`'s per-message
+    /// loop) will forward errors here. Mirrors `Vertx.exceptionHandler(...)`.
+    ///
+    /// Calling this replaces any previously-installed handler. Pass `None`
+    /// (via `clear_exception_handler`) to remove it.
+    pub fn set_exception_handler<F>(&self, handler: F)
+    where
+        F: Fn(&VertxError) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.inner.shared.exception_handler.write() {
+            *guard = Some(std::sync::Arc::new(handler));
+        }
+    }
+
+    pub fn clear_exception_handler(&self) {
+        if let Ok(mut guard) = self.inner.shared.exception_handler.write() {
+            *guard = None;
+        }
+    }
+
     /// Deploy a Verticle on an EventLoop chosen round-robin.
     ///
     /// `factory` runs **synchronously on the target EventLoop thread** with
@@ -118,6 +139,37 @@ impl Vertx {
                 "verticle factory panicked before signaling ready".into(),
             )),
         }
+    }
+
+    /// Multi-instance deploy with `DeploymentOptions`. `factory` is called
+    /// once per instance (on its own EventLoop, picked round-robin) with a
+    /// shared `Arc<C>` config. Returns the `DeploymentId`s in deploy order.
+    ///
+    /// Mirrors `Vertx.deployVerticle(supplier, DeploymentOptions)` with
+    /// `setInstances(n).setConfig(c)`.
+    pub async fn deploy_with<F, V, C>(
+        &self,
+        factory: F,
+        options: crate::DeploymentOptions<C>,
+    ) -> Result<Vec<DeploymentId>>
+    where
+        F: Fn(Context, Arc<C>) -> V + Send + Sync + 'static,
+        V: Verticle,
+        C: Send + Sync + 'static,
+    {
+        let n = options.instances_count();
+        let cfg = options.shared_config();
+        let factory = Arc::new(factory);
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let cfg = Arc::clone(&cfg);
+            let factory = Arc::clone(&factory);
+            let id = self
+                .deploy(move |ctx| factory(ctx, cfg))
+                .await?;
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Deploy a `WorkerVerticle` on the worker pool.
@@ -223,6 +275,7 @@ impl VertxBuilder {
                 event_loops,
                 workers,
                 vertx: weak.clone(),
+                exception_handler: std::sync::RwLock::new(None),
             });
             VertxInner {
                 shared,

@@ -1077,3 +1077,142 @@ async fn arc_immutable_snapshot_shared_across_verticles() {
     let r3: String = bus.request("route.r1", "missing".to_string()).await.unwrap();
     assert_eq!((r1.as_str(), r2.as_str(), r3.as_str()), ("north", "south", ""));
 }
+
+// ---------------------------------------------------------------------------
+// DeliveryOptions.header(k,v) is propagated to Envelope.headers().
+// ---------------------------------------------------------------------------
+
+struct HeaderEchoV {
+    consumer: Consumer<String>,
+}
+#[async_trait(?Send)]
+impl Verticle for HeaderEchoV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        self.consumer.handler(|env| async move {
+            let trace_id = env.headers().get("x-trace-id").cloned().unwrap_or_default();
+            env.reply(trace_id)?;
+            Ok(())
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn delivery_options_headers_round_trip() {
+    let vx = Vertx::new();
+    vx.deploy(|ctx| HeaderEchoV {
+        consumer: ctx.event_bus().consumer::<String>("hdr.echo").unwrap(),
+    })
+    .await
+    .unwrap();
+
+    let opts = DeliveryOptions::new()
+        .header("x-trace-id", "abc-123")
+        .with_timeout(Duration::from_secs(2));
+    let r: String = vx
+        .event_bus()
+        .request_with("hdr.echo", "ping".to_string(), opts)
+        .await
+        .unwrap();
+    assert_eq!(r, "abc-123");
+}
+
+// ---------------------------------------------------------------------------
+// Global exception handler: handler errors are forwarded.
+// ---------------------------------------------------------------------------
+
+struct BoomV {
+    consumer: Consumer<()>,
+}
+#[async_trait(?Send)]
+impl Verticle for BoomV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        self.consumer.handler(|_env| async move {
+            Err(VertxError::Other("boom".into()))
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn exception_handler_receives_handler_errors() {
+    let vx = Vertx::new();
+    let caught: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let sink = caught.clone();
+    vx.set_exception_handler(move |e| {
+        sink.lock().unwrap().push(e.to_string());
+    });
+
+    vx.deploy(|ctx| BoomV {
+        consumer: ctx.event_bus().consumer::<()>("boom").unwrap(),
+    })
+    .await
+    .unwrap();
+
+    // Fire-and-forget; handler errors are async, give it a beat.
+    vx.event_bus().send("boom", ()).await.unwrap();
+    vx.event_bus().send("boom", ()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let got = caught.lock().unwrap();
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|s| s.contains("boom")));
+}
+
+// ---------------------------------------------------------------------------
+// DeploymentOptions: multiple instances on round-robin EventLoops, typed config.
+// ---------------------------------------------------------------------------
+
+use vertx_rs::DeploymentOptions;
+
+#[derive(Clone)]
+struct EchoCfg { prefix: String }
+
+struct CfgEchoV {
+    consumer: Consumer<String>,
+    prefix: String,
+}
+#[async_trait(?Send)]
+impl Verticle for CfgEchoV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let prefix = self.prefix.clone();
+        self.consumer.handler(move |env| {
+            let p = prefix.clone();
+            async move {
+                let reply = format!("{p}:{}", env.body());
+                env.reply(reply)?;
+                Ok(())
+            }
+        });
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn deploy_with_instances_and_typed_config() {
+    let vx = Vertx::builder().event_loop_threads(2).build();
+
+    let ids = vx
+        .deploy_with(
+            |ctx, cfg: Arc<EchoCfg>| CfgEchoV {
+                consumer: ctx.event_bus().consumer::<String>("cfg.echo").unwrap(),
+                prefix: cfg.prefix.clone(),
+            },
+            DeploymentOptions::new()
+                .instances(3)
+                .config(EchoCfg { prefix: "P".into() }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 3);
+
+    // round-robin send across the 3 instances → all reply with prefix
+    let bus = vx.event_bus();
+    for i in 0..6u32 {
+        let r: String = bus.request("cfg.echo", format!("{i}")).await.unwrap();
+        assert!(r.starts_with("P:"), "got {r}");
+    }
+}
