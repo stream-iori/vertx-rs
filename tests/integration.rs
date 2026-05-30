@@ -836,3 +836,114 @@ async fn rc_refcell_shared_state_across_handlers() {
     let c: u64 = bus.request("stats.get", "c".to_string()).await.unwrap();
     assert_eq!((a, b, c), (2, 1, 0));
 }
+
+// ---------------------------------------------------------------------------
+// Pattern: multiple handlers sharing a Copy scalar via Rc<Cell<T>>.
+// No borrow guard → no possible panic, lighter than Rc<RefCell>.
+// ---------------------------------------------------------------------------
+
+struct CounterPairV {
+    incr_consumer: Consumer<()>,
+    read_consumer: Consumer<()>,
+    count: Rc<Cell<u64>>,
+}
+
+#[async_trait(?Send)]
+impl Verticle for CounterPairV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        let c_incr = self.count.clone();
+        self.incr_consumer.handler(move |env| {
+            let n = c_incr.get() + 1;
+            c_incr.set(n);
+            async move { env.reply(n)?; Ok(()) }
+        });
+
+        let c_read = self.count.clone();
+        self.read_consumer.handler(move |env| {
+            let n = c_read.get();
+            async move { env.reply(n)?; Ok(()) }
+        });
+
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn rc_cell_shared_scalar_across_handlers() {
+    let vx = Vertx::new();
+    vx.deploy(|ctx| {
+        let bus = ctx.event_bus();
+        CounterPairV {
+            incr_consumer: bus.consumer::<()>("ctr.incr").unwrap(),
+            read_consumer: bus.consumer::<()>("ctr.read").unwrap(),
+            count: Rc::new(Cell::new(0)),
+        }
+    })
+    .await
+    .unwrap();
+
+    let bus = vx.event_bus();
+    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
+    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
+    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
+    let n: u64 = bus.request("ctr.read", ()).await.unwrap();
+    assert_eq!(n, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Pattern: handler coordination via an internal EventBus address.
+// No shared mutability — each handler owns its own slice of state and
+// communicates by sending messages. Actor-style.
+// ---------------------------------------------------------------------------
+
+struct AdderV {
+    add_consumer: Consumer<u64>,
+}
+
+#[async_trait(?Send)]
+impl Verticle for AdderV {
+    async fn run(self, ctx: Context) -> Result<()> {
+        // `total` is owned solely by the accumulator handler. The frontend
+        // handler delegates by sending an "adder.apply" message and waiting
+        // for a reply — no Rc, no RefCell, no shared state at all.
+        let bus = ctx.event_bus();
+        let internal_bus = bus.clone();
+        let frontend = bus.consumer::<u64>("adder.add").unwrap();
+        frontend.handler(move |env| {
+            let internal_bus = internal_bus.clone();
+            async move {
+                let body = *env.body();
+                let total: u64 = internal_bus.request("adder.apply", body).await?;
+                env.reply(total)?;
+                Ok(())
+            }
+        });
+
+        let mut total: u64 = 0;
+        self.add_consumer.handler(move |env| {
+            total += *env.body();
+            let snapshot = total;
+            async move { env.reply(snapshot)?; Ok(()) }
+        });
+
+        ctx.cancellation_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn message_passing_between_handlers() {
+    let vx = Vertx::new();
+    vx.deploy(|ctx| AdderV {
+        add_consumer: ctx.event_bus().consumer::<u64>("adder.apply").unwrap(),
+    })
+    .await
+    .unwrap();
+
+    let bus = vx.event_bus();
+    let r1: u64 = bus.request("adder.add", 10u64).await.unwrap();
+    let r2: u64 = bus.request("adder.add", 5u64).await.unwrap();
+    let r3: u64 = bus.request("adder.add", 7u64).await.unwrap();
+    assert_eq!((r1, r2, r3), (10, 15, 22));
+}
