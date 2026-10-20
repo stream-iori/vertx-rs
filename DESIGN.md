@@ -1,814 +1,243 @@
-# vertx-rs 设计文档
+# vertx-rs 0.3 设计与迁移说明
 
-> 目标:用 Rust + Tokio 复刻 Vert.x core 的执行模型 ——
-> **EventLoop 亲和的 Verticle** + **多线程 WorkerVerticle** + **Context** + **EventBus** + **Timer**。
->
-> 范围:**单进程**,不含集群、不含 HTTP/Web 组件、不含分布式 EventBus。
-> Vert.x core 中已对齐的核心子集见 §10。
+目标：用 Rust + Tokio 实现 Vert.x 5 的**单进程执行核心**。
+范围包括 Verticle、Context、Worker、EventBus、Timer、部署及异步关闭。
 
----
+## 1. 执行保证
 
-## 0. 环境要求
+| 执行对象 | 线程保证 | 状态约束 |
+|---|---|---|
+| 普通 Verticle 的 factory/start/stop/析构 | 始终在部署时分配的同一个 OS 线程 | 不要求 Send，可持有 Rc/Cell/RefCell |
+| EventLoop Context 的受管任务和 handler | 同一 EventLoop；await 后仍在原线程 | 支持 !Send Future |
+| Worker Context 的普通执行 | 可以换线程；同 Context 的 poll 和任务析构串行 | Send |
+| execute_blocking | 独立 blocking 线程；保留来源逻辑 Context | 闭包和结果要求 Send |
+| 裸 tokio::spawn/spawn_local | 遵循 Tokio 自身规则，不继承逻辑 Context | 不受部署任务管理 |
 
-| 项 | 版本 / 说明 |
-|---|---|
-| Rust toolchain | MSRV 1.75+;实际开发用 stable 1.96.0 |
-| 运行时 | Tokio 1.x(`rt-multi-thread` + `rt` + `sync` + `macros` + `time`) + `tokio-util/rt`(`LocalPoolHandle`) |
-| Edition | 2021 |
+亲和性指 **OS 线程**，不绑定 CPU 核心。线程可以由操作系统调度到不同 CPU。
+单线程上的多个 async 任务仍会在 await 处交替执行；RefCell 借用不能跨 await。
+跨 Verticle 的默认通信方式是 EventBus。Rust 也允许 Arc、原子变量及锁，框架不会强制禁止共享状态。
 
----
-
-## 1. 设计哲学
-
-借鉴 Vert.x 的两条核心原则,并完整复刻 EventLoop 亲和性:
-
-1. **Don't block the event loop** —— Verticle 在它的 EventLoop 线程上跑,任何阻塞都必须走 WorkerVerticle 或 `Context::execute_blocking`。
-2. **No shared mutable state** —— Verticle 之间**只能**通过 EventBus 通信(Rust 类型系统强制)。
-
-但**用更地道的 Rust 风格表达**:
-
-- **Verticle 是 owned-self actor,而不是 start/stop 双钩对象** —— `async fn run(self, ctx) -> Result<()>` 是唯一的方法。Verticle 实例被移动进框架的 task,**它自己就是那个 task**。状态可以是普通字段(`HashMap`、`Cell`),不必包 `Rc<RefCell<_>>`。
-- **生命周期 = run 的 future** —— deploy 后框架轮询这个 future,undeploy 触发 `CancellationToken`,run 的 `select!` 分支醒来退出,清理代码就是 fn 末尾的几行。框架不再外部编排 start/stop 两阶段。
-- **Factory 模式负责"ready"** —— `deploy(factory)` 中的 `factory: FnOnce(Context) -> V` 在目标 EventLoop 上**同步**运行,典型用途是注册 EventBus consumer。factory 返回 = verticle ready,`deploy` 返回 = 消息可以安全送达。
-
-与 Vert.x 的实质差异:
-
-- **不做动态字节码部署**:Verticle 是编译期已知的 Rust 类型,factory 闭包替代 `Class<? extends Verticle>`。
-- **用户不能选 EventLoop**:`deploy` 时由框架 RR 内部分派,亲和性是不可篡改的运行时不变量。
-- **没有 start/stop 两钩**:owned-self / 单个 `run` 更适合 Rust 的所有权模型(详见 §3.1)。
-
----
-
-## 2. 顶层架构
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                          Vertx (句柄)                             │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────┐      │
-│  │                  EventBus Router (共享)                  │      │
-│  │   address -> Vec<SubscriberHandle { mpsc::Sender }>     │      │
-│  └────────────────────────────────────────────────────────┘      │
-│                                                                  │
-│  ┌──────────────┐ ┌──────────────┐ ┌────────────────────────┐    │
-│  │ EventLoop #0 │ │ EventLoop #1 │ │   Worker Pool          │    │
-│  │ (LocalSet)   │ │ (LocalSet)   │ │ (multi-thread tokio)   │    │
-│  │              │ │              │ │                        │    │
-│  │ Verticle A   │ │ Verticle C   │ │ WorkerVerticle X       │    │
-│  │ Verticle B   │ │ Verticle D   │ │ WorkerVerticle Y       │    │
-│  └──────────────┘ └──────────────┘ └────────────────────────┘    │
-│       ↑ N = available_parallelism()      ↑ 默认 20,可配置         │
-└──────────────────────────────────────────────────────────────────┘
+```text
+Vertx
+ ├─ EventLoop #0: OS T0 + current-thread runtime + LocalSet
+ │    ├─ Verticle A / Context A
+ │    └─ Verticle B / Context B
+ ├─ EventLoop #1: OS T1 + current-thread runtime + LocalSet
+ │    └─ Verticle C / Context C
+ ├─ Worker runtime：多线程，每个 Context 有独立执行门
+ ├─ Blocking pool：限制并发，默认每 Context FIFO
+ └─ EventBus：进程内共享地址路由，每个消费者一个有界队列
 ```
 
-- **EventLoop Pool**:`tokio_util::task::LocalPoolHandle::new(N)`,每个 EventLoop = 一个 OS 线程 + 一个 `LocalSet`。
-- **Worker Pool**:独立 multi-thread Tokio Runtime,默认 20 worker 线程,完全隔离。
-- **Verticle 部署时被钉到某个 EventLoop**(框架 RR 选定),终生不变;状态可以是 `!Send`(`Rc`、`RefCell` 等)。
-- **WorkerVerticle 部署在 Worker Pool**,无亲和性,状态必须 `Send`。
-- **EventBus Router 是全局共享的**;但每个 Verticle 拿到的 **EventBus 句柄是绑定到自己 Deployment 的**(见 §3.4)。
+### 1.1 Context 隔离
 
----
+`ContextFuture` 在**每次 poll** 前设置 CURRENT，返回 Pending/Ready 或 panic 时立即恢复。
+ContextGuard 不可 Send，也不跨 await 保存。Future 取消时，在所属执行环境中设置 Context 后析构用户状态。
+Worker 的执行门只覆盖单次 poll，用户等待异步结果时释放；析构也与普通 poll 互斥。
 
-## 3. 核心 API
+```text
+poll(A): CURRENT=A → poll user A → restore
+poll(B): CURRENT=B → poll user B → restore
+poll(A): CURRENT=A → poll user A → restore
+```
 
-### 3.1 Verticle / WorkerVerticle
+Context 与物理线程身份分开记录。调用 execute_blocking 时：
+
+| 查询 | EventLoop 内 | 其 blocking 闭包内 | await 返回后 |
+|---|---|---|---|
+| Context::current() | 来源 Context | 同一来源 Context | 同一来源 Context |
+| ctx.is_event_loop() | true | true | true |
+| is_on_event_loop_thread() | true | false | true |
+| is_on_worker_thread() | false | true | false |
+
+EventLoop 初始化记录实例 ID、EventLoop ID 和实际 ThreadId，受管 poll 校验物理位置。
+Worker 运行时通过线程启动/停止钩子设置物理线程类型。
+
+## 2. 生命周期
 
 ```rust
-/// EventLoop-affine Verticle. owned self,不要求 Send。
-#[async_trait(?Send)]
+#[async_trait::async_trait(?Send)]
 pub trait Verticle: 'static {
-    async fn run(self, ctx: Context) -> Result<()>;
+    async fn start(&mut self, ctx: Context) -> Result<()>;
+    async fn stop(&mut self, ctx: Context) -> Result<()> { Ok(()) }
 }
-
-/// 多线程 Worker Verticle. owned self,要求 Send。
-#[async_trait]
-pub trait WorkerVerticle: Send + 'static {
-    async fn run(self, ctx: Context) -> Result<()>;
-}
+// WorkerVerticle: Send，使用 #[async_trait::async_trait]
 ```
 
-两个 trait 各有一个方法,差别只在 trait bound。**Verticle 实例被 move 进框架的 task**,它**就是**那个 task。
-
-典型实现形态:
-
-```rust
-async fn run(mut self, ctx: Context) -> Result<()> {
-    let cancel = ctx.cancellation_token();
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),   // 协作式终止
-            msg = self.consumer.recv() => {
-                let Some(env) = msg else { return Ok(()) };
-                // ... handle ...
-            }
-        }
-    }
-    // 如果 run 的末尾还有清理代码,放这里
-}
+```text
+Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
+    └─ 失败/取消 ──────────────────────────┘
 ```
 
-**为什么 owned self,不是 `&mut self` start/stop**:Rust 的所有权系统对"对象被移动进 task,task = 对象的全部生命周期"咬合得最干净 —— 状态可以是普通 `Cell<u64>`、`HashMap<K, V>` 不需要 `Rc<RefCell<_>>`,清理代码就是 fn 末尾的代码,框架不需要外部编排两阶段。这是相对 Vert.x 最显著的 Rust 化改写。
-
-### 3.2 Context
-
-```rust
-#[derive(Clone)]
-pub struct Context { /* opaque */ }
-
-pub enum ThreadingModel { EventLoop, Worker, External }
-
-impl Context {
-    // —— Vert.x 对齐的内省 ——
-    pub fn is_event_loop(&self) -> bool;
-    pub fn is_worker(&self) -> bool;
-    pub fn threading_model(&self) -> ThreadingModel;       // 对齐 Vert.x
-    pub fn event_loop_id(&self) -> Option<EventLoopId>;
-    pub fn deployment_id(&self) -> Option<DeploymentId>;   // 对齐 Vert.x
-    pub fn owner(&self) -> Option<Vertx>;                  // 对齐 Vert.x
-
-    // —— 生命周期 ——
-    pub fn is_alive(&self) -> bool;
-    pub fn cancellation_token(&self) -> CancellationToken;
-
-    // —— EventBus & Timer 句柄(均绑定到本 Verticle scope) ——
-    pub fn event_bus(&self) -> EventBus;
-    pub fn timer(&self, delay: Duration) -> Timer;          // 见 §3.5
-    pub fn periodic(&self, init: Duration, period: Duration) -> Periodic;
-
-    // —— 调度 ——
-    /// 把 f 调度回这个 Context 上跑。**Vert.x 风格 fire-and-forget**。
-    /// 需要等结果的话用户自己 oneshot。
-    pub fn run_on_context<F>(&self, f: F) -> Result<()>
-        where F: FnOnce() + Send + 'static;
-
-    pub async fn execute_blocking<F, R>(&self, f: F) -> Result<R>
-        where F: FnOnce() -> R + Send + 'static, R: Send + 'static;
-
-    /// 在本 Context 的 LocalSet 上 spawn 一个 !Send future。
-    /// 仅 EventLoop Context 可用,Worker Context 调用 panic。
-    /// 这是 Verticle 内启动子任务的推荐入口 —— 把"必须用 spawn_local"
-    /// 这种 framework knowledge 显式化为 API。
-    pub fn spawn_local<F>(&self, fut: F)
-        where F: Future<Output = ()> + 'static;
-
-    // —— 当前线程探测(静态),对齐 Vert.x ——
-    pub fn current() -> Option<Context>;
-    pub fn is_on_event_loop_thread() -> bool;
-    pub fn is_on_worker_thread() -> bool;
-    pub fn is_on_vertx_thread() -> bool;
-}
-```
-
-Context 是**不透明结构**,用户只能查询/调用,不能 destructure 或构造。**生命周期与产生它的 Verticle 绑定**:见 §4.5。
-
-> **`run_on_context` 与 Vert.x 对齐**:Vert.x 的 `Context.runOnContext(handler)` 是 `void` 返回值的 fire-and-forget,handler 异步执行。我们的签名也是 fire-and-forget,但返回 `Result<()>` 区分"调度入队成功"和"verticle 已撤销"。
-
-> **`execute_blocking` 与 Vert.x 对齐**:Vert.x 的 `executeBlocking` 返回 `Future<T>`,完成后**回到原 Context**。我们用 Tokio LocalSet 天然得到这个性质 —— 在 EventLoop verticle 内 await 它,continuation 必然回到该 LocalSet 的线程。`ordered` 参数(Vert.x 提供)目前不支持。
-
-### 3.3 Vertx 句柄
-
-```rust
-impl Vertx {
-    pub fn new() -> Self;                    // 默认值
-    pub fn builder() -> VertxBuilder;        // 自定义 EventLoop 数 / Worker 数
-
-    /// 框架外的"全局"句柄(unbound,不与任何 Verticle 关联)。
-    /// 适合测试 / main 中驱动消息。
-    pub fn event_bus(&self) -> EventBus;
-
-    pub fn event_loop_count(&self) -> usize;
-    pub fn worker_thread_count(&self) -> usize;
-
-    /// 框架内部 RR 选 EventLoop;用户不能指定。
-    /// factory 在目标 EventLoop 线程上**同步**调用,接收 Context;典型用途
-    /// 是在 factory 里注册 EventBus consumer。返回 Verticle 实例后,
-    /// `deploy` 立即返回 —— 此时 verticle 已 ready,后续 run() 被框架轮询。
-    pub async fn deploy<F, V>(&self, factory: F) -> Result<DeploymentId>
-        where F: FnOnce(Context) -> V + Send + 'static, V: Verticle;
-
-    /// WorkerVerticle 直接传实例(本来就 Send)。
-    pub async fn deploy_worker<V: WorkerVerticle>(&self, v: V) -> Result<DeploymentId>;
-
-    /// 撤销部署。cancel scope → 清扫 bus → 触发 CancellationToken → 等 run()
-    /// 自然退出;1s 内不退出则 abort 强制中止(对付不监听 cancel 的 verticle)。
-    pub async fn undeploy(&self, id: DeploymentId) -> Result<()>;
-
-    /// 全局(unbound)Timer / Periodic。生命周期独立,不跟 Verticle。
-    pub fn timer(&self, delay: Duration) -> Timer;
-    pub fn periodic(&self, initial_delay: Duration, period: Duration) -> Periodic;
-}
-
-impl VertxBuilder {
-    pub fn event_loop_threads(self, n: usize) -> Self;  // 默认 available_parallelism()
-    pub fn worker_threads(self, n: usize) -> Self;      // 默认 20
-    pub fn build(self) -> Vertx;                        // 失败 panic(框架级)
-}
-```
-
-**为什么 deploy 用 factory(Context)**:Verticle 实例本身可能含 `Rc`,无法跨线程移动。`FnOnce(Context) -> V + Send` 的闭包**是** Send,跨线程发到目标 EventLoop 后调用产出 `V`;Context 传进来让 factory **同步**注册 EventBus consumer,这样 `deploy` 返回时 consumer 已就位,后续从外部 send 不会因为消息到达过早而 NoConsumer。
-
-### 3.4 EventBus 与 Verticle 的绑定
-
-EventBus 内部的路由表是**全局共享**的(否则 Verticle 之间无法通信),但用户拿到的 **EventBus 句柄分两种**:
-
-| 来源 | 类型 | 生命周期约束 |
-|---|---|---|
-| `Vertx::event_bus()` | **unbound** | consumer 一直存活,直到 `Consumer<T>` drop |
-| `Context::event_bus()` | **bound to deployment** | consumer 在 `undeploy` 时自动取消订阅 |
-
-```rust
-impl EventBus {
-    pub fn publish<T: Clone + Send + 'static>(&self, address: &str, body: T) -> Result<()>;
-    pub async fn send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()>;
-    pub fn try_send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()>;
-    pub async fn request<T, R>(&self, address: &str, body: T) -> Result<R>;
-    pub async fn request_with<T, R>(&self, address: &str, body: T, opts: DeliveryOptions) -> Result<R>;
-    pub fn consumer<T: Send + 'static>(&self, address: &str) -> Result<Consumer<T>>;
-}
-
-impl<T> Consumer<T> {
-    pub async fn recv(&mut self) -> Option<Envelope<T>>;
-    /// Vert.x-style: spawn a task that pulls envelopes and feeds them to `handler`.
-    pub fn handler<F, Fut>(self, handler: F)
-    where
-        F: FnMut(Envelope<T>) -> Fut + 'static,
-        Fut: Future<Output = Result<()>> + 'static;
-}
-```
-
-`consumer` 在 bound 句柄上若 verticle 已撤销返 `DeploymentTerminated`,unbound 句柄一定 Ok。
-`request` 用 `DeliveryOptions` 默认值(30s timeout,对齐 Vert.x);需要自定义 timeout / 后续 headers 时用 `request_with`。
-`Consumer<T>::handler(fn)` 是 Vert.x faithful 的 handler 注册形态——内部 `spawn_local` 一个 `while let Some(env) = c.recv().await` 循环,跟 `bus.consumer(addr).handler(msg -> {...})` 语义对齐。需要多源串行 dispatch + `&mut self` 时,仍用底层的 `Verticle::run` + `tokio::select!`。
-
-### 3.4.1 Envelope / ReplyHandle
-
-```rust
-pub struct Envelope<T> { /* opaque */ }
-
-impl<T> Envelope<T> {
-    pub fn body(&self) -> &T;
-    pub fn body_mut(&mut self) -> &mut T;
-    pub fn headers(&self) -> &HashMap<String, String>;
-    pub fn has_reply(&self) -> bool;
-
-    /// In-place reply, consuming self. 常用快捷写法。
-    pub fn reply<R: Send + 'static>(self, resp: R) -> Result<()>;
-
-    /// 拆成三部分:把 body 留给一个任务,reply handle 交给另一个任务。
-    pub fn into_parts(self) -> (T, HashMap<String, String>, Option<ReplyHandle>);
-
-    /// 只要 body。
-    pub fn into_body(self) -> T;
-}
-
-/// 独立的 reply 句柄,可跨 task 传递。
-pub struct ReplyHandle { /* opaque */ }
-
-impl ReplyHandle {
-    pub fn reply<R: Send + 'static>(self, resp: R) -> Result<()>;
-}
-```
-
-`send` / `publish` / `request` 在两类句柄上行为完全一致(都走同一路由器);唯一差别在 `consumer`:**bound 句柄注册的 consumer 会记账在该 Verticle 的 DeploymentScope 上**,`undeploy` 时一次性清扫。
-
-跨上下文派发不需要任何额外代码 —— `mpsc::Sender` 是 `Send`,publisher 从任意线程 send,receiver 在 Verticle 自己的 EventLoop 上 recv。
-
-### 3.4.2 Handler 状态选型
-
-Vert.x 里 `start()` 注册的 handler 闭包捕获 `this`,所有 handler 共享 verticle 字段——JVM 无借用检查,这是常态。Rust 这边一个 verticle 可能多个 handler 都要可变状态,编译期 `&mut self` 互斥,所以必须做选型。**按力度从弱到强(也是优先级从高到低)选**:
-
-| 场景 | 推荐 | 备注 |
-|---|---|---|
-| 单 handler 独占状态 | `move` + `FnMut`,直接拿可变捕获变量 | 编译期保证,零开销。**首选** |
-| 多 handler 共享 `Copy` 标量 | `Rc<Cell<T>>` | 无 borrow guard,无 panic 风险 |
-| 多 handler 共享复合状态 (`HashMap`/`Vec`) | `Rc<RefCell<T>>` | 单线程 EventLoop 上 borrow 不跨 await 时安全;**borrow scope 越小越好** |
-| 多 handler 需协同但状态可拆 | EventBus 内部地址互发消息 | actor 派系,无共享可变 |
-
-#### `Rc<RefCell<T>>` 的纪律
-
-合理用法存在(图结构、注册中心、跨 handler 共享 cache),但要遵守两条硬规矩:
-
-1. **每个 `borrow()` / `borrow_mut()` 只跨一个语句**,出函数前显式 `drop(guard)` 或用 `{...}` 块限定作用域。
-2. **永远不要跨 `.await` 持有 borrow guard**——`RefMut` 跨 await 不会被编译器拦截(`!Send` 在 `spawn_local` 下合法),但下一个被调度的 handler 一旦 `borrow_mut` 就会 panic。
-
-```rust
-// ✅ 正确:borrow 作用域 = 一个表达式
-let n = {
-    let mut m = counts.borrow_mut();
-    let n = m.entry(key).or_insert(0);
-    *n += 1;
-    *n
-};
-async move { env.reply(n) }.await
-
-// ❌ 错误:borrow 跨 await
-let mut m = counts.borrow_mut();
-m.insert(k, async_compute().await);    // 跨 await,可能 panic
-```
-
-不遵守这两条规矩时,把它当成"程序里埋了一颗运行时炸弹"。Rust 把借用检查推迟到了运行时,失败模式从 cargo build 报错变成了生产 panic。
-
-#### 共享状态的"逃生舱"——对应 Vert.x SharedData
-
-**单一 owner 原则**(state 由一个 verticle/handler 拥有,外部经 EventBus 访问)是默认选择。但少数场景确实需要跨 verticle 共享:极致读热路径、跨 verticle 计数 / 互斥。Vert.x 为此提供 `SharedData`(`LocalMap` / `AsyncMap` / `Counter` / `Lock`)——注意它**故意不提供"共享可变结构"原语**,把"图 / index 这种东西"留给"放进一个 owner verticle"去解决。我们沿用同一立场:
-
-| 需求 | Vert.x SharedData | vertx-rs 推荐 | 备注 |
-|---|---|---|---|
-| 共享只读快照(读热路径,从不变) | `LocalMap` (Shareable) | `Arc<T>` | 标准 Rust 原语,零开销读 |
-| 共享只读快照 + 偶尔整体替换 | 同上 | `arc-swap::ArcSwap<T>` | 读零开销,写换整个 Arc |
-| 跨 verticle 标量计数 | `Counter` | `Arc<AtomicU64>` | 标准库就够,无需框架包装 |
-| 跨 verticle 互斥 | `Lock` | `Arc<tokio::sync::Mutex<()>>` | async 友好,跨 await 安全(`Mutex` guard 是 `Send`) |
-| 跨 verticle 异步 KV / 命名注册 | `AsyncMap` | owner verticle + EventBus 地址 | 本地够用;集群化时再加门面 |
-| 跨 verticle 共享**可变结构** | (Vert.x 不提供) | ⚠️ 反模式 → 改 owner verticle | 跟 Vert.x 立场一致 |
-
-**为什么不实现 `SharedData` 门面**:
-- 上表的 Rust 原语都是 std / tokio 一等公民,框架包一层只是徒增 indirection。
-- Vert.x `SharedData` 的核心价值在**集群化**(同名 `Counter` / `AsyncMap` 跨节点是同一实例);本地版本只是 `ConcurrentHashMap` 的薄包装。
-- 我们现在只跑本地,等真正引入集群再加 `SharedData` 门面——那时门面承载的是"命名注册中心 + 本地 vs 集群实现切换",才有意义。
-
-**`Rc<Cell<T>>` / `Rc<RefCell<T>>` 跟这里的区别**:`Rc` 系列是**单 verticle 内**多 handler 共享;`Arc` 系列是**跨 verticle**(跨线程)共享。两者不可混用。
-
-### 3.5 Timer 与 Periodic
-
-```rust
-/// One-shot timer. 实现 Future<Output = Result<()>>。
-pub struct Timer { /* opaque */ }
-
-impl Timer {
-    pub fn cancel(&self);
-    pub fn is_cancelled(&self) -> bool;
-}
-impl Future for Timer { type Output = Result<()>; /* ... */ }
-
-/// 周期 timer。
-pub struct Periodic { /* opaque */ }
-
-impl Periodic {
-    pub async fn tick(&mut self) -> Result<()>;
-    pub fn cancel(&self);
-    pub fn is_cancelled(&self) -> bool;
-}
-```
-
-来源分两种(与 EventBus 句柄结构对称):
-
-| 入口 | 是否绑定 Verticle | 行为 |
-|---|---|---|
-| `Vertx::timer / Vertx::periodic` | **unbound** | 仅显式 `cancel()` 或 await 自然完成 |
-| `Context::timer / Context::periodic` | **bound to deployment** | 同上 + undeploy 时**自动取消**(in-flight await 收到 `TimerCancelled`) |
-
-> **与 Vert.x 对齐**:Vert.x 5.x 的 `Vertx::timer(delay)` 返回的 `Timer` 是 `Future<Void>` + `Cancelable`,与本设计形态一致。我们故意不提供旧 API `setTimer(delay, handler) -> long id`,因为 Rust 里 callback 风格不自然,且 `Timer::cancel()` 已经替代了 `cancelTimer(id)` 的功能。
-
-> **`tick()` 而非 `Stream`**:`Periodic` 没实现 `Stream` trait —— 因为 `Stream::next` 的 lifetime 形态对取消语义不友好。`tick(&mut self) -> Result<()>` 更直接:每次显式 await,可以在错误时退出循环。
-
----
-
-## 4. 关键实现细节
-
-### 4.1 EventLoop 派发
-
-用 `tokio_util::task::LocalPoolHandle::spawn_pinned_by_idx(idx, factory)`:
-- `factory: FnOnce() -> Future + Send` —— 工厂可跨线程
-- 工厂在目标线程上调用,产出的 `Future` 不需要 `Send`
-- 这就是部署 `!Send` Verticle 的底层机制
-
-每次 deploy:
-1. 框架内部 RR 选一个 `EventLoopId`(用户**不可指定**)
-2. 分配 `DeploymentId`,创建 `DeploymentScope`(空 subscriber 列表)
-3. `spawn_pinned` 一个 future,future 内部:`let mut v = factory(); v.start(ctx).await; cancel.cancelled().await; v.stop().await;`
-4. 通过 oneshot 把 `start` 的结果送回 deploy 调用方
-
-### 4.2 DeploymentScope 与 bound EventBus
-
-```rust
-pub(crate) struct DeploymentScope {
-    deployment: DeploymentId,
-    subscribers: Mutex<Vec<(String, SubscriberId)>>,
-}
-
-pub struct EventBus {
-    inner: Arc<EventBusInner>,
-    scope: Option<Arc<DeploymentScope>>,  // None = unbound, Some = bound
-}
-```
-
-- `Context::event_bus()` → `inner.event_bus.bound(scope.clone())`,产出 `scope=Some`
-- 在 bound 句柄上调用 `.consumer(addr)`:`inner.register(addr)` 拿到 `SubscriberId`,然后 push 到 `scope.subscribers`
-- `Vertx::undeploy(id)`:先 `bus.cleanup_scope(scope)` 把所有 `(addr, sub_id)` 一次性从路由表 `unregister`,再 `cancel.cancel() + join.await`
-- 即使用户**没**主动 drop `Consumer<T>`,undeploy 后路由也是干净的
-
-`Consumer<T>::Drop` 仍然在(供 unbound 场景)。它和 scope cleanup 互相幂等(`retain` 找不到 id 就静默)。
-
-### 4.3 Worker Pool 派发
-
-`WorkerPool` 内部持有 `Arc<OwnedRuntime>`,`OwnedRuntime: Drop` 时调 `Runtime::shutdown_background()` —— 在 `#[tokio::test]` 等"嵌套 runtime"场景下析构不会 panic。
-
-- `deploy_worker`:`rt.spawn(start_future)`,再 `rt.spawn(cancel.cancelled() then stop_future)`
-- `execute_blocking`:`rt.spawn_blocking(f)`,用的是 worker runtime 的 blocking pool
-
-### 4.4 Context 的 thread-local
-
-```rust
-thread_local! {
-    static CURRENT: RefCell<Option<Context>> = RefCell::new(None);
-}
-```
-
-- 进入 Verticle 时通过 `ContextGuard`(RAII)设置 CURRENT
-- `Context::current()` 在 Vertx 设置过的线程上返回 `Some(ctx)`,否则 `None`
-- `ContextGuard::drop` 还原 prev,支持嵌套
-
-### 4.5 Context 与 Verticle 的生命周期绑定
-
-Context 可被任意 clone 并越过 Verticle 自身的边界(传给 main、传给 WorkerVerticle、传给纯 std::thread 等)。但**它的"调度能力"必须随 Verticle 的撤销而失效**,否则会出现"verticle 已死、Context 继续往那个 EventLoop 派发空闲任务"的悬空状态。
-
-实现:
-
-```rust
-pub(crate) struct DeploymentScope {
-    deployment: DeploymentId,
-    alive: AtomicBool,          // 翻 false 后所有调度入口立即拒绝
-    cancel: CancellationToken,  // 协作式终止信号
-    subscribers: Mutex<Vec<(String, SubscriberId)>>,
-}
-```
-
-每个 Verticle 部署时分配一份 `Arc<DeploymentScope>`,该 Arc 同时被三方持有:
-1. `Deployment`(存储在 Vertx 的 deployments 表里)
-2. 该 Verticle 自己的 Context(以及任何 clone 出去的副本)
-3. 该 Verticle 通过 `ctx.event_bus()` 拿到的所有 bound EventBus 句柄
-
-**`undeploy` 严格按顺序执行**:
-
-```rust
-async fn undeploy(&self, id: DeploymentId) -> Result<()> {
-    let (_, dep) = self.inner.deployments.remove(&id)?;
-    // 1. 翻死 alive,新的 run_on_context / execute_blocking / bound consumer
-    //    立刻拒绝
-    dep.scope.mark_dead();
-    // 2. 清扫 bus 订阅,verticle 的 recv 循环醒来收到 None,自然退出
-    self.inner.shared.event_bus.cleanup_scope(&dep.scope);
-    // 3. 触发 CancellationToken,verticle 的 run() select! 分支收到信号
-    dep.scope.cancel.cancel();
-    // 4. 等 run() 自然退出,1s 内不退则 abort 兜底
-    match tokio::time::timeout(UNDEPLOY_GRACE, dep.join).await {
-        Ok(_) => Ok(()),
-        Err(_) => { abort_handle.abort(); Ok(()) }
-    }
-}
-```
-
-**Context 调度入口的检查**:`run_on_context` / `execute_blocking` 进入时先 `ensure_alive()`;`run_on_context` 还在跨线程到达目标后**再次检查**,以闭合"调度入队 → 翻死"中间的小窗口。
-
-**bound consumer 注册**:`EventBus::consumer` 在 `scope.is_alive` 为 false 时直接返 `DeploymentTerminated`,并在 register 之后再做一次 re-check 防竞态。
-
-**用户 run() 的协作式取消**:用 `tokio::select!` 显式监听 `ctx.cancellation_token().cancelled()`,这样 undeploy 的 1s 宽限期内 run() 就能自然退出。不监听 cancel 也不会死锁 —— bus consumer 被 cleanup_scope 关闭,`recv()` 返 None;但纯 CPU 循环就要靠 abort 兜底,**多一个 cancel 分支是最佳实践**。
-
-```rust
-async fn run(mut self, ctx: Context) -> Result<()> {
-    let cancel = ctx.cancellation_token();
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),   // ← 协作式
-            msg = self.consumer.recv() => {
-                let Some(env) = msg else { return Ok(()) };
-                // ...
-            }
-        }
-    }
-}
-```
-不监听 token 也不会"卡死":consumer recv 会被 cleanup_scope 唤醒返 None。监听 token 是更显式、更早响应的写法。
-
-**unbound Context / unbound EventBus**(来自 `Vertx::event_bus()`)永远 alive,`cancellation_token` 返回的是从不取消的 fresh token,`try_consumer` 永远成功。这是因为它不绑定到任何 Verticle 上,只能由 Vertx 整体 drop 时收尾。
-
----
-
-## 5. 典型用法
-
-### 5.1 owned-self Verticle 持普通字段(无 Rc/RefCell)
-
-```rust
-struct Pinger {
-    consumer: Consumer<String>,
-    count: Cell<u64>,    // 普通字段,不是 Rc<RefCell<_>>
-}
-
-#[async_trait(?Send)]
-impl Verticle for Pinger {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    self.count.set(self.count.get() + 1);
-                    let _ = env.reply(format!("pong#{}", self.count.get()));
-                }
-            }
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| Pinger {
-        consumer: ctx.event_bus().consumer("ping").unwrap(),
-        count: Cell::new(0),
-    }).await?;
-    let _: String = vx.event_bus()
-        .request("ping", "hi".to_string())
-        .await?;
-    Ok(())
-}
-```
-
-### 5.2 Verticle 之间通过 bound EventBus 通信
-
-```rust
-struct CallerV {
-    consumer: Consumer<String>,
-    bus: EventBus,           // bound bus,在 factory 里就抓出来
-}
-
-#[async_trait(?Send)]
-impl Verticle for CallerV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let upper: String = self.bus
-                        .request("upper", env.body().clone())
-                        .await?;
-                    let _ = env.reply(upper);
-                }
-            }
-        }
-    }
-}
-```
-
-### 5.3 `execute_blocking` 跨上下文跳转
-
-```rust
-async fn run(mut self, ctx: Context) -> Result<()> {
-    let cancel = ctx.cancellation_token();
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            msg = self.consumer.recv() => {
-                let Some(env) = msg else { return Ok(()) };
-                let n = *env.body();
-                // EventLoop 上调用 execute_blocking,跳 worker 算重活,
-                // await 完成后 LocalSet 保证 continuation 回到原 EventLoop。
-                let result = ctx.execute_blocking(move || expensive(n)).await?;
-                let _ = env.reply(result);
-            }
-        }
-    }
-}
-```
-
-### 5.4 把 reply handle 交给另一个任务
-
-`Envelope::into_parts` 让你把 body / headers / reply handle 拆开。配合 `ctx.spawn_local`,可以"主循环立即返回,reply 在后台 task 算完再发":
-
-```rust
-async fn run(mut self, ctx: Context) -> Result<()> {
-    let cancel = ctx.cancellation_token();
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            msg = self.consumer.recv() => {
-                let Some(env) = msg else { return Ok(()) };
-                let (job, _h, reply) = env.into_parts();
-                let ctx2 = ctx.clone();
-                ctx.spawn_local(async move {
-                    let r = ctx2.execute_blocking(move || job.process()).await;
-                    if let (Some(h), Ok(v)) = (reply, r) { let _ = h.reply(v); }
-                });
-            }
-        }
-    }
-}
-```
-
----
-
-## 6. 模块划分
-
-```
-src/
-├── lib.rs               // re-export
-├── vertx.rs             // Vertx, VertxBuilder, deploy / deploy_worker / undeploy
-├── verticle.rs          // Verticle (?Send), WorkerVerticle (Send)
-├── context.rs           // Context (opaque), thread-local CURRENT, ContextGuard
-├── eventloop.rs         // EventLoopId, EventLoopPool (LocalPoolHandle 包装)
-├── worker_pool.rs       // WorkerPool, OwnedRuntime (shutdown_background)
-├── deployment.rs        // DeploymentId
-├── error.rs             // VertxError / Result
-└── eventbus/
-    ├── mod.rs           // EventBus 公共 API + DeploymentScope + bound/cleanup
-    ├── inner.rs         // 路由表 + RR 调度
-    ├── envelope.rs      // Envelope<T> + ErasedEnvelope
-    └── consumer.rs      // Consumer<T> + Drop unregister
-```
-
----
-
-## 7. 验收清单
-
-- [x] `cargo test --tests` 全绿(26/26)
-  - [x] `deploy` 在 factory 返回后立即 ready;未知 id `undeploy` → `DeploymentNotFound`
-  - [x] **不监听 cancel 的 run() 会被 abort 兜底**
-  - [x] EventLoop 亲和性、owned `Cell<u64>` 字段(无 Rc/RefCell)、Verticle 间通信
-  - [x] WorkerVerticle、`execute_blocking` 回 EventLoop
-  - [x] `Context::current()` / 内省(EventLoop 与 Worker 两路径)
-  - [x] `Context::threading_model() / deployment_id() / owner()`(Vert.x 对齐)
-  - [x] `Context::is_on_event_loop_thread() / is_on_worker_thread() / is_on_vertx_thread()`(Vert.x 对齐)
-  - [x] `run_on_context` fire-and-forget,从外部线程跳进 EventLoop
-  - [x] **undeploy 后 `run_on_context` / `execute_blocking` / bound `consumer` 全部返 `DeploymentTerminated`**
-  - [x] `Vertx::timer` 正常触发与显式 cancel;`Vertx::periodic` 多次 tick + cancel
-  - [x] `Context::timer` 在 undeploy 时自动 cancel(bound timer 不漏)
-  - [x] `VertxBuilder` 覆盖默认值,EventBus 核心(publish / send / request + DeliveryOptions / consumer drop)
-- [x] `examples/ping_pong.rs`(owned `Cell<u64>`)
-- [x] `examples/pipeline.rs`(Source/Doubler×2/Sink 都是 owned-self run loop)
-- [x] `examples/verticle_to_verticle.rs`(bound EventBus 互相调用)
-- [ ] 性能 sanity check(后续)
-
----
-
-## 8. 明确不做(范围外)
-
-- 集群 / 分布式 EventBus
-- `Codec<T>` 与跨进程序列化
-- HTTP / WebSocket / TCP 服务端
-- 用户**指定 EventLoop 部署**(`deploy_on` 不存在,框架 RR 内部分派)
-- Verticle **跨 EventLoop** 启动 task(只能在自己的 LocalSet 上 `tokio::task::spawn_local`)
-- 动态加载 / 热部署
-- Metrics / 健康检查端点(只埋 `tracing` 钩子)
-
----
-
-## 9. 已落地的决定
-
-| 决定 | 选择 | 理由 |
-|---|---|---|
-| EventLoop 数量默认 | `std::thread::available_parallelism()` | 跟 Vert.x 一致;可被 builder 覆盖 |
-| Worker 线程数默认 | 20(可覆盖) | 贴近 Vert.x `setWorkerPoolSize` 默认值 |
-| 用户指定 EventLoop | **不支持**,框架 RR 内部分派 | 亲和性是运行时不变量,不应让用户扰动 |
-| Verticle 跨 EventLoop 启 task | 不支持 | 保持亲和性语义清晰;跨上下文用 `execute_blocking` |
-| Verticle 通信方式 | 各 Verticle 用 `ctx.event_bus()` 拿 **bound** 句柄,通过 address 互相调用 | 自动随 undeploy 清理 consumer |
-| `publish` 多订阅者 | `T: Clone` 路径 | 集群阶段再走 Codec |
-| Worker Runtime 析构 | `shutdown_background` | 兼容 `#[tokio::test]` 嵌套 runtime |
-
----
-
-## 10. 与 Vert.x core 的对照
-
-本节列出当前实现相对 Vert.x core 5.x 的覆盖情况,聚焦 **EventLoop / Context / Worker / EventBus / Timer** 五项基础能力。
-
-### 10.1 已对齐
-
-| 能力 | Vert.x | vertx-rs | 备注 |
-|---|---|---|---|
-| 多 EventLoop | `setEventLoopPoolSize`,默认 2*CPU | `VertxBuilder::event_loop_threads`,默认 `available_parallelism` | Vert.x 默认 2x,我们默认 1x,够用 |
-| Worker 池 | `setWorkerPoolSize`,默认 20 | `worker_threads(N)`,默认 20 | ✅ 数值一致 |
-| Verticle 部署 | `deployVerticle(supplier, options)` 有 start/stop 双钩 | `deploy(factory(ctx) -> V)` + Verticle::run(self, ctx) **owned-self** | Rust 化改写,见 §3.1 |
-| 多实例部署 + 配置 | `DeploymentOptions.setInstances(n).setConfig(json)` | `deploy_with(factory, DeploymentOptions::new().instances(n).config::<T>(c))` | 强类型 config,Arc 共享 |
-| 全局异常 hook | `Vertx.exceptionHandler(handler)` | `Vertx::set_exception_handler(fn)` | handler 错误兜底 |
-| Worker Verticle | `DeploymentOptions::setThreadingModel(WORKER)` | `deploy_worker(v)` | 拆成独立 API,更显式 |
-| Context.runOnContext | `void runOnContext(Handler<Void>)` | `run_on_context(f) -> Result<()>` | fire-and-forget 对齐,Result 多一个调度失败信号 |
-| Context.executeBlocking | `Future<T> executeBlocking(Callable<T>)`,回原 context | `async execute_blocking<F,R>(f) -> Result<R>` | LocalSet 天然回原线程 |
-| Context.deploymentID | `String deploymentID()` | `deployment_id() -> Option<DeploymentId>` | ✅ |
-| Context.owner | `Vertx owner()` | `owner() -> Option<Vertx>` | ✅(Weak 升级) |
-| Context.threadingModel | `ThreadingModel threadingModel()` | `threading_model() -> ThreadingModel` | ✅ |
-| 静态线程探测 | `Context.isOnEventLoopThread()` 等 | `Context::is_on_event_loop_thread()` 等 | ✅ |
-| EventBus.send | `EventBus.send(addr, msg)` | `EventBus::send(addr, msg).await` | async + 背压 |
-| EventBus.publish | `EventBus.publish(addr, msg)` | `EventBus::publish(addr, msg)` | 需 `T: Clone`(MVP 限制) |
-| EventBus.request | `Future<Message<T>> request(addr, msg[, opts])` | `request(addr, msg).await` / `request_with(addr, msg, opts).await` | ✅ 默认 30s,DeliveryOptions 对齐 |
-| EventBus.consumer | `MessageConsumer<T>.handler(h)` 推模型 | `bus.consumer::<T>(addr)` 既可 `.recv().await` 拉,也可 `.handler(fn)` 推 | ✅ 两种风格并存 |
-| Verticle 撤销自动清扫 | Vert.x undeploy 自动注销该 verticle 的 consumer | bound EventBus + DeploymentScope.cleanup | ✅ |
-| Timer (one-shot) | `vertx.timer(delay)` 返回 `Timer extends Future<Void>` | `Vertx::timer(d)` 返回 `Timer: Future<Output=Result<()>>` | ✅ |
-| Timer.cancel | `Timer.cancel()` | `Timer::cancel()` | ✅ |
-| Periodic | `vertx.setPeriodic(initial, period, handler)` | `Vertx::periodic(initial, period)` + `.tick().await` | Rust 拉模型 |
-| Timer 绑定 Verticle | Vert.x 撤销 verticle 时其注册的 timer 自动取消 | `Context::timer / periodic` 跟 scope 联动 | ✅ |
-
-### 10.2 故意未对齐 / MVP 不做
-
-| 能力 | Vert.x | 我们的选择 | 原因 |
-|---|---|---|---|
-| Verticle 生命周期形态 | `start(Promise<Void>)` + `stop(Promise<Void>)` 两钩,实例由框架持有 | **owned-self `run(self, ctx) -> Result<()>`**,实例 = task | Rust 所有权模型下 owned-self 更自然 —— state 用普通字段(`Cell`、`HashMap`)无需 Rc/RefCell;清理在 fn 末尾,无外部编排 |
-| 用户指定 EventLoop | `DeploymentOptions::setInstances` + 内部分配 | `DeploymentOptions::instances(n)` 多实例,EventLoop RR 框架内部分派 | 实例数可控,亲和性是运行时不变量 |
-| Verticle 跨 EventLoop 启动 task | 通过 `runOnContext(otherCtx)` 间接支持 | 不支持 | 保持亲和性语义清晰 |
-| 老 Timer API | `setTimer(delay, handler) -> long id` + `cancelTimer(id)` | 不提供 | Rust 回调风格不自然,`Timer::cancel` 已覆盖能力 |
-| `executeBlocking(ordered)` | `ordered=true` 同 context 多次调用串行 | 当前全 unordered | 后续可选添加 |
-| `DeliveryOptions` | timeout / headers / codec / localOnly | timeout + headers 已实现;codec/localOnly 暂未实现 | 集群引入时再补 codec/localOnly |
-| `MessageCodec` | 注册编解码器 | 类型擦除走 `Box<dyn Any>` | 集群阶段引入 serde |
-| `WorkerExecutor` 命名池 | `createSharedWorkerExecutor(name, size)` | 仅一个全局 worker pool | 后续可加 |
-| `Context.put/get/remove` | 每 Context 的 KV 存储 | 不提供 | Rust 类型擦除别扭 |
-| `VIRTUAL_THREAD` | Java 21 虚拟线程 verticle | 不模型化 | Tokio task 已经满足 |
-| `EXTERNAL` Context | 非 Vertx 线程的隐式 Context | `Context::current()` 返回 None | 我们不替外部线程"伪造"Context |
-| 集群 / 分布式 EventBus | Hazelcast / Infinispan 等 | 不做 | 范围外 |
-| HTTP / TCP / WebSocket / FileSystem | 一整套 IO 抽象 | 不做 | 范围外,可作为独立 crate |
-
-### 10.3 命名差异
-
-| Vert.x | vertx-rs | 备注 |
-|---|---|---|
-| `vertx.timer(delay)` | `vx.timer(delay)` | 简写一致 |
-| `vertx.setPeriodic(initial, period, h)` | `vx.periodic(initial, period)` + `tick().await` | 拉模型 |
-| `Vertx.currentContext()` | `Context::current()` | 静态方法位置不同 |
-| `vertx.eventBus()` | `vx.event_bus()` | snake_case |
-| `MessageConsumer<T>.handler(h)` | `Consumer<T>.recv().await` | 推 vs 拉 |
-
-### 10.4 Rust 生态原生覆盖一览
-
-下列 Vert.x 概念在 Rust 异步生态里有一等公民等价物，因此 vertx-rs **故意不再包一层**。如果你正在从 Vert.x 迁移过来，照下表替换即可。
-
-#### Future / Promise / 异步组合
-
-| Vert.x | Rust/Tokio | 例子 |
-|---|---|---|
-| `Future<T>` / `Promise<T>` | `async fn` 返回 `impl Future<Output = T>` | 函数签名即可 |
-| `CompositeFuture.all(a, b)` | `tokio::try_join!(a, b)` | 见下 |
-| `CompositeFuture.any(a, b)` | `tokio::select!` | 见下 |
-| `Future.compose(a -> b(a))` | `let x = a().await; b(x).await` | async/await 原生链式 |
-| `Future.recover(err -> default)` | `a().await.unwrap_or_else(...)` 或 `?` + `map_err` | Result 自然 |
-| `Future.onComplete(handler)` | `tokio::spawn(async move { a.await; ... })` | 不需要回调 |
-
-```rust
-// CompositeFuture.all 等价
-let bus = vx.event_bus();
-let (a, b) = tokio::try_join!(
-    bus.request::<_, String>("svcA", "x".to_string()),
-    bus.request::<_, String>("svcB", "y".to_string()),
-)?;
-
-// CompositeFuture.any 等价
-tokio::select! {
-    r = bus.request::<_, String>("primary", "x".to_string()) => use_result(r?),
-    _ = tokio::time::sleep(Duration::from_millis(50)) => fallback(),
-}
-
-// Future.compose 等价 —— async/await 直接读
-let token = login().await?;
-let user  = fetch_user(token).await?;
-```
-
-#### Buffer / Json / MultiMap
-
-| Vert.x | Rust 等价 | 备注 |
-|---|---|---|
-| `Buffer` | `bytes::Bytes` / `bytes::BytesMut` | 零拷贝切片 + 引用计数 |
-| `JsonObject` / `JsonArray` | 优先 `#[derive(Serialize, Deserialize)]` struct;泛用场景 `serde_json::Value` | 强类型优于动态对象 |
-| `MultiMap`(HTTP headers) | `http::HeaderMap` 或 `Vec<(String,String)>` | Rust 没有 multi-value-map 标准抽象,按场景选 |
-
-```rust
-// JsonObject 风格(动态)
-let v: serde_json::Value = serde_json::json!({ "name": "alice", "age": 30 });
-let name = v["name"].as_str();
-
-// 强类型(推荐)
-#[derive(serde::Deserialize)]
-struct User { name: String, age: u32 }
-let u: User = serde_json::from_str(payload)?;
-```
-
-#### Handler 接口
-
-| Vert.x | Rust |
+- deploy 的 Send factory 在目标 EventLoop 上创建实例；实例本身不必 Send。
+- deploy_worker 同样接收 factory，worker 实例和异步生命周期要求 Send。
+- **deploy 返回成功表示异步 start 已完成**。start 返回后，部署继续存活，等待撤销。
+- 主消息循环通过 Context 启动受管任务。一个任务自然结束不会自动撤销整个部署。
+- 部署记录在启动之前登记；取消 deploy Future 会触发撤销，后台继续清理。
+- start 返回 Err 时仍尝试 stop；factory/start panic 时跳过用户 stop，执行框架清理。
+- stop 错误及 panic 会被返回/报告，资源清理仍继续。每个实例最多执行一次 stop。
+- deploy_with 保留 Vec<DeploymentId> 返回形态；中途失败或调用被取消，撤销本批先前实例。
+- typed config 使用 Arc<C> 传给各实例 factory。
+
+### 2.1 受管任务
+
+| 接口 | 约束 |
 |---|---|
-| `Handler<T>` 单方法接口 | 闭包/函数指针。同步 `FnMut(T)` / 异步 `FnMut(T) -> impl Future` |
-| `AsyncResult<T>` 回调 | `async fn ... -> Result<T>` |
-| `Handler<Throwable>` 错误回调 | `?` 操作符 + `Result` |
+| spawn_local(future) → Result<JoinHandle<Result<()>>> | 当前 Context 必须与目标一致，且位于所属 EventLoop；支持 !Send |
+| spawn(future) → Result<JoinHandle<Result<()>>> | Future 为 Send；派发至目标 Context，EventLoop 目标仍固定线程 |
+| run_on_context(closure) → Result<()> | Send 闭包，异步入队；外部线程也能调用 |
+| execute_blocking(f) | 默认 ordered=true |
+| execute_blocking_with(f, ordered) | false 允许同 Context 多个阻塞操作并行 |
+| request_undeploy() | 不等待自身结束，适合在本部署任务内发起撤销 |
 
-Vert.x 用 `Handler<T>` 是因为 Java 8 之前没有真函数类型;Rust 闭包是一等公民,直接写就行。
+丢弃 JoinHandle 只分离调用方，任务仍由部署管理。
+Tracker token 在用户 Future 及其状态析构完成后才释放，覆盖未首次 poll 就被 abort 的情况。
+普通任务错误报告给异常 handler；Consumer 按消息捕获错误及 panic，随后继续接收。
 
-#### 并发/同步原语(对应 SharedData,见 §3.4.2)
+### 2.2 撤销与关闭
 
-| Vert.x SharedData | Rust 等价 |
+1. 关闭部署准入，拒绝新任务、订阅、定时器及普通阻塞操作。
+2. 注销订阅并取消 scope token；Consumer 不再读取缓冲消息。
+3. 给子任务半个 shutdown_grace 协作退出，随后 abort 剩余异步任务，并等待实际析构完成。
+4. 等待已经开始的 blocking 操作结束，执行 stop。stop 中可以执行清理所需的 blocking 操作。
+5. 等待清理期间产生的 blocking 操作结束，完成部署并释放记录。
+
+undeploy 调用使用一个 shutdown_grace deadline 覆盖上述过程，默认 1 秒。
+超时返回 ShutdownTimeout，后台收尾继续。**abort 不能抢占不让出执行权的同步代码，也不能中断已开始的 blocking 闭包。**
+
+close 是幂等异步操作：关闭全局准入、消费者和定时器，撤销全部部署，等待 blocking 操作，释放执行器。
+取消 close 的等待 Future 不会取消后台清理；超时后实例仍拒绝新工作，可再次等待 close。
+stop 失败通过 CleanupFailed 保留；初始化被取消本身不算关闭失败。
+同部署任务调用等待自身的 undeploy，或本实例 Context 内调用 close，返回 WouldDeadlock。
+Drop 仅发起尽力清理；有确定关闭需求时必须 await close。
+
+## 3. EventBus
+
+```text
+address → Route { TypeId, subscribers, round-robin cursor }
+                       ↓
+             每消费者 mpsc 队列，容量 256
+                       ↓
+                 Envelope<T>
+                       ↓ 可选
+             oneshot<Result<ErasedEnvelope>>
+```
+
+| API | 行为 |
 |---|---|
-| `Counter` | `Arc<AtomicU64>` (无锁) |
-| `Lock` | `Arc<tokio::sync::Mutex<()>>` (async 友好) |
-| `LocalMap<K,V>`(Shareable) | `Arc<T>` 不可变快照 / `arc-swap::ArcSwap<T>` 整体替换 |
-| `AsyncMap` | owner verticle + EventBus 地址 |
+| consumer<T> | 同地址存活消费者类型必须一致；冲突在注册时返回 TypeMismatch |
+| send / send_with | 轮询选择一个消费者；等待该队列空位；成功表示入队 |
+| try_send | 不等待；区分 QueueFull、ChannelClosed、NoConsumer |
+| publish | 复制给所有消费者；满队列丢弃该次投递并记录丢弃数 |
+| request / request_with | 返回响应体；默认 30 秒；一个 deadline 覆盖入队和回复 |
+| request_message / request_message_with | 返回完整响应 Envelope，可读取响应 headers |
+| reply / reply_with | 一次性响应，后者支持响应 headers |
+| fail(code, message) | 返回 RecipientFailure |
+| into_parts | 拆出 body、Headers 和可跨任务移动的 ReplyHandle |
 
-#### 可观测性 SPI
+请求取消/超时不会撤回已经入队的业务消息；迟到 reply 返回 ReplyClosed。
+Headers 按插入顺序保存、键大小写敏感、支持重复值；header 追加，insert 替换，get_all 读取全部值。
 
-| Vert.x | Rust 生态 |
+### 3.1 归属与竞态
+
+- Context::event_bus 注册始终绑定该 Context。
+- Vertx::event_bus 在框架外注册为 unbound；在本实例的 Context 中注册时自动绑定当前 Context。
+- 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
+- handler 接受本地 !Send 闭包；handler_worker 要求 Send 闭包及 Future。都校验调用 Context。
+- scope 存活检查、路由注册、作用域登记持有同一个准入锁；Stopping 不能插入新的登记。
+- 路由注销使用 DashMap entry 原子更新，删除最后一个订阅时同时删除轮询状态。
+- Consumer Drop 同时撤销路由和 scope 登记，避免长生命周期部署积累已销毁记录。
+- 所有同步锁在 await 或用户回调前释放。
+
+## 4. Timer 与配置
+
+Timer 创建时记录绝对 deadline，首次 poll 再晚也不会重新计算延迟。
+Periodic 创建时同样记录起点，首次 tick 才初始化 Tokio interval；错过 tick 使用 Skip 策略。
+取消检查优先于同轮到期，is_cancelled 同时反映显式取消和作用域取消。
+完成的一次性 Timer 不因后续关闭变为已取消。
+Context Timer 随 scope 取消；全局 Timer 随 close 取消。
+创建接口返回 Result；零周期为 InvalidOptions，关闭后创建返回相应生命周期错误。
+等待 Timer/tick 需要 Tokio 时间驱动；Timer 对象不会把调用方 Future 派发到其他 Context。
+
+| 配置 | 默认 |
 |---|---|
-| `VertxMetrics` SPI | [`metrics`](https://crates.io/crates/metrics) crate + `metrics-exporter-prometheus` |
-| `VertxTracer` SPI | [`tracing`](https://crates.io/crates/tracing) + `tracing-subscriber` + `opentelemetry` |
-| 内置 `LoggerHandler` | `tracing::info!` 宏 / 任何 `Subscriber` 实现 |
+| EventLoop 线程数 | 2 × available_parallelism()，builder 可覆盖 |
+| Worker 异步线程 | 20 |
+| blocking 线程及并发上限 | 独立的 20，blocking_threads 可覆盖 |
+| shutdown_grace | 1 秒 |
+| 消费者容量 | 256 |
+| 请求 timeout | 30 秒 |
 
-我们内部已经全程用 `tracing::error!` 等记录,接入 OTel/Jaeger/Prometheus 直接走 subscriber 即可,不需要框架包一层 SPI。
+有序 blocking 使用每 Context 的公平锁保持 FIFO，许可和记录覆盖排队、实际执行及调用方取消。
+普通 Context 执行门不用于 blocking 闭包。等待执行许可的操作可取消，已开始执行的操作必须自然结束。
 
-#### 总结
+## 5. 错误与可观测性
 
-凡是 Vert.x 包了一层"自家接口"的地方,在 Rust 里几乎都对应一个**生态层**的成熟选择。我们的原则:能用 std/tokio/serde/tracing 解决的,vertx-rs 不重复造轮子;只在 Vert.x 特有概念(Verticle / Context / EventBus / SharedData 语义)上保留 API 表面。
+异常路由：Context exception handler → 全局 exception handler → tracing。
+调用前复制 handler 并释放读锁，handler 可重设或清除自身；异常 handler panic 被捕获后写日志，避免递归。
+生命周期结束和全局关闭清除相应 handler 引用。
+tracing 包含部署 ID、Context ID、EventLoop ID、ThreadId，以及广播丢弃、关闭超时等信息。
+
+结构化错误覆盖：类型冲突、无消费者、队列满、通道关闭、请求超时、回复关闭、业务失败、Context 不匹配、
+部署终止、全局关闭、启动失败、panic、关闭超时、多实例回滚失败及整体关闭失败。
+
+## 6. 从 0.2 迁移
+
+| 0.2 | 0.3 |
+|---|---|
+| run(self, ctx) | start(&mut self, ctx) 与可选 stop(&mut self, ctx) |
+| run 内长循环 | 在 start 中 spawn_local/spawn 受管循环，或注册 handler |
+| deploy 返回 factory 完成 | deploy 等待异步 start 完成 |
+| deploy_worker(instance) | deploy_worker(factory) |
+| spawn_local 的输出为 () | Future 输出 Result<()>，调度返回 Result<JoinHandle<Result<()>>> |
+| handler 无返回值 | handler/handler_worker 返回 Result<()>，使用 ? 或处理错误 |
+| timer/periodic 直接返回对象 | 创建时使用 ? 或 unwrap |
+| HashMap headers | Headers；with_headers 仍接受 HashMap 转换 |
+| execute_blocking 无序 | 默认有序；需要并行时 execute_blocking_with(f, false) |
+| 依赖 Drop 结束 | 显式 close().await |
+
+多 handler 共享状态优先级：单 handler 独占 → Rc<Cell> → 小作用域 Rc<RefCell> → 通过内部地址协调。
+若 stop 需要访问任务使用的状态，通过这些明确的所有权结构共享；不要跨 await 保存 RefCell guard。
+
+可运行示例仍为 ping_pong、pipeline、verticle_to_verticle，均使用 start/stop 和显式 close。
+
+## 7. 与 Vert.x 5 的对照与范围
+
+| 能力 | 对齐情况 / Rust 选择 |
+|---|---|
+| EventLoop 线程亲和性 | 对齐；支持 !Send 状态 |
+| Context 传播与线程类型区分 | 对齐受管执行入口 |
+| Worker 普通执行串行 | 对齐；允许线程迁移 |
+| start/stop 就绪与关闭 | 异步钩子；框架增加受管任务取消及明确的等待超时 |
+| executeBlocking ordered | 默认有序；blocking 线程池与异步 Worker 线程分开配置 |
+| send/publish/request/reply/fail | 提供；send 的有界背压和 pull Consumer 是 Rust 扩展 |
+| Consumer 注册时点 | consumer 调用立即注册，支持 recv；与 Java 在 handler 注册后生效有差异 |
+| Timer / Periodic | Future / tick 拉模型；保留创建时间起点与取消语义 |
+| 多实例 | 返回 Vec<DeploymentId>，失败时回滚本批 |
+| Future/Promise | Rust Future、Result、oneshot；不重复实现 Java 类型 |
+| 任意成功的 Future 组合 | futures::future::select_ok；tokio::select! 等待先完成，不能等同 Future.any |
+| 配置 | factory 接收 Arc<C> 强类型配置；不提供动态 Context KV |
+| 外部 Context | current() 返回 None，不自动创建外部 Context |
+| SharedData | 使用 std/Tokio 共享原语；不提供框架门面 |
+
+本轮不包含 HTTP/TCP/WebSocket/FileSystem/DNS/通用流、集群 EventBus、Codec、命名 WorkerExecutor、
+Java 虚拟线程、动态部署、旧式按 ID 取消 Timer 和 metrics 服务端点。
+
+官方语义依据：[Context](https://vertx.io/docs/apidocs/io/vertx/core/Context.html)、
+[VerticleBase](https://vertx.io/docs/apidocs/io/vertx/core/VerticleBase.html)、
+[Message](https://vertx.io/docs/apidocs/io/vertx/core/eventbus/Message.html)、
+[Vertx.close](https://vertx.io/docs/apidocs/io/vertx/core/Vertx.html)。
+
+## 8. 验收
+
+- 同一个 EventLoop 上多 Context 交替 await 不串线；跨 OS 线程 poll 后 TLS 不残留。
+- factory/start/handler/受管任务/stop/析构的 OS 线程与 Context 一致。
+- Worker 同 Context 最大普通并行 poll 数为 1，不同 Context 可以并行。
+- blocking 的逻辑 Context 和物理 Worker 身份正确；有序 FIFO、无序并发上限正确。
+- start/stop 错误、panic、取消、关闭、批量回滚和自身撤销均有回归覆盖。
+- undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
+- 路由注册/清扫/最后订阅注销竞争不残留路由；请求超时包含满队列等待。
+- 业务失败、重复 headers、完整响应、迟到回复、广播满队列行为明确。
+- Timer 延后首次 poll、scope/global 取消、周期 Skip 均有测试。
+- cargo test、cargo clippy --all-targets -- -D warnings、三个示例运行及格式检查通过。
+- 不以未经测量的性能或完整 Vert.x Core 兼容率作承诺。
