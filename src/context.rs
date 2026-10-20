@@ -3,6 +3,7 @@ use crate::error::panic_error;
 use crate::eventloop::{EventLoopId, EventLoopPool};
 use crate::vertx::{Vertx, VertxInner};
 use crate::worker_pool::WorkerPool;
+use crate::TaskHandle;
 use crate::{DeploymentId, EventBus, Result, ThreadingModel, VertxError};
 use futures::FutureExt;
 use std::cell::{Cell, RefCell};
@@ -13,8 +14,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context as TaskContext, Poll};
-use tokio::sync::{Mutex, OwnedMutexGuard};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -46,7 +46,7 @@ pub(crate) struct ContextShared {
 }
 struct ContextData {
     id: u64,
-    gate: Arc<Mutex<()>>,
+    driver: tokio::runtime::Handle,
     execution: std::sync::Mutex<()>,
     ordered: Arc<Mutex<()>>,
     exception_handler: RwLock<Option<ExceptionHandler>>,
@@ -69,13 +69,17 @@ pub struct Context {
 static NEXT_CONTEXT: AtomicU64 = AtomicU64::new(1);
 impl Context {
     fn new(kind: Kind, inner: Arc<ContextShared>, scope: Arc<DeploymentScope>) -> Self {
+        let driver = inner.event_loops.driver(match kind {
+            Kind::EventLoop(id) => id,
+            Kind::Worker => inner.event_loops.pick(),
+        });
         Self {
             kind,
             inner,
             scope,
             data: Arc::new(ContextData {
                 id: NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed),
-                gate: Arc::new(Mutex::new(())),
+                driver,
                 execution: std::sync::Mutex::new(()),
                 ordered: Arc::new(Mutex::new(())),
                 exception_handler: RwLock::new(None),
@@ -201,7 +205,6 @@ impl Context {
         ContextFuture {
             ctx: self.clone(),
             future: Some(Box::pin(future)),
-            waiting: None,
         }
     }
     pub(crate) fn scope_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
@@ -232,21 +235,21 @@ impl Context {
         }
     }
     /// Spawn a managed non-Send task. Must be called in this exact Context.
-    /// Dropping the returned JoinHandle detaches the caller, not the scope.
-    pub fn spawn_local<F>(&self, future: F) -> Result<JoinHandle<Result<()>>>
+    /// Dropping the returned TaskHandle detaches the caller, not the scope.
+    pub fn spawn_local<F>(&self, future: F) -> Result<TaskHandle<()>>
     where
         F: Future<Output = Result<()>> + 'static,
     {
         self.check_local()?;
         let mut state = self.scope.admit()?;
         let future = Tracked::new(self.wrap(self.managed(future)), self.scope.task_token());
-        let handle = tokio::task::spawn_local(future);
+        let handle = TaskHandle::from_tokio(tokio::task::spawn_local(future));
         state.tasks.retain(|h| !h.is_finished());
         state.tasks.push(handle.abort_handle());
         Ok(handle)
     }
     /// Dispatch a Send future to this Context. EventLoop targets remain pinned.
-    pub fn spawn<F>(&self, future: F) -> Result<JoinHandle<Result<()>>>
+    pub fn spawn<F>(&self, future: F) -> Result<TaskHandle<()>>
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
@@ -254,24 +257,31 @@ impl Context {
         let mut state = self.scope.admit()?;
         let task = Tracked::new(self.wrap(self.managed(future)), self.scope.task_token());
         let handle = match self.kind {
-            Kind::EventLoop(id) => self.inner.event_loops.spawn_pinned(id, move || task)?,
-            Kind::Worker => self.inner.workers.spawn(task)?,
+            Kind::EventLoop(id) => {
+                TaskHandle::from_tokio(self.inner.event_loops.spawn_pinned(id, move || task)?)
+            }
+            Kind::Worker => {
+                self.inner
+                    .workers
+                    .spawn(self.data.id, self.data.driver.clone(), task)?
+            }
         };
         state.tasks.retain(|h| !h.is_finished());
         state.tasks.push(handle.abort_handle());
         Ok(handle)
     }
-    pub fn run_on_context<F>(&self, f: F) -> Result<()>
+    /// Queue a Future on this Context. Execution never starts inline.
+    pub fn run_on_context<F>(&self, future: F) -> Result<TaskHandle<()>>
     where
-        F: FnOnce() + Send + 'static,
+        F: Future<Output = Result<()>> + Send + 'static,
     {
-        let ctx = self.clone();
-        self.spawn(async move {
-            ctx.ensure_alive()?;
-            f();
-            Ok(())
-        })?;
-        Ok(())
+        self.spawn(future)
+    }
+    pub(crate) fn worker_lane(&self) -> u64 {
+        self.data.id
+    }
+    pub(crate) fn worker_driver(&self) -> tokio::runtime::Handle {
+        self.data.driver.clone()
     }
     pub fn request_undeploy(&self) -> Result<()> {
         self.ensure_alive()?;
@@ -312,20 +322,22 @@ impl Context {
         } else {
             None
         };
-        let permit = tokio::select! { biased;
-            _ = self.scope.cancel.cancelled(), if !self.stopping => return Err(VertxError::DeploymentTerminated(self.scope.deployment)),
-            p = self.inner.workers.permits.clone().acquire_owned() => p.map_err(|_| VertxError::VertxClosed)?,
-        };
         let ctx = self.clone();
         let handle = self.inner.workers.spawn_blocking(move || {
-            let (_token, _global, _ordered, _permit) = (token, global_token, ordered_lock, permit);
+            let (_token, _global, _ordered) = (token, global_token, ordered_lock);
             let _context = ctx.enter();
+            // Move captures into a local so cancellation drops them before the
+            // Context guard and tracking tokens, rather than with the FnOnce environment.
+            let operation = f;
             if !ctx.stopping && ctx.scope.cancel.is_cancelled() {
+                drop(operation);
                 return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
             }
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(panic_error)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(panic_error)
         })?;
-        handle.await.map_err(VertxError::from)?
+        handle
+            .await
+            .map_err(|_| VertxError::Join("blocking result channel closed".into()))?
     }
     pub fn timer(&self, delay: std::time::Duration) -> Result<crate::Timer> {
         let _state = self.scope.admit()?;
@@ -351,27 +363,15 @@ impl Drop for ContextGuard {
         CURRENT.with(|c| *c.borrow_mut() = self.prev.take());
     }
 }
-type GateWait = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
 pub(crate) struct ContextFuture<F> {
     ctx: Context,
     future: Option<Pin<Box<F>>>,
-    waiting: Option<GateWait>,
 }
 impl<F: Future> Future for ContextFuture<F> {
     type Output = F::Output;
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let _permit = if this.ctx.is_worker() {
-            let waiting = this
-                .waiting
-                .get_or_insert_with(|| Box::pin(this.ctx.data.gate.clone().lock_owned()));
-            let guard = match waiting.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(g) => g,
-            };
-            this.waiting = None;
-            Some(guard)
-        } else {
+        if this.ctx.is_event_loop() {
             assert!(
                 this.ctx
                     .inner
@@ -379,8 +379,7 @@ impl<F: Future> Future for ContextFuture<F> {
                     .check_thread(this.ctx.event_loop_id().unwrap()),
                 "EventLoop affinity violated"
             );
-            None
-        };
+        }
         let _execution = this
             .ctx
             .data

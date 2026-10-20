@@ -19,22 +19,29 @@ pub(crate) struct EventLoopPool {
     instance: u64,
     rr: AtomicUsize,
     threads: Vec<std::thread::ThreadId>,
+    drivers: Vec<tokio::runtime::Handle>,
 }
 impl EventLoopPool {
     pub fn new(size: usize, instance: u64) -> Self {
         assert!(size > 0, "event loop pool size must be > 0");
         let pool = LocalPoolHandle::new(size);
         let mut threads = Vec::with_capacity(size);
+        let mut drivers = Vec::with_capacity(size);
         for idx in 0..size {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             pool.spawn_pinned_by_idx(
                 move || async move {
                     set_thread(Some(ThreadIdentity::EventLoop(instance, EventLoopId(idx))));
-                    let _ = tx.send(std::thread::current().id());
+                    let _ = tx.send((
+                        std::thread::current().id(),
+                        tokio::runtime::Handle::current(),
+                    ));
                 },
                 idx,
             );
-            threads.push(rx.recv().expect("event loop initialization failed"));
+            let (thread, driver) = rx.recv().expect("event loop initialization failed");
+            threads.push(thread);
+            drivers.push(driver);
         }
         Self {
             pool: Mutex::new(Some(pool)),
@@ -42,7 +49,11 @@ impl EventLoopPool {
             instance,
             rr: AtomicUsize::new(0),
             threads,
+            drivers,
         }
+    }
+    pub fn driver(&self, id: EventLoopId) -> tokio::runtime::Handle {
+        self.drivers[id.0].clone()
     }
     pub fn size(&self) -> usize {
         self.size

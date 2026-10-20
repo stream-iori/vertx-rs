@@ -36,6 +36,8 @@ pub enum VertxError {
     StartFailed(String),
     #[error("task panicked: {0}")]
     Panic(String),
+    #[error("task was cancelled")]
+    TaskCancelled,
     #[error("join error: {0}")]
     Join(String),
     #[error("deployment failed: {cause}; rollback failures: {rollback:?}")]

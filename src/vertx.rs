@@ -118,9 +118,6 @@ impl Vertx {
     pub fn worker_thread_count(&self) -> usize {
         self.inner.shared.workers.threads()
     }
-    pub fn blocking_thread_count(&self) -> usize {
-        self.inner.shared.workers.blocking_threads()
-    }
     pub fn is_closed(&self) -> bool {
         self.inner.shared.cancel.is_cancelled()
     }
@@ -203,12 +200,14 @@ impl Vertx {
                 .lock()
                 .unwrap()
                 .insert(id, scope.clone());
-            if let Err(e) = self
-                .inner
-                .shared
-                .workers
-                .spawn(ctx.clone().wrap(drive_worker(ctx, factory, tx)))
-            {
+            if let Err(e) = self.inner.shared.workers.spawn(
+                ctx.worker_lane(),
+                ctx.worker_driver(),
+                ctx.clone().wrap(async move {
+                    drive_worker(ctx, factory, tx).await;
+                    Ok(())
+                }),
+            ) {
                 self.inner.deployments.lock().unwrap().remove(&id);
                 return Err(e);
             }
@@ -325,24 +324,28 @@ impl Vertx {
                     scope.request_stop();
                 }
                 owner.shared.blocking.close();
-                self.inner.shared.workers.spawn(async move {
-                    let mut errors = Vec::new();
-                    for scope in scopes {
-                        if let Err(e) = scope.wait().await {
-                            errors.push(e);
+                let control_loop = owner.shared.event_loops.pick();
+                self.inner
+                    .shared
+                    .event_loops
+                    .spawn_pinned(control_loop, move || async move {
+                        let mut errors = Vec::new();
+                        for scope in scopes {
+                            if let Err(e) = scope.wait().await {
+                                errors.push(e);
+                            }
                         }
-                    }
-                    owner.shared.blocking.wait().await;
-                    owner.shared.exception_handler.write().unwrap().take();
-                    owner.shared.event_loops.shutdown();
-                    owner.shared.workers.shutdown();
-                    let result = if errors.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(VertxError::CleanupFailed(errors))
-                    };
-                    owner.close_result.send_replace(Some(result));
-                })?;
+                        owner.shared.blocking.wait().await;
+                        owner.shared.exception_handler.write().unwrap().take();
+                        owner.shared.workers.shutdown().await;
+                        owner.shared.event_loops.shutdown();
+                        let result = if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(VertxError::CleanupFailed(errors))
+                        };
+                        owner.close_result.send_replace(Some(result));
+                    })?;
             }
         }
         let wait = async {
@@ -367,7 +370,6 @@ impl Default for Vertx {
 pub struct VertxBuilder {
     event_loop_threads: Option<usize>,
     worker_threads: usize,
-    blocking_threads: usize,
     shutdown_grace: Duration,
 }
 impl Default for VertxBuilder {
@@ -375,7 +377,6 @@ impl Default for VertxBuilder {
         Self {
             event_loop_threads: None,
             worker_threads: 20,
-            blocking_threads: 20,
             shutdown_grace: Duration::from_secs(1),
         }
     }
@@ -388,10 +389,6 @@ impl VertxBuilder {
     }
     pub fn worker_threads(mut self, n: usize) -> Self {
         self.worker_threads = n;
-        self
-    }
-    pub fn blocking_threads(mut self, n: usize) -> Self {
-        self.blocking_threads = n;
         self
     }
     pub fn shutdown_grace(mut self, d: Duration) -> Self {
@@ -411,8 +408,8 @@ impl VertxBuilder {
         });
         let event_loops = Arc::new(EventLoopPool::new(el, instance));
         let workers = Arc::new(
-            WorkerPool::new(self.worker_threads, self.blocking_threads, instance)
-                .expect("failed to initialize worker runtime"),
+            WorkerPool::new(self.worker_threads, instance)
+                .expect("failed to initialize worker pool"),
         );
         let cancel = CancellationToken::new();
         let event_bus = EventBus::new(cancel.clone());

@@ -1,9 +1,9 @@
+use crate::TaskAbortHandle;
 use crate::{Result, VertxError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::TaskTracker;
@@ -31,7 +31,7 @@ pub(crate) enum Phase {
 pub(crate) struct ScopeState {
     pub phase: Phase,
     pub subscribers: Vec<(String, u64)>,
-    pub tasks: Vec<AbortHandle>,
+    pub tasks: Vec<TaskAbortHandle>,
 }
 pub(crate) struct DeploymentScope {
     pub deployment: DeploymentId,

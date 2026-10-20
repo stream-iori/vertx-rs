@@ -24,3 +24,4 @@ pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};
 pub use verticle::{Verticle, WorkerVerticle};
 pub use vertx::{Vertx, VertxBuilder};
+pub use worker_pool::{TaskAbortHandle, TaskHandle};
