@@ -313,6 +313,7 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 直接依赖最低版本为 Tokio 1.54.0、tokio-util 0.7.20、async-trait 0.1.92、thiserror 2.0.21、
 futures 0.3.34、dashmap 6.2.1、tracing 0.1.44；示例/测试使用 tracing-subscriber 0.3.23 的 env-filter/json。
 普通依赖仍只启用 Tokio rt/sync/macros/time；开发依赖启用 full/test-util。保留 async-trait。
+测试使用 rstest 0.28.0，关闭默认特性；参数化和 fixture 只影响开发依赖，不向库引入额外计时器或执行器。
 Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺后续解析始终锁定到同一组补丁版本。
 
 ## 6. 从 0.2 迁移
@@ -431,3 +432,47 @@ run_on_context 接收 Future，原同步闭包改成 async { ...; Ok(()) }。
 - Timer 延后首次 poll、scope/global 取消、周期 Skip 均有测试。
 - cargo test、cargo clippy --all-targets -- -D warnings、三个示例运行及格式检查通过。
 - 不以未经测量的性能或完整 Vert.x Core 兼容率作承诺。
+
+## 10. 测试组织
+
+继续使用标准 Rust test harness 和 Tokio 测试入口，用 [rstest](https://docs.rs/rstest/0.28.0/rstest/) 补充命名参数用例与 fixture。
+参数化在编译时生成独立测试，支持 `--list`、按名称筛选及逐例失败报告；不要用一个循环代替多个独立场景。
+
+| JUnit 5 中的需求 | 本项目做法 |
+|---|---|
+| 参数化、方法提供测试数据 | `#[rstest]` + `#[case::场景名(...)]`，每例独立创建资源 |
+| 多维组合 | 独立维度使用 `#[values(...)]`；有关联的输入和预期使用显式 case，避免无效组合 |
+| 每例初始化 | `#[fixture]` 提供独立 Vertx；有特殊线程数、诊断或关闭配置时在测试里显式 builder |
+| 每例清理 | 成功路径显式 `close().await` / 池 shutdown；Drop 只能尽力清理，不能替代异步等待 |
+| 嵌套测试组 | 文件内 `mod` 分组，保留现有源文件和 integration target |
+| 动态测试工厂 | 暂无运行时扫描文件或协议数据生成用例的需求；未来需要时单独评估自定义 harness |
+
+```text
+tests/integration.rs
+ ├─ support：独立实例 fixture、Verticle 适配、日志缓冲及可控 Sink
+ ├─ configuration / lifecycle / shutdown
+ ├─ context / worker / blocking
+ ├─ eventbus / shared_state / timers
+ └─ errors / diagnostics / tracing_propagation / streams
+
+src/* 的 #[cfg(test)]：内部不变量，保留在实现所在模块
+ └─ EventLoop / Worker 内再按调度、取消、关闭及 panic 恢复分组
+```
+
+fixture 不使用 `#[once]` 共享 Vertx、Context、runtime 或当前 Dispatch；每例持有独立资源。
+fixture 只消除重复创建，时序、消息、断言和清理保留在测试主体；不增加统一动态类型场景执行器。
+`#[rstest]` 放在 `#[tokio::test]` 之前，`start_paused` 等属性继续显式写在 Tokio 入口上。
+保留 barrier/channel 握手、重复 wake 和注册竞争压力循环：它们构成同一个并发场景，不能拆成彼此独立的 case。
+不为压缩行数把 !Send 测试改成 Send，不用自动重试或放宽断言掩盖时序问题。
+
+常用命令（名称过滤为子串匹配）：
+
+```sh
+cargo test --test integration -- --list
+cargo test --test integration streams::
+cargo test --test integration pipe_preserves_primary_and_cleanup_failures::case_04_read_and_close_errors
+cargo test --lib eventloop::tests::cancellation::
+```
+
+运行时动态生成独立用例可参考 [libtest-mimic](https://docs.rs/libtest-mimic/latest/libtest_mimic/)，需要自定义 harness，且不支持标准输出捕获。
+当前用例在编译期可枚举，保留标准 harness 能继续直接使用现有 cargo/IDE 测试发现和日志捕获。

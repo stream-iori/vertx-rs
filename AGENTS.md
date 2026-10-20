@@ -28,7 +28,7 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 | `src/streams.rs` | 通用 Stream → Sink 传输、背压、结束策略及清理错误保留 |
 | `src/timer.rs` | 单次和周期定时、deadline、取消 |
 | `src/error.rs`、`src/lib.rs` | 结构化错误和公共导出 |
-| `tests/integration.rs` | 对外行为及并发回归；模块内单元测试覆盖内部不变量 |
+| `tests/integration.rs` | 按职责分组的对外行为与并发回归，support 提供独立 fixture；源码模块内单测覆盖内部不变量 |
 | `examples/` | `ping_pong`、`pipeline`、`verticle_to_verticle`，均显式关闭实例 |
 
 ## 必须保持的执行语义
@@ -161,6 +161,12 @@ cargo run --example verticle_to_verticle
 - 亲和性比较实际 ThreadId，同时检查 Context；Worker 迁移用可控跨线程 poll 验证，不能假定 Tokio 必定迁移。
 - Timer 优先用暂停时间测试；与独立运行时配合时注意虚拟时间，关闭前恢复时间或明确控制推进。
 - 测试使用小线程池并显式清理；同时覆盖同 Context 串行和不同 Context 并行，避免仅测单实例正常路径。
+- 参数化统一使用开发依赖 rstest：用 `#[case::场景名(...)]` 生成独立测试；独立维度可用 `#[values]`，关联输入与预期不要盲目做笛卡尔积。
+- `#[rstest]` 在 `#[tokio::test]` 之前；保留 `start_paused` 等 Tokio 配置。简单无参数测试可继续使用原生 test，不强制套宏。
+- 集成测试保持现有文件和 Cargo target，在文件内按职责分组；公共帮助放 support，具体时序和断言留在测试主体。
+- fixture 每例独立，不用 `#[once]` 共享 Vertx、Context、runtime 或 Dispatch；成功路径显式 await close，不依赖 fixture Drop 模拟异步 teardown。
+- 独立输入矩阵不要藏在 for 循环里；同一场景的重复 wake、竞争压力、消息序列和多参与者握手仍保留循环。
+- 暂不引入运行时动态测试 harness 或自动重试；有外部数据驱动需求时再评估，不为减少行数牺牲 !Send、真实线程和失败定位。
 - 回归覆盖失败、panic、取消、析构、满队列、超时、注册/清扫竞争及并发关闭等相关边界。
 - 文档示例应实际编译；不通过标记 ignore、放宽断言或关闭 lint 掩盖问题。
 - 已通过的检查不无故反复执行；新增改动、失败或仍未解决的疑点才触发补验。
