@@ -239,15 +239,24 @@ impl<T> Drop for Consumer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rstest::rstest]
+    #[case::empty(0)]
+    #[case::buffered(2)]
     #[tokio::test]
-    async fn stream_eof_is_fused_and_does_not_unregister_other_consumers() {
+    async fn stream_eof_is_fused_and_does_not_unregister_other_consumers(#[case] buffered: usize) {
         let vx = crate::Vertx::builder()
             .event_loop_threads(1)
             .worker_threads(1)
             .build();
         let mut consumer = vx.event_bus().consumer::<()>("eof").unwrap();
+        for _ in 0..buffered {
+            vx.event_bus().send("eof", ()).await.unwrap();
+        }
         let mut other = vx.event_bus().consumer::<()>("eof").unwrap();
         consumer.rx.close();
+        for _ in 0..buffered {
+            assert!(consumer.next().await.unwrap().is_ok());
+        }
         assert!(consumer.next().await.is_none());
         assert!(consumer.next().await.is_none());
         assert!(consumer.is_terminated());

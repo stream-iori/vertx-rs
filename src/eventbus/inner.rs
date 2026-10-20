@@ -446,13 +446,20 @@ impl EventBusInner {
 
 #[cfg(test)]
 mod tests {
+    //! Route lifecycle, reentrant wakeups and admission accounting.
     use super::*;
-    #[tokio::test]
-    async fn malformed_envelope_reports_conversion_failure_once() {
-        let bus = Arc::new(EventBusInner::new(
+
+    #[rstest::fixture]
+    fn bus() -> Arc<EventBusInner> {
+        Arc::new(EventBusInner::new(
             CancellationToken::new(),
             crate::diagnostics::Diagnostics::new(0, Default::default()),
-        ));
+        ))
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn malformed_envelope_reports_conversion_failure_once(bus: Arc<EventBusInner>) {
         let mut consumer = bus.register::<u32>("typed", None, 1).unwrap();
         bus.select::<u32>("typed")
             .unwrap()
@@ -472,12 +479,11 @@ mod tests {
         assert!(consumer.recv().await.unwrap().is_none());
         assert!(bus.routes.is_empty());
     }
+    #[rstest::rstest]
     #[tokio::test]
-    async fn concurrent_last_unregister_and_new_register_preserve_new_route() {
-        let bus = Arc::new(EventBusInner::new(
-            CancellationToken::new(),
-            crate::diagnostics::Diagnostics::new(0, Default::default()),
-        ));
+    async fn concurrent_last_unregister_and_new_register_preserve_new_route(
+        bus: Arc<EventBusInner>,
+    ) {
         for _ in 0..100 {
             let old = bus.register::<u32>("race", None, 256).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -500,8 +506,9 @@ mod tests {
         assert!(bus.routes.is_empty());
     }
 
+    #[rstest::rstest]
     #[test]
-    fn unregister_wakes_waiters_after_releasing_the_route_lock() {
+    fn unregister_wakes_waiters_after_releasing_the_route_lock(bus: Arc<EventBusInner>) {
         struct Reenter {
             bus: Arc<EventBusInner>,
             wakes: std::sync::atomic::AtomicUsize,
@@ -515,10 +522,6 @@ mod tests {
                 self.wakes.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let bus = Arc::new(EventBusInner::new(
-            CancellationToken::new(),
-            crate::diagnostics::Diagnostics::new(0, Default::default()),
-        ));
         let consumer = bus.register::<u32>("wake", None, 1).unwrap();
         bus.try_send("wake", 1u32, Headers::new()).unwrap();
         let mut reservation = bus.select::<u32>("wake").unwrap().reserve();
@@ -540,10 +543,7 @@ mod tests {
     #[test]
     fn concurrent_close_and_unregister_leave_no_queue_counts() {
         for _ in 0..100 {
-            let bus = Arc::new(EventBusInner::new(
-                CancellationToken::new(),
-                crate::diagnostics::Diagnostics::new(0, Default::default()),
-            ));
+            let bus = bus();
             let consumer = bus.register::<u32>("close-race", None, 1).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let gate = barrier.clone();

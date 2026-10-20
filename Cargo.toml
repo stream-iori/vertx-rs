@@ -17,6 +17,7 @@ futures = "0.3.34"
 tracing = "0.1.44"
 
 [dev-dependencies]
+rstest = { version = "0.28.0", default-features = false }
 tokio = { version = "1.54.0", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 

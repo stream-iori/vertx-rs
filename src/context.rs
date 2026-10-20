@@ -614,8 +614,11 @@ mod tests {
         assert!(Context::current().is_none());
         vx.close().await.unwrap();
     }
+    #[rstest::rstest]
+    #[case::normal_return(false)]
+    #[case::unwind(true)]
     #[tokio::test]
-    async fn guard_restores_nested_context_and_panic() {
+    async fn guard_restores_nested_context_and_panic(#[case] panic: bool) {
         let vx = Vertx::builder()
             .event_loop_threads(1)
             .worker_threads(2)
@@ -635,9 +638,12 @@ mod tests {
             assert!(Context::current().unwrap().same(&a));
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _b = b.enter();
-                panic!("guard test");
+                assert!(Context::current().unwrap().same(&b));
+                if panic {
+                    panic!("guard test");
+                }
             }));
-            assert!(r.is_err());
+            assert_eq!(r.is_err(), panic);
             assert!(Context::current().unwrap().same(&a));
         }
         assert!(Context::current().is_none());
