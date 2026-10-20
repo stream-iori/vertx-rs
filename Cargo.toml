@@ -2,22 +2,23 @@
 name = "vertx-rs"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.96"
+resolver = "3"
 description = "Rust + Tokio port of Vert.x core: EventLoop-affine Verticle + WorkerVerticle + EventBus"
 license = "Apache-2.0"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-dashmap = "6"
-async-trait = "0.1"
-thiserror = "1"
-futures = "0.3"
-tracing = "0.1"
+tokio = { version = "1.54.0", features = ["rt", "sync", "macros", "time"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+dashmap = "6.2.1"
+async-trait = "0.1.92"
+thiserror = "2.0.21"
+futures = "0.3.34"
+tracing = "0.1.44"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-tracing-subscriber = "0.3"
+tokio = { version = "1.54.0", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [[example]]
 name = "ping_pong"
