@@ -5,12 +5,12 @@
 
 ## 项目定位
 
-Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单进程执行核心：Verticle、Context、Worker、EventBus、Timer、部署和关闭。
+Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单进程执行核心：Verticle、Context、Worker、EventBus、Stream/Sink 传输、Timer、部署和关闭。
 对齐执行语义，使用 Rust 原生 async/await、Result、强类型消息及所有权模型。
 
 - 网络、文件、DNS、集群、Codec、SharedData 门面、命名 WorkerExecutor 和虚拟线程不在当前范围；仅在用户任务需要时扩展。
 - 版本、Edition、MSRV 和依赖特性以 [Cargo.toml](Cargo.toml) 为准。不要为实现便利擅自提高 MSRV 或增加依赖。
-- 保留现有目录、源文件名、测试 target 和示例名称，减少安全拦截及无关变更。task.rs / diagnostics.rs 是已批准的关注点拆分。
+- 保留现有目录、源文件名、测试 target 和示例名称，减少安全拦截及无关变更。task.rs / diagnostics.rs / streams.rs 是已批准的关注点拆分。
 - 不为修复局部问题顺带改版、重构整个项目或调整无关配置。
 
 ## 代码导航
@@ -25,6 +25,7 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 | `src/diagnostics.rs` | 诊断配置、轻量计数、只读快照及有界任务元数据 |
 | `src/deployment.rs` | 部署状态、资源准入、任务跟踪、取消和完成通知 |
 | `src/eventbus/` | 类型路由、消息队列、消费者、请求回复、headers |
+| `src/streams.rs` | 通用 Stream → Sink 传输、背压、结束策略及清理错误保留 |
 | `src/timer.rs` | 单次和周期定时、deadline、取消 |
 | `src/error.rs`、`src/lib.rs` | 结构化错误和公共导出 |
 | `tests/integration.rs` | 对外行为及并发回归；模块内单元测试覆盖内部不变量 |
@@ -95,6 +96,13 @@ Starting → Running → Stopping → Stopped
 - `execute_blocking` 默认同来源 Context FIFO；无序路径与 Worker Future 共用 worker_threads 配置的固定 OS 线程池。
 - blocking 跟踪覆盖排队、执行及调用方取消；实际操作结束前不能提前释放完成记录。
 - Consumer 仅接受返回 Future 的处理函数；同消费者等待上一条 Future 完成后再取下一条，不擅自增加消息并发。
+- 消费者默认容量 256，可通过 ConsumerOptions 单独配置；publish 必须先拿许可再 Clone，不能在路由锁内调用用户 Clone。
+- Consumer::recv 返回 Result<Option<Envelope<T>>>，Stream 的终止错误只交付一次后永久 None；取消优先于同轮缓冲消息。
+- MessageSink 就绪期间保持选定目标和排队位置，重复 poll_ready 只持有一个许可；提交重查存活，close/Drop 只结束适配器。
+- 消费者失活与移除计数在路由锁内完成；取消 token 和 sender 析构放在锁外，避免 Waker 重入死锁。
+- pipe 不创建任务或线程、不要求 Send/Unpin；最多额外暂存一个元素，每 64 次提交让出执行权。
+- 正常 EOF 必须等待 flush，默认随后 close；Result 失败默认 close，并保留主错和清理错误。abort/Drop/panic 不承诺异步 close，不撤回已入队数据。
+- 不自动转发 Envelope 的 headers/reply；使用者明确转换。公开 reserve、字节预算、批量及网络/文件流适配尚未实现。
 - Future 组合直接使用 futures；区分全成功、全结束、首次成功和首次完成，不重新实现 Future/Promise 门面。
 - TaskHandle 的 await 输出为单层 Result；丢弃只分离等待者，abort 在所属执行器取消，完成状态晚于用户析构。
 - 关闭协调在 EventLoop 执行；先完成部署、blocking 和 Worker 退出，再释放驱动。不能在 Worker 内等待回收自身。
@@ -104,12 +112,15 @@ Starting → Running → Stopping → Stopped
 ## 可观测性约束
 
 - 默认轻量计数和当前同步操作，任务详情必须显式开启并受上限约束；不保留无界历史。
+- 队列摘要区分 queued/reserved/waiting，满事件为累计值；详情显式开启、默认最多 1024 条并标记截断，只统计注册中的队列。
+- 队列诊断只弱引用计数元数据，不持有用户消息、队列或 Context；消息数量容量不等于全局内存/字节上限。
 - Diagnostics 不强持有 Context/用户 Future；任务结果、取消、panic 和用户析构路径均正确回收计数及元数据。
 - 快照不得获取 Context 执行锁，也不得向目标 EventLoop 派发请求；阻塞时仍可从外部读取。
 - Span 和 Dispatch 按每次 poll/drop 恢复；禁止把 entered guard 留在跨 await 状态中。
 - 区分同步 poll 时长、异步总等待、有序锁等待、Worker 排队、消息准入及队列停留；消息入队时间在取得 permit 后记录。
 - 慢操作在返回后告警；当前操作可外部采样。不增加常驻监控线程、exporter 或 metrics 服务端点。
 - 安装异常 hook 后仍保留框架错误事件，避免重复报告；不记录消息体和全部 headers，库不初始化 subscriber。
+- 自身作用域终止和显式任务取消不作为业务失败；其他部署的源终止仍需报告，不能统一吞掉 DeploymentTerminated。
 - 生命周期聚合用 LifecycleFailed，批量回滚用 DeploymentFailed；首错和后续错误都保留，cause 使用标准 Error::source。
 - 修改诊断时验证 Context 交错、Worker 迁移、取消/析构、详情上限和成功 close 后全部活跃计数归零。
 

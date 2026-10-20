@@ -1,7 +1,7 @@
 # vertx-rs 0.3 设计与迁移说明
 
 目标：用 Rust Future、固定 OS Worker 线程池和 Tokio IO 驱动实现 Vert.x 5 的**单进程执行核心**。
-范围包括 Verticle、Context、Worker、EventBus、Timer、部署及异步关闭。
+范围包括 Verticle、Context、Worker、EventBus、Stream/Sink 传输、Timer、部署及异步关闭。
 
 ## 1. 执行保证
 
@@ -148,7 +148,7 @@ Drop 仅发起尽力清理；有确定关闭需求时必须 await close。
 ```text
 address → Route { TypeId, subscribers, round-robin cursor }
                        ↓
-             每消费者 mpsc 队列，容量 256
+             每消费者 mpsc 队列，默认容量 256，可单独配置
                        ↓
                  Envelope<T>
                        ↓ 可选
@@ -158,9 +158,12 @@ address → Route { TypeId, subscribers, round-robin cursor }
 | API | 行为 |
 |---|---|
 | consumer<T> | 同地址存活消费者类型必须一致；冲突在注册时返回 TypeMismatch |
+| consumer_with<T> | ConsumerOptions 配置消息数量上限；容量必须在 1..=Semaphore::MAX_PERMITS 内 |
+| Consumer::recv / Stream | recv 返回 Result<Option<Envelope<T>>>；Stream 的 Item 为 Result<Envelope<T>> |
 | send / send_with | 轮询选择一个消费者；等待该队列空位；成功表示入队 |
 | try_send | 不等待；区分 QueueFull、ChannelClosed、NoConsumer |
-| publish | 复制给所有消费者；满队列丢弃该次投递并记录丢弃数 |
+| publish | 向所有消费者尝试取得许可，成功后才 Clone；满队列丢弃该次投递并记录丢弃数 |
+| sink / sink_with | 地址绑定的 MessageSink<T>，实现 futures::Sink；后者配置固定 headers |
 | request / request_with | 返回响应体；默认 30 秒；一个 deadline 覆盖入队和回复 |
 | request_message / request_message_with | 返回完整响应 Envelope，可读取响应 headers |
 | reply / reply_with | 一次性响应，后者支持响应 headers |
@@ -180,6 +183,37 @@ Headers 按插入顺序保存、键大小写敏感、支持重复值；header �
 - 路由注销使用 DashMap entry 原子更新，删除最后一个订阅时同时删除轮询状态。
 - Consumer Drop 同时撤销路由和 scope 登记，避免长生命周期部署积累已销毁记录。
 - 所有同步锁在 await 或用户回调前释放。
+- 注销先在路由锁内标记失活、移除目标并更新计数，再于锁外取消和释放 sender；Waker 可重入路由。
+
+### 3.2 Stream、Sink 与背压传输
+
+```text
+Stream<Result<T>> → 最多暂存一个元素 → Sink::poll_ready → start_send
+                        ↑                    │
+                        └──── Pending 时停止拉取 ┘
+EOF → 等待 flush → 默认等待 close → 返回结果
+失败 → 默认等待 close → 保留主错误与清理错误
+```
+
+| 环节 | 约定 |
+|---|---|
+| Consumer | 取消优先于同轮就绪的缓冲消息；作用域终止返回 DeploymentTerminated，unbound 全局关闭返回 VertxClosed |
+| 终止 | 类型转换失败或取消只产出一次 Err，随后永久 None；正常 EOF 为 None；实现 FusedStream |
+| MessageSink 就绪 | 首次 poll_ready 轮询选定消费者；Pending 后保持同一目标及排队位置，Ready 保留一个许可；重复 poll 不重复预留 |
+| MessageSink 提交 | start_send 前再次检查目标存活；注销/关闭后不能复用缓存许可；支持 !Unpin 消息 |
+| MessageSink flush | 确认已经入队，不等待业务处理完成；未使用的 readiness 许可保持到提交、close 或 Drop |
+| MessageSink close/Drop | 仅结束当前适配器并释放排队/许可，不关闭共享地址或其他生产者 |
+| pipe_to / pipe_to_with | 不创建任务或线程；不要求 Send/Unpin；保持调用方 Context，交给 spawn/spawn_local 管理 |
+| 正常结束 | 始终等待 flush；PipeOptions.end_on_success 默认 true，随后等待 close |
+| Result 失败 | PipeOptions.end_on_failure 默认 true，尝试 close；主错误与 close 错误同时保留在 LifecycleFailed |
+| abort/timeout/Drop/panic | 释放尚未提交的元素和许可；不能异步 close，也不撤回已入队消息；panic 遵循调用方执行器处理 |
+
+通用 pipe 每提交 64 个元素主动让出一次执行权，避免连续 Ready 的自定义流独占线程。
+这不提供全局公平性、字节预算或吞吐保证。调用方借用 sink 并关闭 end_on_success 时，可在传输后继续使用它。
+EventBus Consumer 通常不会自然 EOF，可用 take(n) 等组合器定义有限操作；部署终止不能当正常 EOF。
+Envelope 的 body、headers、reply 能力必须显式处理；map_ok(into_body) 仅转发消息体，不自动传播 headers 或 reply。
+sink_with 的 timeout 与 send_with 一样仅用于 request API，不是排队 deadline；需要时由调用方包裹 timeout。
+同消费者的 Future handler 串行规则不变；同步慢操作仍应交给 execute_blocking。
 
 ## 4. Timer 与配置
 
@@ -196,7 +230,7 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 | EventLoop 线程数 | 2 × available_parallelism()，builder 可覆盖 |
 | Worker 与 blocking 共用的 OS 线程数 | 20，worker_threads 可覆盖 |
 | shutdown_grace | 1 秒 |
-| 消费者容量 | 256 |
+| 消费者容量 | 256；consumer_with 可覆盖 |
 | 请求 timeout | 30 秒 |
 
 有序 blocking 使用每 Context 的公平锁保持 FIFO，跟踪记录覆盖排队、实际执行及调用方取消。
@@ -219,9 +253,11 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 | `Context::id()` / `TaskHandle::id()` | 进程内唯一；任务句柄与对应诊断记录使用相同 TaskId |
 | `VertxBuilder::diagnostics(DiagnosticsOptions)` | 默认启用轻量计数及线程当前操作；`enabled=false` 关闭诊断记录 |
 | `task_details` / `max_task_details` | 详情默认关闭；开启后默认最多 1024 个活跃记录，截断有标记；不保留历史 |
+| `queue_details` / `max_queue_details` | 队列详情默认关闭；开启后快照默认最多 1024 条，queue_details_truncated 标记截断 |
 | `Vertx::diagnostics()` | 同步采样，不向目标 EventLoop 发命令，不获取 Context 执行锁；不是全局事务快照 |
 | 活跃计数 | 部署、任务、就绪任务、路由消费者、blocking 等待/运行；任务包含生命周期驱动及 blocking |
-| 累计计数 | 任务成功/失败/取消、请求超时、广播丢弃；用户状态析构后才完成任务记录 |
+| 累计计数 | 任务成功/失败/取消、请求超时、广播丢弃、队列满事件；用户状态析构后才完成任务记录 |
+| 队列摘要 | queued_messages 为已入队元素，reserved_slots 为已获许可，waiting_senders 为等待准入的发送者；详情含地址、消费者/Context/部署 ID 及容量 |
 | 线程当前操作 | OS ThreadId、ContextId、TaskId、物理 EventLoopId、操作及开始时间；只列正在执行的受管 poll/drop/blocking |
 | 清理进度 | 部署 queued/starting/running/quiescing/stopping；close 的 deployments/blocking/worker_join/event_loop_join/closed/failed |
 
@@ -249,16 +285,22 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 消息 Span 保留发送方的因果父链；`message_handler` 子 Span 单独标明接收方 Context/Task，不能把父链当作当前 Context。
 不输出消息体或全部 headers，库不安装 subscriber。示例支持 `RUST_LOG` 和 `LOG_FORMAT=json`。
 默认摘要采集仍会在每次 poll 更新状态，并包装 Waker 跟踪就绪；轻量不等于零开销，可用 enabled=false 关闭采集。
+队列摘要只统计当前已注册队列，注销即移除，累计满事件保留到实例结束。
+满事件在非阻塞准入返回 Full，或一次异步准入首次等待且观察到容量耗尽时计数；重复 poll 不重复计数，Tokio 的协作让出本身不算队列满。
+诊断注册表每个活跃队列保存一条弱引用及计数元数据，不强持有消息、sender、receiver 或 Context；详情上限限制快照输出。
+注销后被外部保留的 Consumer 可能仍持有缓冲消息，直到 Consumer Drop 才释放；它们不再计入队列摘要。
+容量按消息数量计算，待发送 Future、单条消息大小及任务数量均没有全局上限，不能据此宣称整个进程内存有界。
 日志细节主要在 debug/trace；开启这些级别会增加开销，不承诺未经测量的性能提升。
 
 异常仍按 Context exception handler → 全局 exception handler 调用；调用前释放配置锁，handler 可重设自身。
 框架错误事件独立于用户 hook，安装 hook 也不会吞掉框架诊断；每个报告入口只输出一次框架错误事件。
 异常 handler panic 被捕获后单独记录，避免递归。生命周期结束和全局关闭清除 handler 引用。
+受管任务自身的部署终止、实例关闭和显式取消不作为业务异常报告；读取其他部署的流而遇到终止，仍是失败并报告。
 
 | 错误 | 用途 |
 |---|---|
 | 原始错误 | 只有一个失败时保持原类型 |
-| `LifecycleFailed { cause, cleanup }` | 保留首个 start/stop 错误及后续 stop/析构失败，不覆盖首错 |
+| `LifecycleFailed { cause, cleanup }` | 保留主错误及后续清理失败，包括 start/stop 和 pipe close，不覆盖首错 |
 | `DeploymentFailed { cause, rollback }` | 仅用于多实例部署失败后的回滚 |
 | `CleanupFailed` | close 汇总部署清理和 Worker/EventLoop join 错误 |
 
@@ -287,6 +329,7 @@ Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺
 | HashMap headers | Headers；with_headers 仍接受 HashMap 转换 |
 | execute_blocking 无序 | 默认有序；需要并行时 execute_blocking_with(f, false) |
 | 依赖 Drop 结束 | 显式 close().await |
+| Consumer::recv 返回 Option | 现在返回 Result<Option<Envelope<T>>>；先用 ? 处理终止错误，再处理 EOF |
 
 多 handler 共享状态优先级：单 handler 独占 → Rc<Cell> → 小作用域 Rc<RefCell> → 通过内部地址协调。
 若 stop 需要访问任务使用的状态，通过这些明确的所有权结构共享；不要跨 await 保存 RefCell guard。
@@ -294,7 +337,7 @@ Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺
 | 示例 | 内容 |
 |---|---|
 | `ping_pong` | !Send 状态、线程/Context 身份、headers、业务失败、超时及迟到回复 |
-| `pipeline` | 校验和流水线、两个消费者、共享固定 Worker、有序/无序 blocking、受管任务及诊断快照 |
+| `pipeline` | pipe_to 有限源、容量 1 背压、Stream 收集、两个消费者、共享 Worker、有序/无序 blocking 及队列快照 |
 | `verticle_to_verticle` | 真实成功/失败服务、try_join_all / join_all / select_ok、取消及 detached task 说明 |
 
 三个示例均使用 start/stop、可配置日志、有界等待和显式 close；操作与 close 都失败时保留两者。
@@ -310,6 +353,7 @@ Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺
 | executeBlocking ordered | 默认有序；与 Worker Future 共用固定 OS 线程池 |
 | send/publish/request/reply/fail | 提供；send 的有界背压和 pull Consumer 是 Rust 扩展 |
 | Consumer 注册时点 | consumer 调用立即注册，支持 recv；与 Java 在 handler 注册后生效有差异 |
+| ReadStream / WriteStream / Pipe | 使用 futures::Stream / Sink 和 pipe_to 表达拉取、背压、结束及失败；无需另造 handler/pause/fetch 门面 |
 | Timer / Periodic | Future / tick 拉模型；保留创建时间起点与取消语义 |
 | 多实例 | 返回 Vec<DeploymentId>，失败时回滚本批 |
 | Future/Promise | Rust Future、Result、oneshot；不重复实现 Java 类型 |
@@ -318,7 +362,7 @@ Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺
 | 外部 Context | current() 返回 None，不自动创建外部 Context |
 | SharedData | 使用 std/Tokio 共享原语；不提供框架门面 |
 
-本轮不包含 HTTP/TCP/WebSocket/FileSystem/DNS/通用流、集群 EventBus、Codec、命名 WorkerExecutor、
+本轮不包含 HTTP/TCP/WebSocket/FileSystem/DNS 流适配、公开 reserve、字节预算、批量传输、集群 EventBus、Codec、命名 WorkerExecutor、
 Java 虚拟线程、动态部署、旧式按 ID 取消 Timer 和 metrics 服务端点。
 
 官方语义依据：[Context](https://vertx.io/docs/apidocs/io/vertx/core/Context.html)、
@@ -346,7 +390,7 @@ Future wake → 合并重复通知 → 所属 Context 就绪队列
   Handle::enter 不推进 Future，也不创建 Worker Tokio runtime。实际 Future 调度由原生池完成。
 - 原生线程池只提供普通 Future 执行环境，不提供 Tokio 多线程任务环境特有的 block_in_place 等保证。
   裸 tokio::spawn 使用所进入的 Tokio runtime，既不继承 Context，也不成为原生 Worker 任务；使用 Context::spawn 管理业务任务。
-- 内部就绪队列不额外设置总容量；每个任务最多保留一个就绪通知。EventBus 的消费者队列仍为 256。
+- 内部就绪队列不额外设置总容量；每个任务最多保留一个就绪通知。EventBus 的消费者队列默认容量为 256，可单独配置。
   这不是全局任务数量上限，不承诺更高吞吐量。
 
 直接使用已有 futures 库，不定义 Java 风格 Future/Promise 门面：
@@ -381,6 +425,9 @@ run_on_context 接收 Future，原同步闭包改成 async { ...; Ok(()) }。
 - undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
 - 路由注册/清扫/最后订阅注销竞争不残留路由；请求超时包含满队列等待。
 - 业务失败、重复 headers、完整响应、迟到回复、广播满队列行为明确。
+- Stream 终止错误只产生一次；Sink 重复就绪、排队取消及目标注销不泄漏许可；publish 先获许可再 Clone。
+- pipe 验证背压、有限 EOF、异步 flush/close、主错与清理错误、!Send/!Unpin、取消析构及 Context/Span 隔离。
+- 队列快照区分 queued/reserved/waiting，详情受限；并发关闭/注销后活跃计数归零。
 - Timer 延后首次 poll、scope/global 取消、周期 Skip 均有测试。
 - cargo test、cargo clippy --all-targets -- -D warnings、三个示例运行及格式检查通过。
 - 不以未经测量的性能或完整 Vert.x Core 兼容率作承诺。
