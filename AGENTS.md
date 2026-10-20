@@ -52,6 +52,9 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 - Worker Future 与 blocking 共用固定数量的 OS 线程，不重新引入 Tokio Worker runtime 或额外 blocking 池。
 - Worker poll 通过所属 EventLoop runtime Handle 访问 IO/Timer 驱动；Handle::enter 不替代 Future 调度。
 - wake 合并必须覆盖 poll 中通知与迟到通知；Pending 任务继续登记，取消和用户析构只在所属执行器执行。
+- EventLoop 使用自管 OS 线程、current-thread runtime 和 LocalSet，不重新引入 LocalPoolHandle 或 Tokio 代理任务。
+- 跨线程派发只入队一次并创建一个本地任务；同目标线程直接 spawn_local，用户 Future 不内联执行。
+- EventLoop 取消桥接覆盖入队与 AbortHandle 绑定竞争；已接收命令的取消及析构必须在所属线程完成。
 - `spawn_local` 校验实例、所属 EventLoop、当前 Context 和存活状态；不能只判断线程类型。
 - 框架内部派发统一走受管入口。裸 Tokio spawn 不继承 Context，也不自动受部署管理。
 - 不在 EventLoop 中执行同步 IO、线程 sleep 或长 CPU 计算；使用受限的 blocking 执行入口。
@@ -71,6 +74,9 @@ Starting → Running → Stopping → Stopped
 - 受管任务的完成记录晚于用户状态析构；覆盖未首次 poll 就被 abort 的任务。
 - undeploy 成功返回前，受管任务及其析构必须完成；stop 最多执行一次。
 - close 幂等；等待方取消不撤销后台收尾；超时返回明确错误，实例继续拒绝新工作。
+- close 成功须晚于全部 Worker 与 EventLoop 线程退出及 join；只在末尾创建一个临时回收线程，不添加常驻回收线程。
+- EventLoop 业务清理结束后才停止派发；关闭准入与入队原子协调。剩余命令、LocalSet、runtime 在所属线程销毁后再清除线程身份。
+- 本实例 EventLoop 上的裸 Tokio 任务也不能等待自身 close；检查物理线程，不能只依赖 Context::current。
 - 不把启动取消误报为清理失败。保留原始错误及回滚/关闭错误，不能仅写日志后返回成功。
 - abort 无法抢占不让出执行权的同步代码，也不能中断已开始的 blocking 闭包；不能宣称它们已被强制终止。
 - 等待自身结束必须拒绝；本部署内请求撤销使用 `request_undeploy()`。

@@ -54,6 +54,25 @@ Context 与物理线程身份分开记录。调用 execute_blocking 时：
 EventLoop 初始化记录实例 ID、EventLoop ID 和实际 ThreadId，受管 poll 校验物理位置。
 Worker 原生线程启动/退出时设置和清除物理线程类型。
 
+### 1.2 EventLoop 直接派发
+
+EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线程保留 Tokio current-thread runtime + LocalSet。
+不再使用 LocalPoolHandle 或等待本地 JoinHandle 的 Tokio 代理任务。
+
+```text
+跨线程派发 → 目标 EventLoop 命令队列 → 一个本地任务 → 用户 Future
+同线程派发 ─────────────────────────→ 一个本地任务 → 用户 Future
+```
+
+- 跨线程命令传递 Send factory，!Send Future 在目标线程创建；每个任务只创建一个本地 Tokio 任务。
+- 同目标 EventLoop 的 spawn 及 spawn_local 直接创建本地任务，不经过跨线程队列，也不内联执行用户 Future。
+- 跨线程 TaskHandle 只使用一个结果 oneshot，取消状态覆盖入队前、入队后及绑定本地 AbortHandle 时的竞争。
+- 早到的 abort 不会丢失；取消、未首次 poll 的 Future 析构和 panic 清理都在目标线程完成。
+- 命令每处理最多 64 条主动让出执行权。命令队列沿用无界方式，不增加背压 API。
+- 创建实例等待全部 EventLoop 就绪，记录实际 ThreadId 和 runtime Handle；部分启动失败时回收已创建线程。
+- 普通依赖不启用 Tokio rt-multi-thread；tokio-util 继续用于 CancellationToken、TaskTracker 等工具。
+- 本轮只验证派发结构与执行语义，不提供未经测量的性能提升数字。
+
 ## 2. 生命周期
 
 ```rust
@@ -110,12 +129,18 @@ undeploy 调用使用一个 shutdown_grace deadline 覆盖上述过程，默认 
 超时返回 ShutdownTimeout，后台收尾继续。**abort 不能抢占不让出执行权的同步代码，也不能中断已开始的 blocking 闭包。**
 
 close 是幂等异步操作。协调任务在 EventLoop 上执行：关闭全局准入、消费者和定时器，撤销全部部署，
-等待 blocking 操作，排空 Worker 任务并等待固定线程退出、join，最后释放 EventLoop。
-排空时拒绝新任务，但继续接受已有任务的 wake 和取消调度；Worker 不回收自身线程。
-EventLoop 只在 JoinHandle::is_finished 后 join，不阻塞等待线程退出。
+等待 blocking 操作，排空 Worker 任务并等待固定线程退出、join，再关闭 EventLoop 派发准入并请求停止。
+业务清理期间 EventLoop 继续驱动命令、wake、Timer 和取消；入队检查与关闭派发准入使用同一个锁。
+EventLoop 退出时在所属线程取消剩余命令、销毁 LocalSet 和 runtime，最后清除物理线程身份。
+关闭末尾最多创建一个临时回收线程，join 全部 EventLoop 后才发布最终结果；运行期间没有新增常驻回收线程。
+Worker 与 EventLoop 都不等待回收自身；join 或回收线程创建失败返回 CleanupFailed，不能误报成功。
+显式 close 成功表示所有 Worker 和 EventLoop OS 线程已退出并完成 join。
+排空时拒绝新业务，但继续接受已有任务的必要 wake 和取消调度。
 取消 close 的等待 Future 不会取消后台清理；超时后实例仍拒绝新工作，可再次等待 close。
 stop 失败通过 CleanupFailed 保留；初始化被取消本身不算关闭失败。
 同部署任务调用等待自身的 undeploy，或本实例 Context 内调用 close，返回 WouldDeadlock。
+本实例任一 EventLoop OS 线程上等待 close 也返回 WouldDeadlock，包括 current() 为 None 的裸 Tokio 任务；
+从其他实例的 EventLoop 等待本实例关闭则允许。
 Drop 仅发起尽力清理；有确定关闭需求时必须 await close。
 
 ## 3. EventBus
@@ -285,6 +310,8 @@ run_on_context 接收 Future，原同步闭包改成 async { ...; Ok(()) }。
 - blocking 的逻辑 Context 和物理 Worker 身份正确；有序 FIFO、无序并发由共用线程数限制。
 - Worker 与 blocking 使用同一组实际 ThreadId；Pending 让出线程、跨线程恢复及 wake 合并不丢通知。
 - Worker 内真实异步 IO、Timer、timeout 可用；取消析构和析构 panic 不破坏线程池或 Context。
+- EventLoop 同线程派发不内联；跨线程早到取消、运行中取消及关闭入队竞争不遗失任务结果。
+- 初始化部分失败回收已创建线程；close 成功时全部 EventLoop 已 join，保留 Context、任务句柄或 Waker 不阻止退出。
 - start/stop 错误、panic、取消、关闭、批量回滚和自身撤销均有回归覆盖。
 - undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
 - 路由注册/清扫/最后订阅注销竞争不残留路由；请求超时包含满队列等待。
