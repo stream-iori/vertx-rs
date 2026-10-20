@@ -164,7 +164,10 @@ impl Vertx {
                 .shared
                 .event_loops
                 .spawn_pinned(loop_id, move || {
-                    ctx.clone().wrap(drive_local(ctx, factory, tx))
+                    ctx.clone().wrap(async move {
+                        drive_local(ctx, factory, tx).await;
+                        Ok(())
+                    })
                 })
             {
                 self.inner.deployments.lock().unwrap().remove(&id);
@@ -301,10 +304,12 @@ impl Vertx {
     /// Idempotent asynchronous shutdown. Cancellation of this waiter does not
     /// cancel cleanup. A timeout leaves the instance closed to new work.
     pub async fn close(&self) -> Result<()> {
-        if Context::current().is_some_and(|c| {
-            c.owner()
-                .is_some_and(|v| Arc::ptr_eq(&v.inner, &self.inner))
-        }) {
+        if self.inner.shared.event_loops.owns_current_thread()
+            || Context::current().is_some_and(|c| {
+                c.owner()
+                    .is_some_and(|v| Arc::ptr_eq(&v.inner, &self.inner))
+            })
+        {
             return Err(VertxError::WouldDeadlock);
         }
         {
@@ -338,13 +343,11 @@ impl Vertx {
                         owner.shared.blocking.wait().await;
                         owner.shared.exception_handler.write().unwrap().take();
                         owner.shared.workers.shutdown().await;
-                        owner.shared.event_loops.shutdown();
-                        let result = if errors.is_empty() {
-                            Ok(())
-                        } else {
-                            Err(VertxError::CleanupFailed(errors))
-                        };
-                        owner.close_result.send_replace(Some(result));
+                        owner
+                            .shared
+                            .event_loops
+                            .finish_shutdown(errors, owner.close_result.clone());
+                        Ok(())
                     })?;
             }
         }
@@ -406,7 +409,8 @@ impl VertxBuilder {
                 .map(|n| n.get().saturating_mul(2))
                 .unwrap_or(2)
         });
-        let event_loops = Arc::new(EventLoopPool::new(el, instance));
+        let event_loops =
+            Arc::new(EventLoopPool::new(el, instance).expect("failed to initialize event loops"));
         let workers = Arc::new(
             WorkerPool::new(self.worker_threads, instance)
                 .expect("failed to initialize worker pool"),

@@ -7,7 +7,7 @@ description = "Rust + Tokio port of Vert.x core: EventLoop-affine Verticle + Wor
 license = "Apache-2.0"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 dashmap = "6"
 async-trait = "0.1"

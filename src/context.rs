@@ -257,9 +257,7 @@ impl Context {
         let mut state = self.scope.admit()?;
         let task = Tracked::new(self.wrap(self.managed(future)), self.scope.task_token());
         let handle = match self.kind {
-            Kind::EventLoop(id) => {
-                TaskHandle::from_tokio(self.inner.event_loops.spawn_pinned(id, move || task)?)
-            }
+            Kind::EventLoop(id) => self.inner.event_loops.spawn_pinned(id, move || task)?,
             Kind::Worker => {
                 self.inner
                     .workers

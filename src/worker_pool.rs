@@ -1,5 +1,6 @@
 use crate::context::{set_thread, ThreadIdentity};
 use crate::error::panic_error;
+use crate::eventloop::LocalTaskControl;
 use crate::{Result, VertxError};
 use futures::task::{waker_ref, ArcWake};
 use std::collections::{HashMap, VecDeque};
@@ -20,7 +21,7 @@ pub struct TaskHandle<T> {
 }
 enum TaskBackend<T> {
     Tokio(tokio::task::JoinHandle<Result<T>>),
-    Worker(oneshot::Receiver<Result<T>>),
+    Channel(oneshot::Receiver<Result<T>>),
 }
 /// A clonable cancellation handle. Cancellation takes effect on the owning
 /// executor, after an in-progress poll has returned.
@@ -31,6 +32,7 @@ pub struct TaskAbortHandle {
 #[derive(Clone)]
 enum AbortBackend {
     Tokio(tokio::task::AbortHandle),
+    EventLoop(Arc<LocalTaskControl>),
     Worker {
         task: Weak<Task>,
         finished: Arc<AtomicBool>,
@@ -40,6 +42,7 @@ impl TaskAbortHandle {
     pub fn abort(&self) {
         match &self.backend {
             AbortBackend::Tokio(handle) => handle.abort(),
+            AbortBackend::EventLoop(task) => task.abort(),
             AbortBackend::Worker { task, .. } => {
                 if let Some(task) = task.upgrade() {
                     task.schedule(true);
@@ -50,11 +53,23 @@ impl TaskAbortHandle {
     pub fn is_finished(&self) -> bool {
         match &self.backend {
             AbortBackend::Tokio(handle) => handle.is_finished(),
+            AbortBackend::EventLoop(task) => task.is_finished(),
             AbortBackend::Worker { finished, .. } => finished.load(Ordering::Acquire),
         }
     }
 }
 impl<T> TaskHandle<T> {
+    pub(crate) fn from_event_loop(
+        receiver: oneshot::Receiver<Result<T>>,
+        task: Arc<LocalTaskControl>,
+    ) -> Self {
+        Self {
+            backend: TaskBackend::Channel(receiver),
+            abort: TaskAbortHandle {
+                backend: AbortBackend::EventLoop(task),
+            },
+        }
+    }
     pub(crate) fn from_tokio(handle: tokio::task::JoinHandle<Result<T>>) -> Self {
         let abort = TaskAbortHandle {
             backend: AbortBackend::Tokio(handle.abort_handle()),
@@ -84,10 +99,9 @@ impl<T> Future for TaskHandle<T> {
                 Err(error) if error.is_panic() => Err(panic_error(error.into_panic())),
                 Err(error) => Err(VertxError::Join(error.to_string())),
             }),
-            TaskBackend::Worker(receiver) => Pin::new(receiver).poll(cx).map(|result| {
-                result.unwrap_or_else(|_| {
-                    Err(VertxError::Join("worker result channel closed".into()))
-                })
+            TaskBackend::Channel(receiver) => Pin::new(receiver).poll(cx).map(|result| {
+                result
+                    .unwrap_or_else(|_| Err(VertxError::Join("task result channel closed".into())))
             }),
         }
     }
@@ -402,7 +416,7 @@ impl WorkerPool {
         }
         task.schedule(false);
         Ok(TaskHandle {
-            backend: TaskBackend::Worker(receiver),
+            backend: TaskBackend::Channel(receiver),
             abort: TaskAbortHandle {
                 backend: AbortBackend::Worker {
                     task: Arc::downgrade(&task),

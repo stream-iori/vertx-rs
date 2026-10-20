@@ -135,10 +135,14 @@ async fn undeploy_aborts_misbehaving_child() {
     let id = vx
         .deploy(move |_| {
             local(move |ctx| async move {
-                let handle = ctx.spawn_local(async {
+                let (entered, started) = oneshot::channel();
+                let handle = ctx.spawn_local(async move {
+                    entered.send(()).ok();
                     std::future::pending::<()>().await;
                     Ok(())
                 })?;
+                // This test requires an already-running, non-cooperative child.
+                started.await.unwrap();
                 tx.send(handle).ok();
                 Ok(())
             })
@@ -2331,4 +2335,194 @@ async fn queued_blocking_operation_is_skipped_after_scope_cancellation() {
     assert_eq!(executed.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_eventloop_send_spawn_switches_context_without_running_inline() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let (_, first) = capture(&vx).await;
+    let (_, second) = capture(&vx).await;
+    let first_id = first.deployment_id();
+    let second_id = second.deployment_id();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let observed = ran.clone();
+    first
+        .spawn(async move {
+            let thread = std::thread::current().id();
+            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            let task = second.spawn(async move {
+                assert_eq!(std::thread::current().id(), thread);
+                assert_eq!(Context::current().unwrap().deployment_id(), second_id);
+                ran.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                assert_eq!(Context::current().unwrap().deployment_id(), second_id);
+                Ok(())
+            })?;
+            assert_eq!(observed.load(Ordering::SeqCst), 0);
+            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            task.await?;
+            assert_eq!(observed.load(Ordering::SeqCst), 1);
+            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            Ok(())
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_tokio_task_on_owned_eventloop_cannot_wait_for_its_own_close() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let (_, ctx) = capture(&vx).await;
+    let owner = vx.clone();
+    ctx.spawn(async move {
+        tokio::spawn(async move {
+            assert!(Context::current().is_none());
+            assert!(Context::is_on_event_loop_thread());
+            assert!(matches!(
+                owner.close().await,
+                Err(VertxError::WouldDeadlock)
+            ));
+        })
+        .await
+        .unwrap();
+        Ok(())
+    })
+    .unwrap()
+    .await
+    .unwrap();
+    assert!(!vx.is_closed());
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_cross_thread_abort_preserves_target_context_during_destruction() {
+    struct DropCheck {
+        id: Option<vertx_rs::DeploymentId>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Drop for DropCheck {
+        fn drop(&mut self) {
+            assert!(Context::is_on_event_loop_thread());
+            assert_eq!(Context::current().unwrap().deployment_id(), self.id);
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let (_, ctx) = capture(&vx).await;
+    let (entered, started) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let blocker = ctx
+        .spawn(async move {
+            entered.send(()).ok();
+            wait.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    started.await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = DropCheck {
+        id: ctx.deployment_id(),
+        dropped: dropped.clone(),
+    };
+    let task = ctx
+        .spawn(async move {
+            let _guard = guard;
+            panic!("queued cancelled task was polled");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .unwrap();
+    let abort = task.abort_handle();
+    abort.abort();
+    assert!(!abort.is_finished());
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    assert!(matches!(task.await, Err(VertxError::TaskCancelled)));
+    assert!(abort.is_finished());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    blocker.await.unwrap();
+    assert!(Context::current().is_none());
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_joins_every_eventloop_even_with_retained_contexts_and_task_handles() {
+    struct ExitCount(Arc<AtomicUsize>);
+    impl Drop for ExitCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    thread_local! {
+        static EXIT_COUNT: RefCell<Option<ExitCount>> = const { RefCell::new(None) };
+    }
+    let vx = Vertx::builder()
+        .event_loop_threads(2)
+        .worker_threads(1)
+        .build();
+    let exited = Arc::new(AtomicUsize::new(0));
+    let mut contexts = Vec::new();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let (_, ctx) = capture(&vx).await;
+        let count = exited.clone();
+        let (entered, started) = oneshot::channel();
+        tasks.push(
+            ctx.spawn(async move {
+                EXIT_COUNT.with(|slot| *slot.borrow_mut() = Some(ExitCount(count)));
+                entered.send(()).ok();
+                std::future::pending::<Result<()>>().await
+            })
+            .unwrap(),
+        );
+        started.await.unwrap();
+        contexts.push(ctx);
+    }
+    vx.close().await.unwrap();
+    assert_eq!(exited.load(Ordering::SeqCst), 2);
+    for task in tasks {
+        assert!(task.is_finished());
+        assert!(matches!(task.await, Err(VertxError::TaskCancelled)));
+    }
+    for ctx in contexts {
+        assert!(ctx.spawn(async { Ok(()) }).is_err());
+    }
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn eventloop_can_await_close_of_a_different_vertx_instance() {
+    let first = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let second = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let (_, ctx) = capture(&first).await;
+    let id = ctx.deployment_id();
+    let target = second.clone();
+    ctx.spawn(async move {
+        target.close().await?;
+        assert_eq!(Context::current().unwrap().deployment_id(), id);
+        Ok(())
+    })
+    .unwrap()
+    .await
+    .unwrap();
+    assert!(second.is_closed());
+    assert!(!first.is_closed());
+    first.close().await.unwrap();
 }
