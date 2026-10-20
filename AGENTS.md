@@ -10,7 +10,7 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 
 - 网络、文件、DNS、集群、Codec、SharedData 门面、命名 WorkerExecutor 和虚拟线程不在当前范围；仅在用户任务需要时扩展。
 - 版本、Edition、MSRV 和依赖特性以 [Cargo.toml](Cargo.toml) 为准。不要为实现便利擅自提高 MSRV 或增加依赖。
-- 保留现有目录、源文件名、测试 target 和示例名称，减少安全拦截及无关变更。
+- 保留现有目录、源文件名、测试 target 和示例名称，减少安全拦截及无关变更。task.rs / diagnostics.rs 是已批准的关注点拆分。
 - 不为修复局部问题顺带改版、重构整个项目或调整无关配置。
 
 ## 代码导航
@@ -20,7 +20,9 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 | `src/vertx.rs` | 实例配置、部署、批量回滚、撤销、全局关闭 |
 | `src/verticle.rs` | 普通及 Worker Verticle 的 start/stop 接口 |
 | `src/context.rs` | 逻辑 Context、物理线程身份、按 poll 隔离、受管任务、阻塞计算 |
-| `src/eventloop.rs`、`src/worker_pool.rs` | 固定线程执行器、原生 Worker 线程池、Future 调度、统一任务句柄 |
+| `src/eventloop.rs`、`src/worker_pool.rs` | 固定线程执行器、原生 Worker 线程池、Future 调度 |
+| `src/task.rs` | 公共任务 ID/句柄、结果归一化及执行器取消接口 |
+| `src/diagnostics.rs` | 诊断配置、轻量计数、只读快照及有界任务元数据 |
 | `src/deployment.rs` | 部署状态、资源准入、任务跟踪、取消和完成通知 |
 | `src/eventbus/` | 类型路由、消息队列、消费者、请求回复、headers |
 | `src/timer.rs` | 单次和周期定时、deadline、取消 |
@@ -99,6 +101,18 @@ Starting → Running → Stopping → Stopped
 - Timer 创建时确定绝对 deadline；延迟首次 poll 不重新计时。Periodic 保持 Skip 策略，零周期返回参数错误。
 - 定时器取消涵盖自身、部署和全局关闭；取消与到期同轮就绪时取消优先。
 
+## 可观测性约束
+
+- 默认轻量计数和当前同步操作，任务详情必须显式开启并受上限约束；不保留无界历史。
+- Diagnostics 不强持有 Context/用户 Future；任务结果、取消、panic 和用户析构路径均正确回收计数及元数据。
+- 快照不得获取 Context 执行锁，也不得向目标 EventLoop 派发请求；阻塞时仍可从外部读取。
+- Span 和 Dispatch 按每次 poll/drop 恢复；禁止把 entered guard 留在跨 await 状态中。
+- 区分同步 poll 时长、异步总等待、有序锁等待、Worker 排队、消息准入及队列停留；消息入队时间在取得 permit 后记录。
+- 慢操作在返回后告警；当前操作可外部采样。不增加常驻监控线程、exporter 或 metrics 服务端点。
+- 安装异常 hook 后仍保留框架错误事件，避免重复报告；不记录消息体和全部 headers，库不初始化 subscriber。
+- 生命周期聚合用 LifecycleFailed，批量回滚用 DeploymentFailed；首错和后续错误都保留，cause 使用标准 Error::source。
+- 修改诊断时验证 Context 交错、Worker 迁移、取消/析构、详情上限和成功 close 后全部活跃计数归零。
+
 ## 取证与修改方式
 
 - 遇到“为什么、根因、是否生效、看看日志、线上是否如此”等问题，先查可用证据，再下结论。
@@ -115,6 +129,7 @@ Starting → Running → Stopping → Stopped
 先运行与修改直接相关的测试。Rust 行为或公共 API 变更完成后执行以下检查；单纯文档修改只做相关链接、内容和差异检查。
 
 ```sh
+cargo build --lib
 cargo test --tests
 cargo test --doc
 cargo clippy --all-targets -- -D warnings

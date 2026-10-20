@@ -206,13 +206,72 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 
 ## 5. 错误与可观测性
 
-异常路由：Context exception handler → 全局 exception handler → tracing。
-调用前复制 handler 并释放读锁，handler 可重设或清除自身；异常 handler panic 被捕获后写日志，避免递归。
-生命周期结束和全局关闭清除相应 handler 引用。
-tracing 包含部署 ID、Context ID、EventLoop ID、ThreadId，以及广播丢弃、关闭超时等信息。
+```text
+用户 Future / blocking / 消息
+       ├─ tracing Span + Dispatch：每次 poll / drop 恢复，不跨 await 持有 guard
+       └─ Diagnostics：计数 + 当前线程操作 + 可选的有界任务详情
+                            ↑
+                  Vertx::diagnostics() 外部直接读取
+```
 
-结构化错误覆盖：类型冲突、无消费者、队列满、通道关闭、请求超时、回复关闭、业务失败、Context 不匹配、
-部署终止、全局关闭、启动失败、panic、关闭超时、多实例回滚失败及整体关闭失败。
+| 入口 / 数据 | 保证 |
+|---|---|
+| `Context::id()` / `TaskHandle::id()` | 进程内唯一；任务句柄与对应诊断记录使用相同 TaskId |
+| `VertxBuilder::diagnostics(DiagnosticsOptions)` | 默认启用轻量计数及线程当前操作；`enabled=false` 关闭诊断记录 |
+| `task_details` / `max_task_details` | 详情默认关闭；开启后默认最多 1024 个活跃记录，截断有标记；不保留历史 |
+| `Vertx::diagnostics()` | 同步采样，不向目标 EventLoop 发命令，不获取 Context 执行锁；不是全局事务快照 |
+| 活跃计数 | 部署、任务、就绪任务、路由消费者、blocking 等待/运行；任务包含生命周期驱动及 blocking |
+| 累计计数 | 任务成功/失败/取消、请求超时、广播丢弃；用户状态析构后才完成任务记录 |
+| 线程当前操作 | OS ThreadId、ContextId、TaskId、物理 EventLoopId、操作及开始时间；只列正在执行的受管 poll/drop/blocking |
+| 清理进度 | 部署 queued/starting/running/quiescing/stopping；close 的 deployments/blocking/worker_join/event_loop_join/closed/failed |
+
+诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
+任务销毁时删除详情；晚到的 wake 不复活记录。未采集的任务不会为了补齐列表而被保留。
+消费者数量指有效路由订阅；scope 清扫、close 与 Consumer Drop 不重复扣减。
+裸 Tokio 任务、用户自建线程及等待 Context 执行锁的时间不在监控范围内。
+
+| 耗时字段 | 起止 |
+|---|---|
+| `admission_wait` | 消息准备到获得 mpsc permit；send 的背压等待 |
+| `queue_residence` | 成功获得 permit 后记录入队时间，到消费者实际取出 |
+| `ready_queue_wait` | 任务提交/从等待变为就绪，到进入下一次 poll；不包含 Future Pending 等待 |
+| `ordered_wait` | blocking 等待同 Context 有序锁 |
+| `worker_queue_wait` | blocking 提交到固定 Worker 池，到 Worker 取出 |
+| `synchronous_elapsed` | 单次同步 poll/drop 或 blocking 执行 |
+| `total_elapsed` | 任务提交到用户状态析构，包含异步等待；不能当成线程阻塞时间 |
+
+慢操作阈值：EventLoop poll/drop 默认 100ms，Worker poll/drop 与 blocking 默认 1s，均可配置。
+警告只会在同步操作返回后发出；操作尚未返回时，外部线程可以读取当前操作及 started_at。
+没有常驻监控线程，不抢占用户代码，不提供“已强制终止”的保证。
+
+结构化日志关联实例、部署、Context、任务、EventLoop、OS 线程以及 message_id/request_id/address；
+错误提供稳定的 `VertxError::kind()`。消息 Span 随 handler 的每次 poll/drop 恢复，跨线程保留提交方 Dispatch。
+消息 Span 保留发送方的因果父链；`message_handler` 子 Span 单独标明接收方 Context/Task，不能把父链当作当前 Context。
+不输出消息体或全部 headers，库不安装 subscriber。示例支持 `RUST_LOG` 和 `LOG_FORMAT=json`。
+默认摘要采集仍会在每次 poll 更新状态，并包装 Waker 跟踪就绪；轻量不等于零开销，可用 enabled=false 关闭采集。
+日志细节主要在 debug/trace；开启这些级别会增加开销，不承诺未经测量的性能提升。
+
+异常仍按 Context exception handler → 全局 exception handler 调用；调用前释放配置锁，handler 可重设自身。
+框架错误事件独立于用户 hook，安装 hook 也不会吞掉框架诊断；每个报告入口只输出一次框架错误事件。
+异常 handler panic 被捕获后单独记录，避免递归。生命周期结束和全局关闭清除 handler 引用。
+
+| 错误 | 用途 |
+|---|---|
+| 原始错误 | 只有一个失败时保持原类型 |
+| `LifecycleFailed { cause, cleanup }` | 保留首个 start/stop 错误及后续 stop/析构失败，不覆盖首错 |
+| `DeploymentFailed { cause, rollback }` | 仅用于多实例部署失败后的回滚 |
+| `CleanupFailed` | close 汇总部署清理和 Worker/EventLoop join 错误 |
+
+两个聚合错误的 cause 均实现标准 Error::source 链。Worker join 失败不能静默丢弃。
+任务取消、业务失败、类型错误、请求超时、panic、关闭超时仍保持各自的结构化错误类型。
+
+### 5.1 工具链与依赖
+
+最低 Rust 1.96、Edition 2021、Cargo resolver 3；库版本保持 0.3.0。
+直接依赖最低版本为 Tokio 1.54.0、tokio-util 0.7.20、async-trait 0.1.92、thiserror 2.0.21、
+futures 0.3.34、dashmap 6.2.1、tracing 0.1.44；示例/测试使用 tracing-subscriber 0.3.23 的 env-filter/json。
+普通依赖仍只启用 Tokio rt/sync/macros/time；开发依赖启用 full/test-util。保留 async-trait。
+Cargo.lock 沿用库项目的忽略策略；这里记录最低版本，不承诺后续解析始终锁定到同一组补丁版本。
 
 ## 6. 从 0.2 迁移
 
@@ -232,7 +291,13 @@ tracing 包含部署 ID、Context ID、EventLoop ID、ThreadId，以及广播丢
 多 handler 共享状态优先级：单 handler 独占 → Rc<Cell> → 小作用域 Rc<RefCell> → 通过内部地址协调。
 若 stop 需要访问任务使用的状态，通过这些明确的所有权结构共享；不要跨 await 保存 RefCell guard。
 
-可运行示例仍为 ping_pong、pipeline、verticle_to_verticle，均使用 start/stop 和显式 close。
+| 示例 | 内容 |
+|---|---|
+| `ping_pong` | !Send 状态、线程/Context 身份、headers、业务失败、超时及迟到回复 |
+| `pipeline` | 校验和流水线、两个消费者、共享固定 Worker、有序/无序 blocking、受管任务及诊断快照 |
+| `verticle_to_verticle` | 真实成功/失败服务、try_join_all / join_all / select_ok、取消及 detached task 说明 |
+
+三个示例均使用 start/stop、可配置日志、有界等待和显式 close；操作与 close 都失败时保留两者。
 
 ## 7. 与 Vert.x 5 的对照与范围
 

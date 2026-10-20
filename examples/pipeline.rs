@@ -1,56 +1,69 @@
-//! Source -> Doubler x 2 -> Worker Sink, using managed tasks and bounded queues.
+//! Source → 两个 Hasher EventLoop → Worker Sink；所有同步计算共用两个 OS Worker。
+//!
+//! 运行：RUST_LOG=vertx_rs=debug cargo run --example pipeline
+//! LOG_FORMAT=json 输出结构化日志；预期：五个校验和，close 后 active_tasks=0。
+//! ordered 只保证同来源 Context 的 blocking FIFO，不保证全流水线输出顺序。
+//! handler 等待上一条处理结束后才消费下一条；增加消费者才会增加消息并行度。
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, WorkerVerticle};
+use vertx_rs::{Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError, WorkerVerticle};
 struct Source;
 #[async_trait(?Send)]
 impl Verticle for Source {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let bus = ctx.event_bus();
-        ctx.spawn_local(async move {
-            for value in 1..=5i64 {
-                bus.send("stage1", value).await?;
+        let handle = ctx.spawn_local(async move {
+            for seed in 1..=5u64 {
+                bus.send("hash", seed).await?;
             }
             Ok(())
         })?;
+        println!("source task={}", handle.id()); // 丢弃句柄只分离等待者，部署继续管理任务。
         Ok(())
     }
 }
-struct Doubler;
+// 模拟批量校验工作，避免把微不足道的乘法转交线程池。
+fn checksum(seed: u64) -> u64 {
+    (0..100_000u64).fold(seed, |hash, value| {
+        hash.rotate_left(5).wrapping_add(value ^ seed)
+    })
+}
+struct Hasher;
 #[async_trait(?Send)]
-impl Verticle for Doubler {
+impl Verticle for Hasher {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
-            .consumer::<i64>("stage1")?
+            .consumer::<u64>("hash")?
             .handler(move |env| {
                 let ctx = ctx.clone();
                 async move {
-                    let value = *env.body();
-                    // Both futures progress on the current Context. The closure
-                    // uses the shared OS Worker pool; the timer uses its IO driver.
-                    let (doubled, ()) = futures::try_join!(
-                        ctx.execute_blocking(move || value * 2),
-                        ctx.timer(std::time::Duration::ZERO)?,
+                    let seed = env.into_body();
+                    // 两个 Future 同时等待：有序与无序 blocking 都进同一个固定 Worker 池。
+                    let (ordered, unordered) = futures::try_join!(
+                        ctx.execute_blocking(move || checksum(seed)),
+                        ctx.execute_blocking_with(move || checksum(seed), false),
                     )?;
-                    ctx.event_bus().send("stage2", doubled).await
+                    assert_eq!(ordered, unordered);
+                    ctx.event_bus().send("sink", (seed, ordered)).await
                 }
             })
     }
 }
 struct Sink {
-    done: Option<oneshot::Sender<Vec<i64>>>,
+    done: Option<oneshot::Sender<Vec<(u64, u64)>>>,
 }
 #[async_trait]
 impl WorkerVerticle for Sink {
     async fn start(&mut self, ctx: Context) -> Result<()> {
-        let done = self.done.take().unwrap();
-        let mut consumer = ctx.event_bus().consumer::<i64>("stage2")?;
+        let done = self.done.take().expect("start is called once");
+        let mut consumer = ctx.event_bus().consumer::<(u64, u64)>("sink")?;
         ctx.spawn(async move {
             let mut results = Vec::new();
             while let Some(env) = consumer.recv().await {
                 results.push(env.into_body());
                 if results.len() == 5 {
-                    let _ = done.send(results);
+                    done.send(results).ok();
                     return Ok(());
                 }
             }
@@ -59,17 +72,87 @@ impl WorkerVerticle for Sink {
         Ok(())
     }
 }
-#[tokio::main]
-async fn main() -> Result<()> {
-    let vx = Vertx::builder().event_loop_threads(2).build();
+async fn run(vx: &Vertx) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     vx.deploy_worker(|_| Sink { done: Some(tx) }).await?;
-    vx.deploy(|_| Doubler).await?;
-    vx.deploy(|_| Doubler).await?;
+    vx.deploy(|_| Hasher).await?;
+    vx.deploy(|_| Hasher).await?;
     vx.deploy(|_| Source).await?;
-    let mut results = rx.await.unwrap();
+    print_snapshot("running", vx);
+    let mut results = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .map_err(|_| VertxError::Timeout(Duration::from_secs(2)))?
+        .map_err(|_| VertxError::ReplyClosed)?;
     results.sort();
-    assert_eq!(results, vec![2, 4, 6, 8, 10]);
+    for &(seed, hash) in &results {
+        assert_eq!(checksum(seed), hash);
+    }
     println!("sink got: {results:?}");
-    vx.close().await
+    Ok(())
+}
+fn print_snapshot(label: &str, vx: &Vertx) {
+    let snapshot = vx.diagnostics();
+    println!(
+        "{label}: deployments={}, tasks={}, ready={}, blocking(wait/run)={}/{}, close={}",
+        snapshot.active_deployments,
+        snapshot.active_tasks,
+        snapshot.ready_tasks,
+        snapshot.blocking_waiting,
+        snapshot.blocking_running,
+        snapshot.close_stage
+    );
+    for task in snapshot.tasks {
+        println!(
+            "  {} {} {:?}, elapsed={:?}",
+            task.task_id, task.context_id, task.stage, task.elapsed
+        );
+    }
+    for thread in snapshot.threads {
+        println!(
+            "  {:?}: {} {}, running={:?}",
+            thread.thread_id,
+            thread.task_id,
+            thread.operation,
+            thread.started_at.elapsed()
+        );
+    }
+}
+fn init_tracing() {
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
+}
+async fn finish(vx: &Vertx, outcome: Result<()>) -> Result<()> {
+    match (outcome, vx.close().await) {
+        (Ok(()), close) => close,
+        (Err(cause), Ok(())) => Err(cause),
+        (Err(cause), Err(cleanup)) => Err(VertxError::LifecycleFailed {
+            cause: Box::new(cause),
+            cleanup: vec![cleanup],
+        }),
+    }
+}
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    let vx = Vertx::builder()
+        .event_loop_threads(2)
+        .worker_threads(2)
+        .diagnostics(DiagnosticsOptions {
+            task_details: true,
+            max_task_details: 32,
+            ..Default::default()
+        })
+        .build();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), run(&vx))
+        .await
+        .unwrap_or_else(|_| Err(VertxError::Timeout(Duration::from_secs(5))));
+    let result = finish(&vx, outcome).await;
+    print_snapshot("closed", &vx);
+    result
 }
