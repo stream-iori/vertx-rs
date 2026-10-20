@@ -1,5 +1,6 @@
 //! Two deployments communicating through their own Context-bound EventBus.
 use async_trait::async_trait;
+use futures::FutureExt;
 use vertx_rs::{Context, Result, Verticle, Vertx};
 struct Upper;
 #[async_trait(?Send)]
@@ -21,7 +22,14 @@ impl Verticle for Caller {
         bus.consumer::<String>("caller")?.handler(move |env| {
             let bus = bus.clone();
             async move {
-                let response: String = bus.request("upper", env.body().clone()).await?;
+                // any: the first success wins, rather than the first completion.
+                // Dropping remaining request futures does not retract queued messages.
+                let candidates = ["unavailable-upper", "upper"].into_iter().map(|address| {
+                    bus.request::<_, String>(address, env.body().clone())
+                        .boxed()
+                });
+                let (response, remaining) = futures::future::select_ok(candidates).await?;
+                drop(remaining);
                 env.reply(response)
             }
         })

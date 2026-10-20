@@ -1,6 +1,6 @@
 # vertx-rs 0.3 设计与迁移说明
 
-目标：用 Rust + Tokio 实现 Vert.x 5 的**单进程执行核心**。
+目标：用 Rust Future、固定 OS Worker 线程池和 Tokio IO 驱动实现 Vert.x 5 的**单进程执行核心**。
 范围包括 Verticle、Context、Worker、EventBus、Timer、部署及异步关闭。
 
 ## 1. 执行保证
@@ -10,7 +10,7 @@
 | 普通 Verticle 的 factory/start/stop/析构 | 始终在部署时分配的同一个 OS 线程 | 不要求 Send，可持有 Rc/Cell/RefCell |
 | EventLoop Context 的受管任务和 handler | 同一 EventLoop；await 后仍在原线程 | 支持 !Send Future |
 | Worker Context 的普通执行 | 可以换线程；同 Context 的 poll 和任务析构串行 | Send |
-| execute_blocking | 独立 blocking 线程；保留来源逻辑 Context | 闭包和结果要求 Send |
+| execute_blocking | 与 Worker Future 共用固定线程池；保留来源逻辑 Context | 闭包和结果要求 Send |
 | 裸 tokio::spawn/spawn_local | 遵循 Tokio 自身规则，不继承逻辑 Context | 不受部署任务管理 |
 
 亲和性指 **OS 线程**，不绑定 CPU 核心。线程可以由操作系统调度到不同 CPU。
@@ -24,8 +24,8 @@ Vertx
  │    └─ Verticle B / Context B
  ├─ EventLoop #1: OS T1 + current-thread runtime + LocalSet
  │    └─ Verticle C / Context C
- ├─ Worker runtime：多线程，每个 Context 有独立执行门
- ├─ Blocking pool：限制并发，默认每 Context FIFO
+ ├─ Worker pool：固定 N 个 OS 线程，Context 就绪队列串行派发 Future poll
+ │    └─ execute_blocking 共用该池，默认每来源 Context FIFO
  └─ EventBus：进程内共享地址路由，每个消费者一个有界队列
 ```
 
@@ -33,7 +33,8 @@ Vertx
 
 `ContextFuture` 在**每次 poll** 前设置 CURRENT，返回 Pending/Ready 或 panic 时立即恢复。
 ContextGuard 不可 Send，也不跨 await 保存。Future 取消时，在所属执行环境中设置 Context 后析构用户状态。
-Worker 的执行门只覆盖单次 poll，用户等待异步结果时释放；析构也与普通 poll 互斥。
+Worker 的 Context 就绪队列每次派发一个 poll；Pending 后释放执行权，析构也与普通 poll 互斥。
+同 Context 的其他任务可以在该 Future 等待期间执行；同消费者仍等待当前消息 Future 完成再取下一条。
 
 ```text
 poll(A): CURRENT=A → poll user A → restore
@@ -51,7 +52,7 @@ Context 与物理线程身份分开记录。调用 execute_blocking 时：
 | is_on_worker_thread() | false | true | false |
 
 EventLoop 初始化记录实例 ID、EventLoop ID 和实际 ThreadId，受管 poll 校验物理位置。
-Worker 运行时通过线程启动/停止钩子设置物理线程类型。
+Worker 原生线程启动/退出时设置和清除物理线程类型。
 
 ## 2. 生命周期
 
@@ -83,14 +84,17 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 
 | 接口 | 约束 |
 |---|---|
-| spawn_local(future) → Result<JoinHandle<Result<()>>> | 当前 Context 必须与目标一致，且位于所属 EventLoop；支持 !Send |
-| spawn(future) → Result<JoinHandle<Result<()>>> | Future 为 Send；派发至目标 Context，EventLoop 目标仍固定线程 |
-| run_on_context(closure) → Result<()> | Send 闭包，异步入队；外部线程也能调用 |
+| spawn_local(future) → Result<TaskHandle<()>> | 当前 Context 必须与目标一致，且位于所属 EventLoop；支持 !Send |
+| spawn(future) → Result<TaskHandle<()>> | Future 为 Send；派发至目标 Context，EventLoop 目标仍固定线程 |
+| run_on_context(future) → Result<TaskHandle<()>> | Send Future，异步入队；外部线程也能调用 |
 | execute_blocking(f) | 默认 ordered=true |
 | execute_blocking_with(f, ordered) | false 允许同 Context 多个阻塞操作并行 |
 | request_undeploy() | 不等待自身结束，适合在本部署任务内发起撤销 |
 
-丢弃 JoinHandle 只分离调用方，任务仍由部署管理。
+TaskHandle<T> 的 await 输出为 Result<T>，无需嵌套 await??。
+提供 abort、abort_handle、is_finished；TaskAbortHandle 可克隆。
+丢弃 TaskHandle 只分离调用方，任务仍由部署管理；取消返回 TaskCancelled，不作为业务异常报告。
+is_finished 和等待结果都晚于用户 Future 析构。保留取消句柄或迟到的 Waker 不阻止线程池关闭。
 Tracker token 在用户 Future 及其状态析构完成后才释放，覆盖未首次 poll 就被 abort 的情况。
 普通任务错误报告给异常 handler；Consumer 按消息捕获错误及 panic，随后继续接收。
 
@@ -105,7 +109,10 @@ Tracker token 在用户 Future 及其状态析构完成后才释放，覆盖未�
 undeploy 调用使用一个 shutdown_grace deadline 覆盖上述过程，默认 1 秒。
 超时返回 ShutdownTimeout，后台收尾继续。**abort 不能抢占不让出执行权的同步代码，也不能中断已开始的 blocking 闭包。**
 
-close 是幂等异步操作：关闭全局准入、消费者和定时器，撤销全部部署，等待 blocking 操作，释放执行器。
+close 是幂等异步操作。协调任务在 EventLoop 上执行：关闭全局准入、消费者和定时器，撤销全部部署，
+等待 blocking 操作，排空 Worker 任务并等待固定线程退出、join，最后释放 EventLoop。
+排空时拒绝新任务，但继续接受已有任务的 wake 和取消调度；Worker 不回收自身线程。
+EventLoop 只在 JoinHandle::is_finished 后 join，不阻塞等待线程退出。
 取消 close 的等待 Future 不会取消后台清理；超时后实例仍拒绝新工作，可再次等待 close。
 stop 失败通过 CleanupFailed 保留；初始化被取消本身不算关闭失败。
 同部署任务调用等待自身的 undeploy，或本实例 Context 内调用 close，返回 WouldDeadlock。
@@ -162,14 +169,15 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 | 配置 | 默认 |
 |---|---|
 | EventLoop 线程数 | 2 × available_parallelism()，builder 可覆盖 |
-| Worker 异步线程 | 20 |
-| blocking 线程及并发上限 | 独立的 20，blocking_threads 可覆盖 |
+| Worker 与 blocking 共用的 OS 线程数 | 20，worker_threads 可覆盖 |
 | shutdown_grace | 1 秒 |
 | 消费者容量 | 256 |
 | 请求 timeout | 30 秒 |
 
-有序 blocking 使用每 Context 的公平锁保持 FIFO，许可和记录覆盖排队、实际执行及调用方取消。
-普通 Context 执行门不用于 blocking 闭包。等待执行许可的操作可取消，已开始执行的操作必须自然结束。
+有序 blocking 使用每 Context 的公平锁保持 FIFO，跟踪记录覆盖排队、实际执行及调用方取消。
+普通 Context 执行门不用于 blocking 闭包。等待有序锁或尚未开始的操作在作用域关闭后不再执行用户闭包，已开始执行的操作必须自然结束。
+阻塞任务提交后，等待方取消不撤回操作；跟踪记录保持到实际闭包结束。
+池内线程被同步操作占满时，其他 Worker 工作等待；关闭超时检测在 EventLoop/调用方上继续工作。
 
 ## 5. 错误与可观测性
 
@@ -189,7 +197,7 @@ tracing 包含部署 ID、Context ID、EventLoop ID、ThreadId，以及广播丢
 | run 内长循环 | 在 start 中 spawn_local/spawn 受管循环，或注册 handler |
 | deploy 返回 factory 完成 | deploy 等待异步 start 完成 |
 | deploy_worker(instance) | deploy_worker(factory) |
-| spawn_local 的输出为 () | Future 输出 Result<()>，调度返回 Result<JoinHandle<Result<()>>> |
+| spawn_local 的输出为 () | Future 输出 Result<()>，调度返回 Result<TaskHandle<()>> |
 | handler 无返回值 | handler/handler_worker 返回 Result<()>，使用 ? 或处理错误 |
 | timer/periodic 直接返回对象 | 创建时使用 ? 或 unwrap |
 | HashMap headers | Headers；with_headers 仍接受 HashMap 转换 |
@@ -209,7 +217,7 @@ tracing 包含部署 ID、Context ID、EventLoop ID、ThreadId，以及广播丢
 | Context 传播与线程类型区分 | 对齐受管执行入口 |
 | Worker 普通执行串行 | 对齐；允许线程迁移 |
 | start/stop 就绪与关闭 | 异步钩子；框架增加受管任务取消及明确的等待超时 |
-| executeBlocking ordered | 默认有序；blocking 线程池与异步 Worker 线程分开配置 |
+| executeBlocking ordered | 默认有序；与 Worker Future 共用固定 OS 线程池 |
 | send/publish/request/reply/fail | 提供；send 的有界背压和 pull Consumer 是 Rust 扩展 |
 | Consumer 注册时点 | consumer 调用立即注册，支持 recv；与 Java 在 handler 注册后生效有差异 |
 | Timer / Periodic | Future / tick 拉模型；保留创建时间起点与取消语义 |
@@ -228,12 +236,55 @@ Java 虚拟线程、动态部署、旧式按 ID 取消 Timer 和 metrics 服务�
 [Message](https://vertx.io/docs/apidocs/io/vertx/core/eventbus/Message.html)、
 [Vertx.close](https://vertx.io/docs/apidocs/io/vertx/core/Vertx.html)。
 
-## 8. 验收
+## 8. 原生 Worker 调度与 Future 组合
+
+```text
+Future wake → 合并重复通知 → 所属 Context 就绪队列
+                                ↓
+                         共享 FIFO 就绪队列
+                                ↓
+                   空闲 OS Worker 执行一次 poll
+                     ├─ Pending：释放线程与 Context
+                     └─ Ready / abort：析构后通知完成
+```
+
+- 每个 Context 同时只有一个队列执行权，每次 poll 后重新排到共享队尾，避免单个 Context 连续独占。
+- poll 中发生 wake，记录为再次就绪；已入队任务不重复入队，完成后的迟到 wake 被忽略。
+- 执行器持有全部存活任务，包括 Pending 状态；取消在所属 Worker 的 Context 执行权下完成析构。
+- Future 和 blocking 共用线程；blocking 有序锁独立于普通 Context 执行权，单线程池内 await execute_blocking 不占住线程。
+- Worker 每次 poll 进入分配的 EventLoop runtime Handle，Tokio 仅提供 IO/Timer 注册和驱动。
+  Handle::enter 不推进 Future，也不创建 Worker Tokio runtime。实际 Future 调度由原生池完成。
+- 原生线程池只提供普通 Future 执行环境，不提供 Tokio 多线程任务环境特有的 block_in_place 等保证。
+  裸 tokio::spawn 使用所进入的 Tokio runtime，既不继承 Context，也不成为原生 Worker 任务；使用 Context::spawn 管理业务任务。
+- 内部就绪队列不额外设置总容量；每个任务最多保留一个就绪通知。EventBus 的消费者队列仍为 256。
+  这不是全局任务数量上限，不承诺更高吞吐量。
+
+直接使用已有 futures 库，不定义 Java 风格 Future/Promise 门面：
+
+| 需求 | Rust API | 结束条件 |
+|---|---|---|
+| 全成功 | try_join! / try_join_all | 全成功，或遇错提前返回 |
+| 全结束并收集结果 | join! / join_all | 全部结束，保留逐项 Result |
+| 任意成功 | select_ok | 首次成功；只有全失败才失败 |
+| 任意最先完成 | select! / select_all | 首次结束，无论成功或失败 |
+
+普通 Rust Future 是惰性的，必须被 await/poll 才会推进；组合器不自动创建线程，也不改变当前 Context。
+组合器提前返回并丢弃剩余普通 Future，会停止继续 poll；已提交的外部 IO 不保证被撤销。
+已 spawn 的任务独立运行，丢弃其 TaskHandle 仅分离等待者；需要取消时显式 abort，或撤销所属部署。
+select_ok 返回的剩余 Future 由调用方决定继续等待或丢弃。空集合及 Unpin 等约束遵循 futures 原始 API。
+
+本轮不提供旧 API 兼容层：删除 blocking_threads / blocking_thread_count，统一由 worker_threads 配置线程数；
+spawn/spawn_local 返回 TaskHandle<()>，原 handle.await?? 改为 handle.await?；
+run_on_context 接收 Future，原同步闭包改成 async { ...; Ok(()) }。
+
+## 9. 验收
 
 - 同一个 EventLoop 上多 Context 交替 await 不串线；跨 OS 线程 poll 后 TLS 不残留。
-- factory/start/handler/受管任务/stop/析构的 OS 线程与 Context 一致。
+- 普通 Verticle 的 factory/start/handler/受管任务/stop/析构始终位于所属 OS 线程与 Context。
 - Worker 同 Context 最大普通并行 poll 数为 1，不同 Context 可以并行。
-- blocking 的逻辑 Context 和物理 Worker 身份正确；有序 FIFO、无序并发上限正确。
+- blocking 的逻辑 Context 和物理 Worker 身份正确；有序 FIFO、无序并发由共用线程数限制。
+- Worker 与 blocking 使用同一组实际 ThreadId；Pending 让出线程、跨线程恢复及 wake 合并不丢通知。
+- Worker 内真实异步 IO、Timer、timeout 可用；取消析构和析构 panic 不破坏线程池或 Context。
 - start/stop 错误、panic、取消、关闭、批量回滚和自身撤销均有回归覆盖。
 - undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
 - 路由注册/清扫/最后订阅注销竞争不残留路由；请求超时包含满队列等待。

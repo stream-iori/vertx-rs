@@ -26,7 +26,12 @@ impl Verticle for Doubler {
                 let ctx = ctx.clone();
                 async move {
                     let value = *env.body();
-                    let doubled = ctx.execute_blocking(move || value * 2).await?;
+                    // Both futures progress on the current Context. The closure
+                    // uses the shared OS Worker pool; the timer uses its IO driver.
+                    let (doubled, ()) = futures::try_join!(
+                        ctx.execute_blocking(move || value * 2),
+                        ctx.timer(std::time::Duration::ZERO)?,
+                    )?;
                     ctx.event_bus().send("stage2", doubled).await
                 }
             })

@@ -5,7 +5,7 @@
 
 ## 项目定位
 
-Rust + Tokio 实现 Vert.x 5 的单进程执行核心：Verticle、Context、Worker、EventBus、Timer、部署和关闭。
+Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单进程执行核心：Verticle、Context、Worker、EventBus、Timer、部署和关闭。
 对齐执行语义，使用 Rust 原生 async/await、Result、强类型消息及所有权模型。
 
 - 网络、文件、DNS、集群、Codec、SharedData 门面、命名 WorkerExecutor 和虚拟线程不在当前范围；仅在用户任务需要时扩展。
@@ -20,7 +20,7 @@ Rust + Tokio 实现 Vert.x 5 的单进程执行核心：Verticle、Context、Wor
 | `src/vertx.rs` | 实例配置、部署、批量回滚、撤销、全局关闭 |
 | `src/verticle.rs` | 普通及 Worker Verticle 的 start/stop 接口 |
 | `src/context.rs` | 逻辑 Context、物理线程身份、按 poll 隔离、受管任务、阻塞计算 |
-| `src/eventloop.rs`、`src/worker_pool.rs` | 固定线程执行器、Worker Runtime、blocking 资源限制 |
+| `src/eventloop.rs`、`src/worker_pool.rs` | 固定线程执行器、原生 Worker 线程池、Future 调度、统一任务句柄 |
 | `src/deployment.rs` | 部署状态、资源准入、任务跟踪、取消和完成通知 |
 | `src/eventbus/` | 类型路由、消息队列、消费者、请求回复、headers |
 | `src/timer.rs` | 单次和周期定时、deadline、取消 |
@@ -48,7 +48,10 @@ Rust + Tokio 实现 Vert.x 5 的单进程执行核心：Verticle、Context、Wor
 - ContextGuard 只能覆盖同步 poll，不能保存在跨 await 的 Future 状态里，也不能变成 Send。
 - Pending、Ready、panic、取消和析构路径都要恢复原 Context；不能只修首次调用或正常返回路径。
 - 逻辑 Context 与物理线程身份分别维护；不能用 `ctx.is_event_loop()` 推断当前一定在 EventLoop 线程。
-- Worker 执行许可不能跨用户 Future 的异步等待持有。检查重复包装、嵌套加锁和自等待死锁。
+- Worker Context 就绪队列的执行权不能跨用户 Future 的异步等待持有。一次派发一个 poll，再排到共享队尾。
+- Worker Future 与 blocking 共用固定数量的 OS 线程，不重新引入 Tokio Worker runtime 或额外 blocking 池。
+- Worker poll 通过所属 EventLoop runtime Handle 访问 IO/Timer 驱动；Handle::enter 不替代 Future 调度。
+- wake 合并必须覆盖 poll 中通知与迟到通知；Pending 任务继续登记，取消和用户析构只在所属执行器执行。
 - `spawn_local` 校验实例、所属 EventLoop、当前 Context 和存活状态；不能只判断线程类型。
 - 框架内部派发统一走受管入口。裸 Tokio spawn 不继承 Context，也不自动受部署管理。
 - 不在 EventLoop 中执行同步 IO、线程 sleep 或长 CPU 计算；使用受限的 blocking 执行入口。
@@ -81,8 +84,12 @@ Starting → Running → Stopping → Stopped
 - send 成功代表入队；send 有背压，publish 满队列丢弃并记录，不能把两者混为可靠投递。
 - request 的同一个 deadline 覆盖排队和回复；超时不会撤回已入队消息，迟到回复返回错误。
 - 保留响应 headers、重复 header 值和结构化业务失败；不要把不同错误都压成 Other。
-- `execute_blocking` 默认同 Context FIFO；无序路径仍受全局 blocking 并发限制，独立于异步 Worker 线程数。
-- blocking 跟踪与许可覆盖排队、执行及调用方取消；实际操作结束前不能提前释放许可或完成记录。
+- `execute_blocking` 默认同来源 Context FIFO；无序路径与 Worker Future 共用 worker_threads 配置的固定 OS 线程池。
+- blocking 跟踪覆盖排队、执行及调用方取消；实际操作结束前不能提前释放完成记录。
+- Consumer 仅接受返回 Future 的处理函数；同消费者等待上一条 Future 完成后再取下一条，不擅自增加消息并发。
+- Future 组合直接使用 futures；区分全成功、全结束、首次成功和首次完成，不重新实现 Future/Promise 门面。
+- TaskHandle 的 await 输出为单层 Result；丢弃只分离等待者，abort 在所属执行器取消，完成状态晚于用户析构。
+- 关闭协调在 EventLoop 执行；先完成部署、blocking 和 Worker 退出，再释放驱动。不能在 Worker 内等待回收自身。
 - Timer 创建时确定绝对 deadline；延迟首次 poll 不重新计时。Periodic 保持 Skip 策略，零周期返回参数错误。
 - 定时器取消涵盖自身、部署和全局关闭；取消与到期同轮就绪时取消优先。
 
