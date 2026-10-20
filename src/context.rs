@@ -246,6 +246,11 @@ impl Context {
             future.as_mut().poll(cx)
         })
     }
+    pub(crate) fn is_expected_cancellation(&self, error: &VertxError) -> bool {
+        matches!(error, VertxError::TaskCancelled)
+            || matches!(error, VertxError::DeploymentTerminated(id) if *id == self.scope.deployment && self.scope.cancel.is_cancelled())
+            || matches!(error, VertxError::VertxClosed if self.inner.cancel.is_cancelled())
+    }
     fn managed<F>(&self, future: F) -> impl Future<Output = Result<()>>
     where
         F: Future<Output = Result<()>>,
@@ -255,12 +260,16 @@ impl Context {
             if ctx.scope.cancel.is_cancelled() {
                 return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
             }
-            let r = std::panic::AssertUnwindSafe(future)
+            let mut r = std::panic::AssertUnwindSafe(future)
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|e| Err(panic_error(e)));
             if let Err(e) = &r {
-                ctx.report_error(e);
+                if !ctx.is_expected_cancellation(e) {
+                    ctx.report_error(e);
+                } else if matches!(e, VertxError::VertxClosed) {
+                    r = Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
+                }
             }
             r
         }
@@ -663,7 +672,10 @@ mod tests {
             let result = register.join().unwrap();
             stop.join().unwrap();
             match result {
-                Ok(mut consumer) => assert!(consumer.recv().await.is_none()),
+                Ok(mut consumer) => assert!(matches!(
+                    consumer.recv().await,
+                    Err(VertxError::DeploymentTerminated(_))
+                )),
                 Err(crate::VertxError::DeploymentTerminated(_)) => {}
                 _ => panic!("unexpected registration outcome"),
             }

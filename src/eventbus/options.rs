@@ -77,3 +77,35 @@ impl DeliveryOptions {
         self.headers
     }
 }
+
+/// Per-consumer hard queue capacity, measured in messages, not bytes.
+#[derive(Debug, Clone)]
+pub struct ConsumerOptions {
+    capacity: usize,
+}
+impl Default for ConsumerOptions {
+    fn default() -> Self {
+        Self { capacity: 256 }
+    }
+}
+impl ConsumerOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        if self.capacity == 0 || self.capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            Err(crate::VertxError::InvalidOptions(
+                "consumer capacity must be in 1..=Semaphore::MAX_PERMITS".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}

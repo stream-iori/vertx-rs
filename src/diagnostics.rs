@@ -2,15 +2,19 @@
 //! are retained here; snapshots are not globally transactional.
 use crate::{ContextId, DeploymentId, EventLoopId, TaskId, VertxError};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Lightweight counters and current synchronous operations are enabled by default.
-/// Detailed active-task metadata is opt-in and bounded; no history is retained.
+/// Task and queue details are opt-in with bounded snapshot output; no history
+/// is retained. Queue summary metadata scales with registered consumers.
 #[derive(Debug, Clone)]
 pub struct DiagnosticsOptions {
     pub enabled: bool,
     pub task_details: bool,
+    pub queue_details: bool,
+    pub max_queue_details: usize,
     pub max_task_details: usize,
     pub event_loop_poll_threshold: Duration,
     pub worker_poll_threshold: Duration,
@@ -21,6 +25,8 @@ impl Default for DiagnosticsOptions {
         Self {
             enabled: true,
             task_details: false,
+            queue_details: false,
+            max_queue_details: 1024,
             max_task_details: 1024,
             event_loop_poll_threshold: Duration::from_millis(100),
             worker_poll_threshold: Duration::from_secs(1),
@@ -59,6 +65,44 @@ pub struct DeploymentSnapshot {
     pub deployment_id: DeploymentId,
     pub stage: &'static str,
 }
+/// Counts only registered consumer queues. Capacity is in messages, not bytes.
+#[derive(Debug, Clone)]
+pub struct QueueSnapshot {
+    pub consumer_id: u64,
+    pub address: String,
+    pub context_id: Option<ContextId>,
+    pub deployment_id: Option<DeploymentId>,
+    pub capacity: usize,
+    pub queued: usize,
+    pub reserved: usize,
+    pub waiting_senders: usize,
+    pub full_events: u64,
+}
+/// Small metadata only: never owns a sender, receiver, message or Context.
+pub(crate) struct QueueStats {
+    metadata: QueueSnapshot,
+    pub queued: AtomicUsize,
+    pub reserved: AtomicUsize,
+    pub waiting: AtomicUsize,
+    full: AtomicU64,
+    diagnostics: Weak<Diagnostics>,
+}
+impl QueueStats {
+    fn snapshot(&self) -> QueueSnapshot {
+        let mut out = self.metadata.clone();
+        out.queued = self.queued.load(Ordering::Relaxed);
+        out.reserved = self.reserved.load(Ordering::Relaxed);
+        out.waiting_senders = self.waiting.load(Ordering::Relaxed);
+        out.full_events = self.full.load(Ordering::Relaxed);
+        out
+    }
+    pub fn full(&self) {
+        self.full.fetch_add(1, Ordering::Relaxed);
+        if let Some(diagnostics) = self.diagnostics.upgrade() {
+            diagnostics.state.lock().unwrap().summary.queue_full_events += 1;
+        }
+    }
+}
 /// Sampling view. Counters include lifecycle drivers and blocking work as tasks;
 /// threads lists only in-progress managed poll/drop/blocking operations.
 /// Naked Tokio tasks and time spent waiting for the Context execution mutex are
@@ -69,6 +113,12 @@ pub struct DiagnosticsSnapshot {
     pub instance_id: u64,
     pub active_deployments: usize,
     pub active_consumers: usize,
+    pub queued_messages: usize,
+    pub reserved_slots: usize,
+    pub waiting_senders: usize,
+    pub queue_full_events: u64,
+    pub queues: Vec<QueueSnapshot>,
+    pub queue_details_truncated: bool,
     pub active_tasks: usize,
     pub ready_tasks: usize,
     pub blocking_waiting: usize,
@@ -88,6 +138,7 @@ pub struct DiagnosticsSnapshot {
 struct State {
     summary: DiagnosticsSnapshot,
     details: HashMap<TaskId, (TaskSnapshot, Instant)>,
+    queues: HashMap<u64, Weak<QueueStats>>,
     threads: HashMap<std::thread::ThreadId, ThreadSnapshot>,
     deployments: HashMap<DeploymentId, &'static str>,
 }
@@ -109,6 +160,47 @@ impl Diagnostics {
                 ..Default::default()
             }),
         })
+    }
+    pub fn register_queue(
+        self: &Arc<Self>,
+        consumer_id: u64,
+        address: &str,
+        capacity: usize,
+        context_id: Option<ContextId>,
+        deployment_id: Option<DeploymentId>,
+    ) -> Option<Arc<QueueStats>> {
+        if !self.options.enabled {
+            return None;
+        }
+        let stats = Arc::new(QueueStats {
+            metadata: QueueSnapshot {
+                consumer_id,
+                address: address.into(),
+                capacity,
+                context_id,
+                deployment_id,
+                queued: 0,
+                reserved: 0,
+                waiting_senders: 0,
+                full_events: 0,
+            },
+            queued: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
+            full: AtomicU64::new(0),
+            diagnostics: Arc::downgrade(self),
+        });
+        self.state
+            .lock()
+            .unwrap()
+            .queues
+            .insert(consumer_id, Arc::downgrade(&stats));
+        Some(stats)
+    }
+    pub fn unregister_queue(&self, id: u64) {
+        if self.options.enabled {
+            self.state.lock().unwrap().queues.remove(&id);
+        }
     }
     pub fn current_task_id(&self) -> Option<TaskId> {
         self.state
@@ -147,6 +239,17 @@ impl Diagnostics {
                 stage,
             })
             .collect();
+        for stats in state.queues.values().filter_map(Weak::upgrade) {
+            out.queued_messages += stats.queued.load(Ordering::Relaxed);
+            out.reserved_slots += stats.reserved.load(Ordering::Relaxed);
+            out.waiting_senders += stats.waiting.load(Ordering::Relaxed);
+            if self.options.queue_details && out.queues.len() < self.options.max_queue_details {
+                out.queues.push(stats.snapshot());
+            }
+        }
+        out.queues.sort_by_key(|queue| queue.consumer_id);
+        out.queue_details_truncated =
+            self.options.queue_details && state.queues.len() > out.queues.len();
         out.active_deployments = out.deployments.len();
         out
     }
@@ -333,7 +436,8 @@ impl TaskRecord {
         self.error_kind = result.as_ref().err().map(VertxError::kind);
         self.result = Some(match result {
             Ok(_) => "completed",
-            Err(VertxError::TaskCancelled | VertxError::DeploymentTerminated(_)) => "cancelled",
+            Err(VertxError::TaskCancelled) => "cancelled",
+            Err(VertxError::DeploymentTerminated(id)) if *id == self.deployment_id => "cancelled",
             Err(_) => "failed",
         });
     }

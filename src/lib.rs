@@ -9,6 +9,7 @@ mod diagnostics;
 mod error;
 mod eventbus;
 mod eventloop;
+mod streams;
 mod task;
 mod threading_model;
 mod timer;
@@ -20,12 +21,16 @@ pub use context::{Context, ContextId};
 pub use deployment::DeploymentId;
 pub use deployment_options::DeploymentOptions;
 pub use diagnostics::{
-    DeploymentSnapshot, DiagnosticsOptions, DiagnosticsSnapshot, TaskSnapshot, TaskStage,
-    ThreadSnapshot,
+    DeploymentSnapshot, DiagnosticsOptions, DiagnosticsSnapshot, QueueSnapshot, TaskSnapshot,
+    TaskStage, ThreadSnapshot,
 };
 pub use error::{Result, VertxError};
-pub use eventbus::{Consumer, DeliveryOptions, Envelope, EventBus, Headers, ReplyHandle};
+pub use eventbus::{
+    Consumer, ConsumerOptions, DeliveryOptions, Envelope, EventBus, Headers, MessageSink,
+    ReplyHandle,
+};
 pub use eventloop::EventLoopId;
+pub use streams::{pipe_to, pipe_to_with, PipeOptions};
 pub use task::{TaskAbortHandle, TaskHandle, TaskId};
 pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};

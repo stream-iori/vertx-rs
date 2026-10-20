@@ -9,24 +9,197 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-const CHANNEL_CAPACITY: usize = 256;
-// Stamp immediately before send; subscriber callbacks run only after the
-// envelope is actually queued, so a slow subscriber cannot inflate queue age.
-fn enqueue(permit: mpsc::Permit<'_, ErasedEnvelope>, mut envelope: ErasedEnvelope) {
-    let trace = envelope.trace.mark_enqueued();
-    permit.send(envelope);
-    if let Some(trace) = trace {
-        trace.log_enqueued();
+pub(crate) type SubscriberId = u64;
+/// Shared liveness and counters; the consumer deliberately does not own a sender.
+pub(crate) struct QueueState {
+    pub cancel: CancellationToken,
+    active: std::sync::atomic::AtomicBool,
+    pub stats: Option<Arc<crate::diagnostics::QueueStats>>,
+}
+impl QueueState {
+    fn mark_inactive(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+    pub fn dequeued(&self) {
+        if let Some(stats) = &self.stats {
+            stats.queued.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
-pub(crate) type SubscriberId = u64;
-struct Subscriber {
+#[derive(Clone)]
+pub(crate) struct Target {
     id: SubscriberId,
     tx: mpsc::Sender<ErasedEnvelope>,
+    pub state: Arc<QueueState>,
+    address: String,
+    closed: CancellationToken,
+}
+impl Target {
+    fn check(&self) -> Result<()> {
+        if self.closed.is_cancelled() {
+            Err(VertxError::VertxClosed)
+        } else if !self.state.active.load(Ordering::Acquire)
+            || self.state.cancel.is_cancelled()
+            || self.tx.is_closed()
+        {
+            Err(VertxError::ChannelClosed(self.address.clone()))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn reserve(self) -> Reservation {
+        let acquire = Box::pin(self.tx.clone().reserve_owned());
+        let cancel = Box::pin(self.state.cancel.clone().cancelled_owned());
+        Reservation {
+            target: self,
+            acquire: Some(acquire),
+            cancel,
+            permit: None,
+            waiting: false,
+        }
+    }
+    fn try_reserve(self) -> Result<Reservation> {
+        self.check()?;
+        let permit = self
+            .tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    if let Some(stats) = &self.state.stats {
+                        stats.full();
+                    }
+                    VertxError::QueueFull(self.address.clone())
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    VertxError::ChannelClosed(self.address.clone())
+                }
+            })?;
+        if let Some(stats) = &self.state.stats {
+            stats.reserved.fetch_add(1, Ordering::Relaxed);
+        }
+        let cancel = Box::pin(self.state.cancel.clone().cancelled_owned());
+        Ok(Reservation {
+            target: self,
+            acquire: None,
+            cancel,
+            permit: Some(permit),
+            waiting: false,
+        })
+    }
+}
+type Acquire = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<
+                    mpsc::OwnedPermit<ErasedEnvelope>,
+                    mpsc::error::SendError<()>,
+                >,
+            > + Send,
+    >,
+>;
+/// One queue position and, once ready, one slot. Drop releases both accounting
+/// and Tokio's reservation even if a waiting sender is aborted before wakeup.
+pub(crate) struct Reservation {
+    target: Target,
+    acquire: Option<Acquire>,
+    cancel: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    permit: Option<mpsc::OwnedPermit<ErasedEnvelope>>,
+    waiting: bool,
+}
+impl Reservation {
+    pub fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if let Err(error) = self.target.check() {
+            return Poll::Ready(Err(error));
+        }
+        if self.cancel.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(self.target.check());
+        }
+        if self.permit.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        match self
+            .acquire
+            .as_mut()
+            .expect("unreserved sender owns an acquire future")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Pending => {
+                if !self.waiting {
+                    self.waiting = true;
+                    if let Some(stats) = &self.target.state.stats {
+                        stats.waiting.fetch_add(1, Ordering::Relaxed);
+                        // Tokio may also yield for its cooperative budget;
+                        // Pending alone does not prove the queue is full.
+                        if self.target.tx.capacity() == 0 {
+                            stats.full();
+                        }
+                    }
+                }
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                self.end_wait();
+                self.acquire = None;
+                match result {
+                    Ok(permit) => {
+                        self.permit = Some(permit);
+                        if let Some(stats) = &self.target.state.stats {
+                            stats.reserved.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Poll::Ready(self.target.check())
+                    }
+                    Err(_) => {
+                        Poll::Ready(Err(VertxError::ChannelClosed(self.target.address.clone())))
+                    }
+                }
+            }
+        }
+    }
+    fn end_wait(&mut self) {
+        if self.waiting {
+            self.waiting = false;
+            if let Some(stats) = &self.target.state.stats {
+                stats.waiting.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn send(mut self, mut envelope: ErasedEnvelope) -> Result<()> {
+        // Tracing callbacks run outside router locks and before the final check.
+        let trace = envelope.trace.mark_enqueued();
+        self.target.check()?;
+        let permit = self
+            .permit
+            .take()
+            .ok_or_else(|| VertxError::Other("sink is not ready".into()))?;
+        if let Some(stats) = &self.target.state.stats {
+            stats.reserved.fetch_sub(1, Ordering::Relaxed);
+            // Increment before waking a receiver which may immediately dequeue.
+            stats.queued.fetch_add(1, Ordering::Relaxed);
+        }
+        permit.send(envelope);
+        if let Some(trace) = trace {
+            trace.log_enqueued();
+        }
+        Ok(())
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.end_wait();
+        if self.permit.is_some() {
+            if let Some(stats) = &self.target.state.stats {
+                stats.reserved.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 struct Route {
     kind: TypeId,
-    subscribers: Vec<Subscriber>,
+    subscribers: Vec<Target>,
     cursor: usize,
 }
 pub(crate) struct EventBusInner {
@@ -60,11 +233,29 @@ impl EventBusInner {
         self: &Arc<Self>,
         address: &str,
         owner: Option<Context>,
+        capacity: usize,
     ) -> Result<Consumer<T>> {
         let _admission = self.admission.read().unwrap();
         self.ensure_open()?;
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = owner
+            .as_ref()
+            .map(|c| c.cancellation_token())
+            .unwrap_or_else(|| self.closed.clone())
+            .child_token();
+        let stats = self.diagnostics.register_queue(
+            id,
+            address,
+            capacity,
+            owner.as_ref().map(Context::id),
+            owner.as_ref().and_then(Context::deployment_id),
+        );
+        let state = Arc::new(QueueState {
+            cancel: cancel.clone(),
+            active: std::sync::atomic::AtomicBool::new(true),
+            stats,
+        });
         {
             let mut route = self.routes.entry(address.into()).or_insert_with(|| Route {
                 kind: TypeId::of::<T>(),
@@ -72,45 +263,72 @@ impl EventBusInner {
                 cursor: 0,
             });
             if route.kind != TypeId::of::<T>() {
+                self.diagnostics.unregister_queue(id);
                 return Err(VertxError::TypeMismatch(address.into()));
             }
-            route.subscribers.push(Subscriber { id, tx });
+            route.subscribers.push(Target {
+                id,
+                tx,
+                state: state.clone(),
+                address: address.into(),
+                closed: self.closed.clone(),
+            });
             self.diagnostics.consumer(1);
         }
         if self.closed.is_cancelled() {
             self.unregister(address, id);
             return Err(VertxError::VertxClosed);
         }
-        let cancel = owner
-            .as_ref()
-            .map(|c| c.cancellation_token())
-            .unwrap_or_else(|| self.closed.clone());
         Ok(Consumer::new(
             rx,
             address.into(),
             id,
             self.clone(),
             owner,
-            cancel,
+            state,
         ))
     }
     pub fn unregister(&self, address: &str, id: SubscriberId) {
-        if let Entry::Occupied(mut entry) = self.routes.entry(address.into()) {
-            let before = entry.get().subscribers.len();
-            entry.get_mut().subscribers.retain(|s| s.id != id);
-            self.diagnostics
-                .consumer(-((before - entry.get().subscribers.len()) as isize));
-            if entry.get().subscribers.is_empty() {
-                entry.remove();
+        let removed = if let Entry::Occupied(mut entry) = self.routes.entry(address.into()) {
+            if let Some(index) = entry.get().subscribers.iter().position(|t| t.id == id) {
+                let target = entry.get_mut().subscribers.remove(index);
+                target.state.mark_inactive();
+                self.diagnostics.unregister_queue(id);
+                self.diagnostics.consumer(-1);
+                if entry.get().subscribers.is_empty() {
+                    entry.remove();
+                }
+                Some(target)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        // Cancellation and the last sender's Drop can invoke user Wakers.
+        // Both must run after releasing the route entry guard.
+        if let Some(target) = removed {
+            target.state.cancel.cancel();
         }
     }
     pub fn close(&self) {
         self.closed.cancel();
         let _admission = self.admission.write().unwrap();
-        let count: usize = self.routes.iter().map(|r| r.subscribers.len()).sum();
-        self.routes.clear();
-        self.diagnostics.consumer(-(count as isize));
+        let mut removed = Vec::new();
+        self.routes.retain(|_, route| {
+            for target in &route.subscribers {
+                target.state.mark_inactive();
+                self.diagnostics.unregister_queue(target.id);
+            }
+            self.diagnostics
+                .consumer(-(route.subscribers.len() as isize));
+            removed.append(&mut route.subscribers);
+            false
+        });
+        drop(_admission);
+        for target in removed {
+            target.state.cancel.cancel();
+        }
     }
     pub fn publish<T: Clone + Send + 'static>(
         &self,
@@ -125,25 +343,23 @@ impl EventBusInner {
                 if route.kind != TypeId::of::<T>() {
                     return Err(VertxError::TypeMismatch(address.into()));
                 }
-                route.subscribers.iter().map(|s| s.tx.clone()).collect()
+                route.subscribers.clone()
             }
         };
         let mut dropped = 0usize;
-        for tx in senders {
-            // Clone outside router locks: Clone is user code and may re-enter the bus.
-            let body = Box::new(body.clone());
-            match tx.try_reserve() {
-                Ok(permit) => {
-                    let trace = MessageTrace::new(&self.diagnostics, address, None);
-                    enqueue(
-                        permit,
-                        ErasedEnvelope {
-                            trace,
-                            body,
-                            headers: headers.clone(),
-                            reply_to: None,
-                        },
-                    );
+        for target in senders {
+            match target.try_reserve() {
+                Ok(reservation) => {
+                    // Clone is user code; only invoke it after admission, outside route locks.
+                    let envelope = ErasedEnvelope {
+                        trace: MessageTrace::new(&self.diagnostics, address, None),
+                        body: Box::new(body.clone()),
+                        headers: headers.clone(),
+                        reply_to: None,
+                    };
+                    if reservation.send(envelope).is_err() {
+                        dropped += 1;
+                    }
                 }
                 Err(_) => dropped += 1,
             }
@@ -159,14 +375,7 @@ impl EventBusInner {
         }
         Ok(())
     }
-    fn prepare<T: Send + 'static>(
-        &self,
-        address: &str,
-        body: T,
-        headers: Headers,
-        reply_to: Option<oneshot::Sender<Result<ErasedEnvelope>>>,
-        request_id: Option<u64>,
-    ) -> Result<(mpsc::Sender<ErasedEnvelope>, ErasedEnvelope)> {
+    pub fn select<T: Send + 'static>(&self, address: &str) -> Result<Target> {
         self.ensure_open()?;
         let mut route = self
             .routes
@@ -177,10 +386,19 @@ impl EventBusInner {
         }
         let index = route.cursor % route.subscribers.len();
         route.cursor = route.cursor.wrapping_add(1);
-        let tx = route.subscribers[index].tx.clone();
-        drop(route); // Subscriber callbacks must run outside the route lock.
+        Ok(route.subscribers[index].clone())
+    }
+    fn prepare<T: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        headers: Headers,
+        reply_to: Option<oneshot::Sender<Result<ErasedEnvelope>>>,
+        request_id: Option<u64>,
+    ) -> Result<(Target, ErasedEnvelope)> {
+        let target = self.select::<T>(address)?;
         Ok((
-            tx,
+            target,
             ErasedEnvelope {
                 trace: MessageTrace::new(&self.diagnostics, address, request_id),
                 body: Box::new(body),
@@ -189,20 +407,10 @@ impl EventBusInner {
             },
         ))
     }
-    async fn deliver(
-        &self,
-        address: &str,
-        tx: mpsc::Sender<ErasedEnvelope>,
-        envelope: ErasedEnvelope,
-    ) -> Result<()> {
-        tokio::select! { biased;
-            _ = self.closed.cancelled() => Err(VertxError::VertxClosed),
-            r = tx.reserve() => {
-                let permit = r.map_err(|_| VertxError::ChannelClosed(address.into()))?;
-                enqueue(permit, envelope);
-                Ok(())
-            },
-        }
+    async fn deliver(&self, target: Target, envelope: ErasedEnvelope) -> Result<()> {
+        let mut reservation = target.reserve();
+        futures::future::poll_fn(|cx| reservation.poll_ready(cx)).await?;
+        reservation.send(envelope)
     }
     pub async fn send<T: Send + 'static>(
         &self,
@@ -211,7 +419,7 @@ impl EventBusInner {
         headers: Headers,
     ) -> Result<()> {
         let (tx, env) = self.prepare(address, body, headers, None, None)?;
-        self.deliver(address, tx, env).await
+        self.deliver(tx, env).await
     }
     pub fn try_send<T: Send + 'static>(
         &self,
@@ -220,12 +428,7 @@ impl EventBusInner {
         headers: Headers,
     ) -> Result<()> {
         let (tx, env) = self.prepare(address, body, headers, None, None)?;
-        let permit = tx.try_reserve().map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => VertxError::QueueFull(address.into()),
-            mpsc::error::TrySendError::Closed(_) => VertxError::ChannelClosed(address.into()),
-        })?;
-        enqueue(permit, env);
-        Ok(())
+        tx.try_reserve()?.send(env)
     }
     pub async fn send_with_reply<T: Send + 'static>(
         &self,
@@ -236,7 +439,7 @@ impl EventBusInner {
     ) -> Result<oneshot::Receiver<Result<ErasedEnvelope>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let (tx, env) = self.prepare(address, body, headers, Some(reply_tx), Some(request_id))?;
-        self.deliver(address, tx, env).await?;
+        self.deliver(tx, env).await?;
         Ok(reply_rx)
     }
 }
@@ -245,13 +448,38 @@ impl EventBusInner {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn malformed_envelope_reports_conversion_failure_once() {
+        let bus = Arc::new(EventBusInner::new(
+            CancellationToken::new(),
+            crate::diagnostics::Diagnostics::new(0, Default::default()),
+        ));
+        let mut consumer = bus.register::<u32>("typed", None, 1).unwrap();
+        bus.select::<u32>("typed")
+            .unwrap()
+            .try_reserve()
+            .unwrap()
+            .send(ErasedEnvelope {
+                trace: MessageTrace::new(&bus.diagnostics, "typed", None),
+                body: Box::new("wrong type"),
+                headers: Headers::new(),
+                reply_to: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            consumer.recv().await,
+            Err(VertxError::TypeMismatch(_))
+        ));
+        assert!(consumer.recv().await.unwrap().is_none());
+        assert!(bus.routes.is_empty());
+    }
+    #[tokio::test]
     async fn concurrent_last_unregister_and_new_register_preserve_new_route() {
         let bus = Arc::new(EventBusInner::new(
             CancellationToken::new(),
             crate::diagnostics::Diagnostics::new(0, Default::default()),
         ));
         for _ in 0..100 {
-            let old = bus.register::<u32>("race", None).unwrap();
+            let old = bus.register::<u32>("race", None, 256).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let b = barrier.clone();
             let dropper = std::thread::spawn(move || {
@@ -262,13 +490,73 @@ mod tests {
             let router = bus.clone();
             let creator = std::thread::spawn(move || {
                 b.wait();
-                router.register::<u32>("race", None).unwrap()
+                router.register::<u32>("race", None, 256).unwrap()
             });
             dropper.join().unwrap();
             let mut new = creator.join().unwrap();
             bus.try_send("race", 42u32, Headers::new()).unwrap();
-            assert_eq!(new.recv().await.unwrap().into_body(), 42);
+            assert_eq!(new.recv().await.unwrap().unwrap().into_body(), 42);
         }
         assert!(bus.routes.is_empty());
+    }
+
+    #[test]
+    fn unregister_wakes_waiters_after_releasing_the_route_lock() {
+        struct Reenter {
+            bus: Arc<EventBusInner>,
+            wakes: std::sync::atomic::AtomicUsize,
+        }
+        impl std::task::Wake for Reenter {
+            fn wake(self: Arc<Self>) {
+                assert!(!matches!(
+                    self.bus.routes.try_get("wake"),
+                    dashmap::try_result::TryResult::Locked
+                ));
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let bus = Arc::new(EventBusInner::new(
+            CancellationToken::new(),
+            crate::diagnostics::Diagnostics::new(0, Default::default()),
+        ));
+        let consumer = bus.register::<u32>("wake", None, 1).unwrap();
+        bus.try_send("wake", 1u32, Headers::new()).unwrap();
+        let mut reservation = bus.select::<u32>("wake").unwrap().reserve();
+        let reenter = Arc::new(Reenter {
+            bus: bus.clone(),
+            wakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = std::task::Waker::from(reenter.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(reservation.poll_ready(&mut cx).is_pending());
+        bus.unregister("wake", consumer.subscriber_id());
+        assert!(reenter.wakes.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            reservation.poll_ready(&mut cx),
+            std::task::Poll::Ready(Err(VertxError::ChannelClosed(_)))
+        ));
+    }
+
+    #[test]
+    fn concurrent_close_and_unregister_leave_no_queue_counts() {
+        for _ in 0..100 {
+            let bus = Arc::new(EventBusInner::new(
+                CancellationToken::new(),
+                crate::diagnostics::Diagnostics::new(0, Default::default()),
+            ));
+            let consumer = bus.register::<u32>("close-race", None, 1).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let gate = barrier.clone();
+            let dropper = std::thread::spawn(move || {
+                gate.wait();
+                drop(consumer);
+            });
+            barrier.wait();
+            bus.close();
+            dropper.join().unwrap();
+            let snapshot = bus.diagnostics.snapshot();
+            assert_eq!(snapshot.active_consumers, 0);
+            assert!(snapshot.queues.is_empty());
+        }
     }
 }
