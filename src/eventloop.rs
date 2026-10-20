@@ -1,55 +1,70 @@
+use crate::context::{set_thread, ThreadIdentity};
+use crate::{Result, VertxError};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
+use std::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::task::LocalPoolHandle;
 
-/// Stable identifier for one EventLoop (one OS thread + LocalSet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventLoopId(pub(crate) usize);
-
 impl std::fmt::Display for EventLoopId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "el#{}", self.0)
     }
 }
-
-/// Pool of single-threaded tokio runtimes ("event loops"), one per OS thread.
-/// Verticles deployed here are pinned to a specific loop for their entire lifetime
-/// and may hold `!Send` state.
 pub(crate) struct EventLoopPool {
-    pool: LocalPoolHandle,
+    pool: Mutex<Option<LocalPoolHandle>>,
     size: usize,
+    instance: u64,
     rr: AtomicUsize,
+    threads: Vec<std::thread::ThreadId>,
 }
-
 impl EventLoopPool {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, instance: u64) -> Self {
         assert!(size > 0, "event loop pool size must be > 0");
+        let pool = LocalPoolHandle::new(size);
+        let mut threads = Vec::with_capacity(size);
+        for idx in 0..size {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            pool.spawn_pinned_by_idx(
+                move || async move {
+                    set_thread(Some(ThreadIdentity::EventLoop(instance, EventLoopId(idx))));
+                    let _ = tx.send(std::thread::current().id());
+                },
+                idx,
+            );
+            threads.push(rx.recv().expect("event loop initialization failed"));
+        }
         Self {
-            pool: LocalPoolHandle::new(size),
+            pool: Mutex::new(Some(pool)),
             size,
+            instance,
             rr: AtomicUsize::new(0),
+            threads,
         }
     }
-
     pub fn size(&self) -> usize {
         self.size
     }
-
-    /// Round-robin selection.
     pub fn pick(&self) -> EventLoopId {
         EventLoopId(self.rr.fetch_add(1, Ordering::Relaxed) % self.size)
     }
-
-    /// Spawn a task on a specific EventLoop. The factory runs on that loop's
-    /// thread, so the future it produces may be `!Send`.
-    pub fn spawn_pinned<F, Fut, R>(&self, id: EventLoopId, factory: F) -> JoinHandle<R>
+    pub fn check_thread(&self, id: EventLoopId) -> bool {
+        crate::context::thread_identity() == Some(ThreadIdentity::EventLoop(self.instance, id))
+            && self.threads[id.0] == std::thread::current().id()
+    }
+    pub fn spawn_pinned<F, Fut, R>(&self, id: EventLoopId, factory: F) -> Result<JoinHandle<R>>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        self.pool.spawn_pinned_by_idx(factory, id.0)
+        let p = self.pool.lock().unwrap();
+        let pool = p.as_ref().ok_or(VertxError::VertxClosed)?;
+        Ok(pool.spawn_pinned_by_idx(factory, id.0))
+    }
+    pub fn shutdown(&self) {
+        self.pool.lock().unwrap().take();
     }
 }

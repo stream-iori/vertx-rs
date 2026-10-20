@@ -1,1218 +1,1778 @@
-//! Integration tests for vertx-rs (owned-self / run model).
-
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
+//! Contract tests for the Vert.x 5-style execution core.
 use async_trait::async_trait;
-use vertx_rs::{Consumer, Context, DeliveryOptions, EventBus, Result, Verticle, Vertx, VertxError, WorkerVerticle};
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::oneshot;
+use vertx_rs::{
+    Context, DeliveryOptions, DeploymentOptions, Result, ThreadingModel, Verticle, Vertx,
+    VertxError, WorkerVerticle,
+};
 
-// ---------------------------------------------------------------------------
-// Lifecycle: deploy spawns run() after factory; undeploy cancels it
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-struct Counters {
+fn vx() -> Vertx {
+    Vertx::builder()
+        .event_loop_threads(2)
+        .worker_threads(2)
+        .blocking_threads(2)
+        .shutdown_grace(Duration::from_millis(500))
+        .build()
+}
+struct Local<F>(Option<F>);
+fn local<F, Fut>(f: F) -> Local<F>
+where
+    F: FnOnce(Context) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    Local(Some(f))
+}
+#[async_trait(?Send)]
+impl<F, Fut> Verticle for Local<F>
+where
+    F: FnOnce(Context) -> Fut + 'static,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    async fn start(&mut self, ctx: Context) -> Result<()> {
+        self.0.take().unwrap()(ctx).await
+    }
+}
+struct Worker<F>(Option<F>);
+fn worker<F, Fut>(f: F) -> Worker<F>
+where
+    F: FnOnce(Context) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    Worker(Some(f))
+}
+#[async_trait]
+impl<F, Fut> WorkerVerticle for Worker<F>
+where
+    F: FnOnce(Context) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    async fn start(&mut self, ctx: Context) -> Result<()> {
+        self.0.take().unwrap()(ctx).await
+    }
+}
+async fn capture(vx: &Vertx) -> (vertx_rs::DeploymentId, Context) {
+    let (tx, rx) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                tx.send(ctx).ok();
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    (id, rx.await.unwrap())
+}
+async fn echo(vx: &Vertx, address: &'static str) -> vertx_rs::DeploymentId {
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            ctx.event_bus()
+                .consumer::<String>(address)?
+                .handler(|env| async move {
+                    let body = env.body().clone();
+                    env.reply(body)
+                })
+        })
+    })
+    .await
+    .unwrap()
+}
+struct Lifecycle {
     started: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
 }
-
-struct LifecycleV {
-    counters: Counters,
-}
-
 #[async_trait(?Send)]
-impl Verticle for LifecycleV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        self.counters.started.fetch_add(1, Ordering::SeqCst);
-        ctx.cancellation_token().cancelled().await;
-        self.counters.stopped.fetch_add(1, Ordering::SeqCst);
+impl Verticle for Lifecycle {
+    async fn start(&mut self, _: Context) -> Result<()> {
+        tokio::task::yield_now().await;
+        self.started.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn stop(&mut self, _: Context) -> Result<()> {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
-
 #[tokio::test]
-async fn deploy_runs_factory_then_run_then_undeploy_cancels() {
-    let vx = Vertx::new();
-    let c = Counters::default();
-    let c2 = c.clone();
+async fn deploy_runs_factory_then_start_then_undeploy_stops() {
+    let vx = vx();
+    let started = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let (a, b) = (started.clone(), stopped.clone());
     let id = vx
-        .deploy(move |_ctx| LifecycleV { counters: c2 })
-        .await
-        .unwrap();
-    // Give the spawned task a moment to enter run().
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(c.started.load(Ordering::SeqCst), 1);
-    assert_eq!(c.stopped.load(Ordering::SeqCst), 0);
-
-    vx.undeploy(id).await.unwrap();
-    assert_eq!(c.stopped.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn undeploy_unknown_id_errors() {
-    let vx = Vertx::new();
-    let id = vx
-        .deploy(|_| LifecycleV { counters: Counters::default() })
-        .await
-        .unwrap();
-    vx.undeploy(id).await.unwrap();
-    let err = vx.undeploy(id).await.unwrap_err();
-    assert!(matches!(err, VertxError::DeploymentNotFound(_)));
-}
-
-#[tokio::test]
-async fn undeploy_aborts_misbehaving_verticle() {
-    // Verticle that never listens to cancellation — must be aborted.
-    struct Stubborn;
-    #[async_trait(?Send)]
-    impl Verticle for Stubborn {
-        async fn run(self, _ctx: Context) -> Result<()> {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-    let vx = Vertx::new();
-    let id = vx.deploy(|_| Stubborn).await.unwrap();
-    // undeploy with internal grace period; should eventually return.
-    let res = tokio::time::timeout(Duration::from_secs(3), vx.undeploy(id)).await;
-    assert!(res.is_ok(), "undeploy must not hang");
-}
-
-// ---------------------------------------------------------------------------
-// EventLoop affinity & !Send state held by owned value (no Rc/RefCell)
-// ---------------------------------------------------------------------------
-
-struct AffinityV {
-    consumer: Consumer<u32>,
-    samples: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for AffinityV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        self.samples
-            .lock()
-            .unwrap()
-            .push(std::thread::current().id());
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    self.samples.lock().unwrap().push(std::thread::current().id());
-                    let body = env.body().clone();
-                    let _ = env.reply(body);
-                }
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn verticle_pinned_to_single_thread() {
-    let vx = Vertx::new();
-    let samples: Arc<std::sync::Mutex<Vec<_>>> = Arc::new(Default::default());
-    let s2 = Arc::clone(&samples);
-    vx.deploy(move |ctx| AffinityV {
-        consumer: ctx.event_bus().consumer::<u32>("affinity").unwrap(),
-        samples: s2,
-    })
-    .await
-    .unwrap();
-
-    for i in 0..20u32 {
-        let _: u32 = vx
-            .event_bus()
-            .request("affinity", i)
-            .await
-            .unwrap();
-    }
-
-    let s = samples.lock().unwrap();
-    let first = s[0];
-    assert!(s.iter().all(|t| *t == first), "moved across threads: {s:?}");
-    assert!(s.len() >= 21);
-}
-
-/// Counter verticle holding owned `Cell<u64>` (no Rc/RefCell needed).
-struct CounterV {
-    consumer: Consumer<()>,
-    count: Cell<u64>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for CounterV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    self.count.set(self.count.get() + 1);
-                    let _ = env.reply(self.count.get());
-                }
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn verticle_can_hold_non_send_state_directly() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| CounterV {
-        consumer: ctx.event_bus().consumer::<()>("inc").unwrap(),
-        count: Cell::new(0),
-    })
-    .await
-    .unwrap();
-    let n1: u64 = vx.event_bus().request("inc", ()).await.unwrap();
-    let n2: u64 = vx.event_bus().request("inc", ()).await.unwrap();
-    let n3: u64 = vx.event_bus().request("inc", ()).await.unwrap();
-    assert_eq!((n1, n2, n3), (1, 2, 3));
-}
-
-// ---------------------------------------------------------------------------
-// EventBus: bound consumer auto-cleanup, inter-verticle communication
-// ---------------------------------------------------------------------------
-
-struct EchoV {
-    consumer: Consumer<String>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for EchoV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let body = env.body().clone();
-                    let _ = env.reply(format!("echo:{body}"));
-                }
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn undeploy_unregisters_bound_consumers() {
-    let vx = Vertx::new();
-    let id = vx
-        .deploy(|ctx| EchoV {
-            consumer: ctx.event_bus().consumer::<String>("echo").unwrap(),
+        .deploy(move |_| Lifecycle {
+            started: a,
+            stopped: b,
         })
         .await
         .unwrap();
-    let r: String = vx
-        .event_bus()
-        .request("echo", "hi".to_string())
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    assert_eq!(stopped.load(Ordering::SeqCst), 0);
+    vx.undeploy(id).await.unwrap();
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn undeploy_unknown_id_errors() {
+    let vx = vx();
+    let (id, _) = capture(&vx).await;
+    vx.undeploy(id).await.unwrap();
+    assert!(matches!(
+        vx.undeploy(id).await,
+        Err(VertxError::DeploymentNotFound(_))
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn undeploy_aborts_misbehaving_child() {
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let handle = ctx.spawn_local(async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })?;
+                tx.send(handle).ok();
+                Ok(())
+            })
+        })
         .await
         .unwrap();
-    assert_eq!(r, "echo:hi");
-
+    let child = rx.await.unwrap();
     vx.undeploy(id).await.unwrap();
-    let err = vx.event_bus().send("echo", "x".to_string()).await.unwrap_err();
-    assert!(matches!(err, VertxError::NoConsumer(_)));
+    assert!(child.await.unwrap_err().is_cancelled());
+    vx.close().await.unwrap();
 }
-
-// Inter-verticle calls via bound buses.
-struct UpperV {
-    consumer: Consumer<String>,
-}
-#[async_trait(?Send)]
-impl Verticle for UpperV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let body = env.body().clone();
-                    let _ = env.reply(body.to_uppercase());
-                }
-            }
+#[tokio::test]
+async fn verticle_pinned_to_single_thread() {
+    struct Affinity {
+        samples: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+        non_send: Rc<Cell<u64>>,
+    }
+    impl Drop for Affinity {
+        fn drop(&mut self) {
+            self.samples
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            assert!(Context::current().is_some());
         }
     }
-}
-struct CallerV {
-    consumer: Consumer<String>,
-    bus: EventBus,
-}
-#[async_trait(?Send)]
-impl Verticle for CallerV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let body = env.body().clone();
-                    let upper: String = self.bus
-                        .request("upper", body)
-                        .await
-                        .unwrap();
-                    let _ = env.reply(upper);
-                }
-            }
+    #[async_trait(?Send)]
+    impl Verticle for Affinity {
+        async fn start(&mut self, ctx: Context) -> Result<()> {
+            self.samples
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            let (samples, count) = (self.samples.clone(), self.non_send.clone());
+            ctx.event_bus()
+                .consumer::<()>("affinity")?
+                .handler(move |env| {
+                    let (samples, count) = (samples.clone(), count.clone());
+                    async move {
+                        samples.lock().unwrap().push(std::thread::current().id());
+                        tokio::task::yield_now().await;
+                        let ctx = Context::current().unwrap();
+                        ctx.execute_blocking(|| 42).await?;
+                        samples.lock().unwrap().push(std::thread::current().id());
+                        count.set(count.get() + 1);
+                        env.reply(count.get())
+                    }
+                })
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            tokio::task::yield_now().await;
+            self.samples
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            Ok(())
         }
     }
+    let vx = vx();
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let s = samples.clone();
+    let id = vx
+        .deploy(move |_| {
+            s.lock().unwrap().push(std::thread::current().id());
+            Affinity {
+                samples: s,
+                non_send: Rc::new(Cell::new(0)),
+            }
+        })
+        .await
+        .unwrap();
+    for i in 1..=20 {
+        assert_eq!(
+            vx.event_bus()
+                .request::<_, u64>("affinity", ())
+                .await
+                .unwrap(),
+            i
+        );
+    }
+    vx.undeploy(id).await.unwrap();
+    {
+        let s = samples.lock().unwrap();
+        assert!(s.len() >= 44);
+        assert!(s.iter().all(|t| *t == s[0]));
+    }
+    vx.close().await.unwrap();
 }
-
+#[tokio::test]
+async fn verticle_can_hold_non_send_state_directly() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let count = Cell::new(0u64);
+            ctx.event_bus().consumer::<()>("inc")?.handler(move |env| {
+                count.set(count.get() + 1);
+                let n = count.get();
+                async move { env.reply(n) }
+            })
+        })
+    })
+    .await
+    .unwrap();
+    for n in 1..=3 {
+        assert_eq!(
+            vx.event_bus().request::<_, u64>("inc", ()).await.unwrap(),
+            n
+        );
+    }
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn undeploy_unregisters_bound_consumers() {
+    let vx = vx();
+    let id = echo(&vx, "echo").await;
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, String>("echo", "hi".to_owned())
+            .await
+            .unwrap(),
+        "hi"
+    );
+    vx.undeploy(id).await.unwrap();
+    assert!(matches!(
+        vx.event_bus().send("echo", "x".to_owned()).await,
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+}
 #[tokio::test]
 async fn verticles_communicate_through_their_bound_buses() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| UpperV {
-        consumer: ctx.event_bus().consumer::<String>("upper").unwrap(),
+    let vx = vx();
+    echo(&vx, "upstream").await;
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let bus = ctx.event_bus();
+            bus.consumer::<String>("caller")?.handler(move |env| {
+                let bus = bus.clone();
+                async move {
+                    let response: String = bus.request("upstream", env.body().clone()).await?;
+                    env.reply(response)
+                }
+            })
+        })
     })
     .await
     .unwrap();
-    vx.deploy(|ctx| CallerV {
-        consumer: ctx.event_bus().consumer::<String>("caller").unwrap(),
-        bus: ctx.event_bus(),
-    })
-    .await
-    .unwrap();
-    let r: String = vx
-        .event_bus()
-        .request("caller", "hello".to_string())
-        .await
-        .unwrap();
-    assert_eq!(r, "HELLO");
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, String>("caller", "hello".to_owned())
+            .await
+            .unwrap(),
+        "hello"
+    );
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// WorkerVerticle + execute_blocking
-// ---------------------------------------------------------------------------
-
-struct EchoWorker {
-    consumer: Consumer<String>,
-}
-#[async_trait]
-impl WorkerVerticle for EchoWorker {
-    async fn run(mut self, _ctx: Context) -> Result<()> {
-        while let Some(env) = self.consumer.recv().await {
-            let body = env.body().clone();
-            let _ = env.reply(format!("worker:{body}"));
-        }
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn worker_verticle_processes_messages() {
-    let vx = Vertx::new();
-    vx.deploy_worker(EchoWorker {
-        consumer: vx.event_bus().consumer::<String>("worker-echo").unwrap(),
+    let vx = vx();
+    vx.deploy_worker(|_| {
+        worker(|ctx| async move {
+            ctx.event_bus()
+                .consumer::<u64>("worker")?
+                .handler_worker(|env| async move {
+                    assert!(Context::is_on_worker_thread());
+                    let n = *env.body() * 2;
+                    env.reply(n)
+                })
+        })
     })
     .await
     .unwrap();
-    let r: String = vx
-        .event_bus()
-        .request("worker-echo", "hi".to_string())
-        .await
-        .unwrap();
-    assert_eq!(r, "worker:hi");
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, u64>("worker", 21u64)
+            .await
+            .unwrap(),
+        42
+    );
+    vx.close().await.unwrap();
 }
-
-struct ComputeV {
-    consumer: Consumer<u64>,
-}
-#[async_trait(?Send)]
-impl Verticle for ComputeV {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let n = *env.body();
-                    let out = ctx
-                        .execute_blocking(move || {
-                            std::thread::sleep(Duration::from_millis(5));
-                            n * n
-                        })
-                        .await
-                        .unwrap();
-                    let _ = env.reply(out);
-                }
-            }
-        }
-    }
-}
-
 #[tokio::test]
 async fn execute_blocking_from_event_loop_verticle() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| ComputeV {
-        consumer: ctx.event_bus().consumer::<u64>("compute").unwrap(),
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let thread = std::thread::current().id();
+            let id = ctx.deployment_id();
+            let result = ctx
+                .execute_blocking(move || {
+                    assert_eq!(Context::current().unwrap().deployment_id(), id);
+                    assert!(Context::current().unwrap().is_event_loop());
+                    assert!(Context::is_on_worker_thread());
+                    assert!(!Context::is_on_event_loop_thread());
+                    42
+                })
+                .await?;
+            assert_eq!(result, 42);
+            assert_eq!(std::thread::current().id(), thread);
+            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            Ok(())
+        })
     })
     .await
     .unwrap();
-    let n: u64 = vx.event_bus().request("compute", 7u64).await.unwrap();
-    assert_eq!(n, 49);
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// Context introspection (Vert.x parity)
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn context_current_is_none_outside_vertx() {
     assert!(Context::current().is_none());
-    assert!(!Context::is_on_event_loop_thread());
-    assert!(!Context::is_on_worker_thread());
     assert!(!Context::is_on_vertx_thread());
 }
-
-#[derive(Clone)]
-struct ProbeOut {
-    threading_model: vertx_rs::ThreadingModel,
-    is_on_el: bool,
-    is_on_worker: bool,
-    is_on_vertx: bool,
-    deployment_id: Option<vertx_rs::DeploymentId>,
-    owner_present: bool,
-}
-
-struct ProbeV {
-    out: Arc<std::sync::Mutex<Option<ProbeOut>>>,
-}
-#[async_trait(?Send)]
-impl Verticle for ProbeV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        *self.out.lock().unwrap() = Some(ProbeOut {
-            threading_model: ctx.threading_model(),
-            is_on_el: Context::is_on_event_loop_thread(),
-            is_on_worker: Context::is_on_worker_thread(),
-            is_on_vertx: Context::is_on_vertx_thread(),
-            deployment_id: ctx.deployment_id(),
-            owner_present: ctx.owner().is_some(),
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn context_introspection_event_loop_full() {
-    let vx = Vertx::new();
-    let out: Arc<std::sync::Mutex<Option<ProbeOut>>> = Arc::new(Default::default());
-    let out2 = Arc::clone(&out);
-    let dep = vx.deploy(move |_| ProbeV { out: out2 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let r = out.lock().unwrap().clone().unwrap();
-    assert_eq!(r.threading_model, vertx_rs::ThreadingModel::EventLoop);
-    assert!(r.is_on_el);
-    assert!(!r.is_on_worker);
-    assert!(r.is_on_vertx);
-    assert_eq!(r.deployment_id, Some(dep));
-    assert!(r.owner_present);
+    let vx = vx();
+    let (id, ctx) = capture(&vx).await;
+    assert_eq!(ctx.threading_model(), ThreadingModel::EventLoop);
+    assert_eq!(ctx.deployment_id(), Some(id));
+    assert!(ctx.owner().is_some());
+    assert!(ctx.event_loop_id().is_some());
+    vx.close().await.unwrap();
 }
-
-struct WorkerProbeV {
-    out: Arc<std::sync::Mutex<Option<ProbeOut>>>,
-}
-#[async_trait]
-impl WorkerVerticle for WorkerProbeV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        *self.out.lock().unwrap() = Some(ProbeOut {
-            threading_model: ctx.threading_model(),
-            is_on_el: Context::is_on_event_loop_thread(),
-            is_on_worker: Context::is_on_worker_thread(),
-            is_on_vertx: Context::is_on_vertx_thread(),
-            deployment_id: ctx.deployment_id(),
-            owner_present: ctx.owner().is_some(),
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn context_introspection_worker_full() {
-    let vx = Vertx::new();
-    let out: Arc<std::sync::Mutex<Option<ProbeOut>>> = Arc::new(Default::default());
-    let dep = vx
-        .deploy_worker(WorkerProbeV { out: Arc::clone(&out) })
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let r = out.lock().unwrap().clone().unwrap();
-    assert_eq!(r.threading_model, vertx_rs::ThreadingModel::Worker);
-    assert!(!r.is_on_el);
-    assert!(r.is_on_worker);
-    assert!(r.is_on_vertx);
-    assert_eq!(r.deployment_id, Some(dep));
-    assert!(r.owner_present);
+    let vx = vx();
+    vx.deploy_worker(|_| {
+        worker(|ctx| async move {
+            assert_eq!(ctx.threading_model(), ThreadingModel::Worker);
+            assert!(ctx.event_loop_id().is_none());
+            assert!(Context::is_on_worker_thread());
+            let id = ctx.deployment_id();
+            tokio::task::yield_now().await;
+            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// run_on_context: fire-and-forget hop into an EventLoop
-// ---------------------------------------------------------------------------
-
-/// Verticle that broadcasts its Context for the test to grab.
-struct CtxBroker {
-    slot: Arc<std::sync::Mutex<Option<Context>>>,
-}
-#[async_trait(?Send)]
-impl Verticle for CtxBroker {
-    async fn run(self, ctx: Context) -> Result<()> {
-        *self.slot.lock().unwrap() = Some(ctx.clone());
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn external_thread_can_hop_into_event_loop_via_run_on_context() {
-    let vx = Vertx::new();
-    let slot: Arc<std::sync::Mutex<Option<Context>>> = Arc::new(Default::default());
-    let s2 = Arc::clone(&slot);
-    vx.deploy(move |_| CtxBroker { slot: s2 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    assert!(Context::current().is_none());
-    let el_ctx = slot.lock().unwrap().clone().unwrap();
-    let expected = el_ctx.event_loop_id().unwrap();
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    el_ctx
-        .run_on_context(move || {
-            let id = Context::current().and_then(|c| c.event_loop_id()).unwrap();
-            let _ = tx.send(id);
+    let vx = vx();
+    let (_, ctx) = capture(&vx).await;
+    let (tx, rx) = oneshot::channel();
+    let id = ctx.deployment_id();
+    std::thread::spawn(move || {
+        ctx.run_on_context(move || {
+            assert!(Context::is_on_event_loop_thread());
+            tx.send(Context::current().unwrap().deployment_id()).ok();
         })
-        .unwrap();
-    let observed = rx.await.unwrap();
-    assert_eq!(observed, expected);
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(rx.await.unwrap(), id);
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn run_on_context_after_undeploy_returns_terminated() {
-    let vx = Vertx::new();
-    let slot: Arc<std::sync::Mutex<Option<Context>>> = Arc::new(Default::default());
-    let s2 = Arc::clone(&slot);
-    let id = vx.deploy(move |_| CtxBroker { slot: s2 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let captured = slot.lock().unwrap().clone().unwrap();
-    assert!(captured.is_alive());
-
+    let vx = vx();
+    let (id, ctx) = capture(&vx).await;
     vx.undeploy(id).await.unwrap();
-    assert!(!captured.is_alive());
-    let res = captured.run_on_context(|| {});
-    assert!(matches!(res, Err(VertxError::DeploymentTerminated(_))));
+    assert!(matches!(
+        ctx.run_on_context(|| {}),
+        Err(VertxError::DeploymentTerminated(_))
+    ));
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn execute_blocking_after_undeploy_returns_terminated() {
-    let vx = Vertx::new();
-    let slot: Arc<std::sync::Mutex<Option<Context>>> = Arc::new(Default::default());
-    let s2 = Arc::clone(&slot);
-    let id = vx.deploy(move |_| CtxBroker { slot: s2 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let captured = slot.lock().unwrap().clone().unwrap();
+    let vx = vx();
+    let (id, ctx) = capture(&vx).await;
     vx.undeploy(id).await.unwrap();
-    let res: Result<u32> = captured.execute_blocking(|| 1u32).await;
-    assert!(matches!(res, Err(VertxError::DeploymentTerminated(_))));
+    assert!(matches!(
+        ctx.execute_blocking(|| 1).await,
+        Err(VertxError::DeploymentTerminated(_))
+    ));
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn bound_consumer_after_undeploy_returns_terminated() {
-    let vx = Vertx::new();
-    let slot: Arc<std::sync::Mutex<Option<Context>>> = Arc::new(Default::default());
-    let s2 = Arc::clone(&slot);
-    let id = vx.deploy(move |_| CtxBroker { slot: s2 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let captured = slot.lock().unwrap().clone().unwrap();
-    let bound_bus = captured.event_bus();
+    let vx = vx();
+    let (id, ctx) = capture(&vx).await;
     vx.undeploy(id).await.unwrap();
-    let res: Result<Consumer<String>> = bound_bus.consumer("anywhere");
-    assert!(matches!(res, Err(VertxError::DeploymentTerminated(_))));
+    assert!(matches!(
+        ctx.event_bus().consumer::<()>("late"),
+        Err(VertxError::DeploymentTerminated(_))
+    ));
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// Timer / Periodic
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn vertx_timer_fires_after_delay() {
-    let vx = Vertx::new();
-    let start = std::time::Instant::now();
-    vx.timer(Duration::from_millis(50)).await.unwrap();
-    assert!(start.elapsed() >= Duration::from_millis(45));
+    let vx = vx();
+    let timer = vx.timer(Duration::from_millis(100)).unwrap();
+    tokio::time::advance(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_millis(1), timer)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::resume();
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn vertx_timer_explicit_cancel() {
-    let vx = Vertx::new();
-    let timer = vx.timer(Duration::from_secs(10));
+    let vx = vx();
+    let timer = vx.timer(Duration::ZERO).unwrap();
     timer.cancel();
-    let res = timer.await;
-    assert!(matches!(res, Err(VertxError::TimerCancelled)));
+    assert!(timer.is_cancelled());
+    assert!(matches!(timer.await, Err(VertxError::TimerCancelled)));
+    vx.close().await.unwrap();
 }
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn vertx_periodic_ticks_multiple_times() {
-    let vx = Vertx::new();
-    let mut p = vx.periodic(Duration::from_millis(10), Duration::from_millis(10));
+    let vx = vx();
+    let mut periodic = vx
+        .periodic(Duration::from_millis(10), Duration::from_millis(10))
+        .unwrap();
     for _ in 0..3 {
-        p.tick().await.unwrap();
+        periodic.tick().await.unwrap();
     }
-    p.cancel();
-    let res = p.tick().await;
-    assert!(matches!(res, Err(VertxError::TimerCancelled)));
+    periodic.cancel();
+    assert!(periodic.is_cancelled());
+    assert!(matches!(
+        periodic.tick().await,
+        Err(VertxError::TimerCancelled)
+    ));
+    tokio::time::resume();
+    vx.close().await.unwrap();
 }
-
-// Bound timer dies with the verticle.
-struct TimerHolderV {
-    timer: vertx_rs::Timer,
-    fired: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicUsize>,
-}
-#[async_trait(?Send)]
-impl Verticle for TimerHolderV {
-    async fn run(self, _ctx: Context) -> Result<()> {
-        match self.timer.await {
-            Ok(()) => {
-                self.fired.fetch_add(1, Ordering::SeqCst);
-            }
-            Err(VertxError::TimerCancelled) => {
-                self.cancelled.fetch_add(1, Ordering::SeqCst);
-            }
-            Err(_) => {}
-        }
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn bound_timer_cancels_on_undeploy() {
-    let vx = Vertx::new();
-    let fired = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicUsize::new(0));
-    let f = Arc::clone(&fired);
-    let c = Arc::clone(&cancelled);
-    let id = vx
-        .deploy(move |ctx| TimerHolderV {
-            timer: ctx.timer(Duration::from_secs(10)),
-            fired: f,
-            cancelled: c,
-        })
-        .await
+    let vx = vx();
+    let (id, ctx) = capture(&vx).await;
+    let timer = ctx.timer(Duration::from_secs(99)).unwrap();
+    let mut periodic = ctx
+        .periodic(Duration::ZERO, Duration::from_secs(1))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(fired.load(Ordering::SeqCst), 0);
     vx.undeploy(id).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(fired.load(Ordering::SeqCst), 0);
-    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert!(timer.is_cancelled());
+    assert!(periodic.is_cancelled());
+    assert!(matches!(timer.await, Err(VertxError::TimerCancelled)));
+    assert!(matches!(
+        periodic.tick().await,
+        Err(VertxError::TimerCancelled)
+    ));
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// EventBus core
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn publish_delivers_to_all_subscribers() {
-    let vx = Vertx::new();
+    let vx = vx();
     let bus = vx.event_bus();
-    let mut c1 = bus.consumer::<String>("news").unwrap();
-    let mut c2 = bus.consumer::<String>("news").unwrap();
-    bus.publish("news", "breaking".to_string()).unwrap();
-    assert_eq!(c1.recv().await.unwrap().body(), "breaking");
-    assert_eq!(c2.recv().await.unwrap().body(), "breaking");
+    let mut a = bus.consumer::<u32>("pub").unwrap();
+    let mut b = bus.consumer::<u32>("pub").unwrap();
+    bus.publish("pub", 7u32).unwrap();
+    assert_eq!(a.recv().await.unwrap().into_body(), 7);
+    assert_eq!(b.recv().await.unwrap().into_body(), 7);
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn send_with_no_consumer_errors() {
-    let vx = Vertx::new();
-    let err = vx.event_bus().send("ghost", 1u32).await.unwrap_err();
-    assert!(matches!(err, VertxError::NoConsumer(_)));
+    let vx = vx();
+    assert!(matches!(
+        vx.event_bus().send("missing", ()).await,
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn request_timeout_fires() {
-    let vx = Vertx::new();
+    let vx = vx();
     let bus = vx.event_bus();
-    let _c = bus.consumer::<String>("holdme").unwrap();
-    let res: std::result::Result<String, _> = bus
-        .request_with("holdme", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_millis(30)))
-        .await;
-    assert!(matches!(res, Err(VertxError::Timeout(_))));
+    let _consumer = bus.consumer::<()>("timeout").unwrap();
+    assert!(matches!(
+        bus.request_with::<_, ()>(
+            "timeout",
+            (),
+            DeliveryOptions::new().with_timeout(Duration::from_millis(5))
+        )
+        .await,
+        Err(VertxError::Timeout(_))
+    ));
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn dropping_consumer_unregisters() {
-    let vx = Vertx::new();
-    let bus = vx.event_bus();
-    {
-        let _c = bus.consumer::<u32>("temp").unwrap();
-        bus.send("temp", 1u32).await.unwrap();
-    }
-    let err = bus.send("temp", 2u32).await.unwrap_err();
-    assert!(matches!(err, VertxError::NoConsumer(_)));
+    let vx = vx();
+    let consumer = vx.event_bus().consumer::<()>("drop").unwrap();
+    drop(consumer);
+    assert!(matches!(
+        vx.event_bus().try_send("drop", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn default_worker_pool_size_is_20() {
-    let vx = Vertx::new();
+    let vx = Vertx::builder().event_loop_threads(1).build();
     assert_eq!(vx.worker_thread_count(), 20);
+    assert_eq!(vx.blocking_thread_count(), 20);
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn builder_overrides() {
     let vx = Vertx::builder()
-        .event_loop_threads(2)
+        .event_loop_threads(3)
         .worker_threads(4)
+        .blocking_threads(2)
         .build();
-    assert_eq!(vx.event_loop_count(), 2);
+    assert_eq!(vx.event_loop_count(), 3);
     assert_eq!(vx.worker_thread_count(), 4);
+    assert_eq!(vx.blocking_thread_count(), 2);
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// Vert.x-style handler API: Consumer::handler(fn) spawns its own loop.
-// User Verticle::run just waits for cancellation (or is a no-op start hook).
-// ---------------------------------------------------------------------------
-
-struct HandlerPingerV {
-    consumer: Consumer<String>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for HandlerPingerV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        // Single-handler state: just `move` the counter into the FnMut.
-        // No Rc, no Cell, no interior mutability — zero overhead, compile-time safe.
-        let mut count: u64 = 0;
-        self.consumer.handler(move |env| {
-            count += 1;
-            let n = count;
-            async move {
-                env.reply(format!("hpong#{n}"))?;
-                Ok(())
-            }
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn consumer_handler_dispatches_envelopes() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| HandlerPingerV {
-        consumer: ctx.event_bus().consumer::<String>("hping").unwrap(),
+    let vx = vx();
+    echo(&vx, "handler").await;
+    for n in 0..10 {
+        assert_eq!(
+            vx.event_bus()
+                .request::<_, String>("handler", n.to_string())
+                .await
+                .unwrap(),
+            n.to_string()
+        );
+    }
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn consumer_handler_unregisters_on_undeploy() {
+    let vx = vx();
+    let id = echo(&vx, "handler").await;
+    vx.undeploy(id).await.unwrap();
+    assert!(matches!(
+        vx.event_bus().try_send("handler", "x".to_owned()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn rc_refcell_shared_state_across_handlers() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let values = Rc::new(RefCell::new(Vec::<u32>::new()));
+            let a = values.clone();
+            ctx.event_bus()
+                .consumer::<u32>("put")?
+                .handler(move |env| {
+                    a.borrow_mut().push(*env.body());
+                    async move { env.reply(()) }
+                })?;
+            ctx.event_bus().consumer::<()>("get")?.handler(move |env| {
+                let n = values.borrow().len();
+                async move { env.reply(n) }
+            })
+        })
     })
     .await
     .unwrap();
-
-    let bus = vx.event_bus();
-    let r1: String = bus
-        .request_with("hping", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_secs(2)))
-        .await
-        .unwrap();
-    let r2: String = bus
-        .request_with("hping", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_secs(2)))
-        .await
-        .unwrap();
-    assert_eq!(r1, "hpong#1");
-    assert_eq!(r2, "hpong#2");
+    vx.event_bus().request::<_, ()>("put", 1u32).await.unwrap();
+    assert_eq!(
+        vx.event_bus().request::<_, usize>("get", ()).await.unwrap(),
+        1
+    );
+    vx.close().await.unwrap();
 }
-
-struct HandlerCancelV {
-    consumer: Consumer<String>,
-}
-#[async_trait(?Send)]
-impl Verticle for HandlerCancelV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        self.consumer.handler(|env| async move {
-            env.reply(1u64).ok();
-            Ok(())
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
-async fn consumer_handler_unregisters_on_undeploy() {
-    let vx = Vertx::new();
-    let dep = vx
-        .deploy(|ctx| HandlerCancelV {
-            consumer: ctx.event_bus().consumer::<String>("hping2").unwrap(),
+async fn rc_cell_shared_scalar_across_handlers() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let value = Rc::new(Cell::new(0u32));
+            let a = value.clone();
+            ctx.event_bus()
+                .consumer::<u32>("put")?
+                .handler(move |env| {
+                    a.set(*env.body());
+                    async move { env.reply(()) }
+                })?;
+            ctx.event_bus().consumer::<()>("get")?.handler(move |env| {
+                let n = value.get();
+                async move { env.reply(n) }
+            })
+        })
+    })
+    .await
+    .unwrap();
+    vx.event_bus().request::<_, ()>("put", 42u32).await.unwrap();
+    assert_eq!(
+        vx.event_bus().request::<_, u32>("get", ()).await.unwrap(),
+        42
+    );
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn message_passing_between_handlers() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            ctx.event_bus()
+                .consumer::<u32>("double")?
+                .handler(|env| async move {
+                    let n = *env.body() * 2;
+                    env.reply(n)
+                })?;
+            let bus = ctx.event_bus();
+            bus.consumer::<u32>("forward")?.handler(move |env| {
+                let bus = bus.clone();
+                async move {
+                    let n: u32 = bus.request("double", *env.body()).await?;
+                    env.reply(n)
+                }
+            })
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, u32>("forward", 21u32)
+            .await
+            .unwrap(),
+        42
+    );
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn arc_atomic_counter_shared_across_verticles() {
+    let vx = vx();
+    let count = Arc::new(AtomicUsize::new(0));
+    for _ in 0..3 {
+        let count = count.clone();
+        vx.deploy(move |_| {
+            local(move |ctx| async move {
+                ctx.event_bus()
+                    .consumer::<()>("count")?
+                    .handler(move |env| {
+                        let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                        async move { env.reply(n) }
+                    })
+            })
         })
         .await
         .unwrap();
-
-    vx.event_bus()
-        .request_with::<_, u64>("hping2", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_secs(2)))
-        .await
-        .unwrap();
-
-    vx.undeploy(dep).await.unwrap();
-    let res = vx
-        .event_bus()
-        .request_with::<_, u64>("hping2", "x".to_string(), DeliveryOptions::new().with_timeout(Duration::from_millis(100)))
-        .await;
-    assert!(res.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Reference pattern: when multiple handlers share complex mutable state,
-// `Rc<RefCell<T>>` is the right tool. Discipline: keep borrow scope tiny,
-// never hold a borrow across `.await`.
-// ---------------------------------------------------------------------------
-
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
-struct StatsV {
-    incr_consumer: Consumer<String>,
-    get_consumer: Consumer<String>,
-    counts: Rc<RefCell<HashMap<String, u64>>>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for StatsV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let counts_incr = self.counts.clone();
-        self.incr_consumer.handler(move |env| {
-            // Borrow scope is exactly one statement — no `.await` between
-            // `borrow_mut()` and drop, so no panic risk.
-            let n = {
-                let mut m = counts_incr.borrow_mut();
-                let n = m.entry(env.body().clone()).or_insert(0);
-                *n += 1;
-                *n
-            };
-            async move { env.reply(n)?; Ok(()) }
-        });
-
-        let counts_get = self.counts.clone();
-        self.get_consumer.handler(move |env| {
-            let n = counts_get.borrow().get(env.body()).copied().unwrap_or(0);
-            async move { env.reply(n)?; Ok(()) }
-        });
-
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
     }
-}
-
-#[tokio::test]
-async fn rc_refcell_shared_state_across_handlers() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| {
-        let bus = ctx.event_bus();
-        StatsV {
-            incr_consumer: bus.consumer::<String>("stats.incr").unwrap(),
-            get_consumer: bus.consumer::<String>("stats.get").unwrap(),
-            counts: Rc::new(RefCell::new(HashMap::new())),
-        }
-    })
-    .await
-    .unwrap();
-
-    let bus = vx.event_bus();
-    let _: u64 = bus.request("stats.incr", "a".to_string()).await.unwrap();
-    let _: u64 = bus.request("stats.incr", "a".to_string()).await.unwrap();
-    let _: u64 = bus.request("stats.incr", "b".to_string()).await.unwrap();
-    let a: u64 = bus.request("stats.get", "a".to_string()).await.unwrap();
-    let b: u64 = bus.request("stats.get", "b".to_string()).await.unwrap();
-    let c: u64 = bus.request("stats.get", "c".to_string()).await.unwrap();
-    assert_eq!((a, b, c), (2, 1, 0));
-}
-
-// ---------------------------------------------------------------------------
-// Pattern: multiple handlers sharing a Copy scalar via Rc<Cell<T>>.
-// No borrow guard → no possible panic, lighter than Rc<RefCell>.
-// ---------------------------------------------------------------------------
-
-struct CounterPairV {
-    incr_consumer: Consumer<()>,
-    read_consumer: Consumer<()>,
-    count: Rc<Cell<u64>>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for CounterPairV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let c_incr = self.count.clone();
-        self.incr_consumer.handler(move |env| {
-            let n = c_incr.get() + 1;
-            c_incr.set(n);
-            async move { env.reply(n)?; Ok(()) }
-        });
-
-        let c_read = self.count.clone();
-        self.read_consumer.handler(move |env| {
-            let n = c_read.get();
-            async move { env.reply(n)?; Ok(()) }
-        });
-
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
+    for n in 1..=9 {
+        assert_eq!(
+            vx.event_bus()
+                .request::<_, usize>("count", ())
+                .await
+                .unwrap(),
+            n
+        );
     }
+    vx.close().await.unwrap();
 }
-
-#[tokio::test]
-async fn rc_cell_shared_scalar_across_handlers() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| {
-        let bus = ctx.event_bus();
-        CounterPairV {
-            incr_consumer: bus.consumer::<()>("ctr.incr").unwrap(),
-            read_consumer: bus.consumer::<()>("ctr.read").unwrap(),
-            count: Rc::new(Cell::new(0)),
-        }
-    })
-    .await
-    .unwrap();
-
-    let bus = vx.event_bus();
-    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
-    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
-    let _: u64 = bus.request("ctr.incr", ()).await.unwrap();
-    let n: u64 = bus.request("ctr.read", ()).await.unwrap();
-    assert_eq!(n, 3);
-}
-
-// ---------------------------------------------------------------------------
-// Pattern: handler coordination via an internal EventBus address.
-// No shared mutability — each handler owns its own slice of state and
-// communicates by sending messages. Actor-style.
-// ---------------------------------------------------------------------------
-
-struct AdderV {
-    add_consumer: Consumer<u64>,
-}
-
-#[async_trait(?Send)]
-impl Verticle for AdderV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        // `total` is owned solely by the accumulator handler. The frontend
-        // handler delegates by sending an "adder.apply" message and waiting
-        // for a reply — no Rc, no RefCell, no shared state at all.
-        let bus = ctx.event_bus();
-        let internal_bus = bus.clone();
-        let frontend = bus.consumer::<u64>("adder.add").unwrap();
-        frontend.handler(move |env| {
-            let internal_bus = internal_bus.clone();
-            async move {
-                let body = *env.body();
-                let total: u64 = internal_bus.request("adder.apply", body).await?;
-                env.reply(total)?;
-                Ok(())
-            }
-        });
-
-        let mut total: u64 = 0;
-        self.add_consumer.handler(move |env| {
-            total += *env.body();
-            let snapshot = total;
-            async move { env.reply(snapshot)?; Ok(()) }
-        });
-
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn message_passing_between_handlers() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| AdderV {
-        add_consumer: ctx.event_bus().consumer::<u64>("adder.apply").unwrap(),
-    })
-    .await
-    .unwrap();
-
-    let bus = vx.event_bus();
-    let r1: u64 = bus.request("adder.add", 10u64).await.unwrap();
-    let r2: u64 = bus.request("adder.add", 5u64).await.unwrap();
-    let r3: u64 = bus.request("adder.add", 7u64).await.unwrap();
-    assert_eq!((r1, r2, r3), (10, 15, 22));
-}
-
-// ---------------------------------------------------------------------------
-// SharedData escape hatch: Vert.x `Counter` ≈ `Arc<AtomicU64>` for cross-
-// verticle scalar counts. No framework wrapper needed.
-// ---------------------------------------------------------------------------
-
-use std::sync::atomic::AtomicU64;
-
-struct CtrIncrV {
-    consumer: Consumer<u64>,
-    counter: Arc<AtomicU64>,
-}
-#[async_trait(?Send)]
-impl Verticle for CtrIncrV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let c = self.counter.clone();
-        self.consumer.handler(move |env| {
-            let n = c.fetch_add(*env.body(), Ordering::Relaxed) + *env.body();
-            async move { env.reply(n)?; Ok(()) }
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
-struct CtrReadV {
-    consumer: Consumer<()>,
-    counter: Arc<AtomicU64>,
-}
-#[async_trait(?Send)]
-impl Verticle for CtrReadV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let c = self.counter.clone();
-        self.consumer.handler(move |env| {
-            let n = c.load(Ordering::Relaxed);
-            async move { env.reply(n)?; Ok(()) }
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn arc_atomic_counter_shared_across_verticles() {
-    let vx = Vertx::new();
-    let counter = Arc::new(AtomicU64::new(0));
-
-    let c1 = counter.clone();
-    vx.deploy(move |ctx| CtrIncrV {
-        consumer: ctx.event_bus().consumer::<u64>("ctr.add").unwrap(),
-        counter: c1,
-    })
-    .await
-    .unwrap();
-
-    let c2 = counter.clone();
-    vx.deploy(move |ctx| CtrReadV {
-        consumer: ctx.event_bus().consumer::<()>("ctr.get").unwrap(),
-        counter: c2,
-    })
-    .await
-    .unwrap();
-
-    let bus = vx.event_bus();
-    let _: u64 = bus.request("ctr.add", 3u64).await.unwrap();
-    let _: u64 = bus.request("ctr.add", 4u64).await.unwrap();
-    let n: u64 = bus.request("ctr.get", ()).await.unwrap();
-    assert_eq!(n, 7);
-}
-
-// ---------------------------------------------------------------------------
-// SharedData escape hatch: Vert.x `LocalMap` (immutable Shareable values)
-// ≈ `Arc<T>` — share a read-only snapshot across verticles.
-// ---------------------------------------------------------------------------
-
-/// Immutable routing table built once at deploy time, shared by reference.
-struct RouteTable {
-    routes: HashMap<String, String>,
-}
-
-struct RouterV {
-    consumer: Consumer<String>,
-    table: Arc<RouteTable>,
-}
-#[async_trait(?Send)]
-impl Verticle for RouterV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let t = self.table.clone();
-        self.consumer.handler(move |env| {
-            // Zero-copy read: just an Arc clone, then map lookup. No EventBus
-            // round-trip for the hot path.
-            let route = t.routes.get(env.body()).cloned().unwrap_or_default();
-            async move { env.reply(route)?; Ok(()) }
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn arc_immutable_snapshot_shared_across_verticles() {
-    let vx = Vertx::new();
-    let table = Arc::new(RouteTable {
-        routes: [("a", "north"), ("b", "south")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-    });
-
-    let t1 = table.clone();
-    vx.deploy(move |ctx| RouterV {
-        consumer: ctx.event_bus().consumer::<String>("route.r1").unwrap(),
-        table: t1,
-    })
-    .await
-    .unwrap();
-    let t2 = table.clone();
-    vx.deploy(move |ctx| RouterV {
-        consumer: ctx.event_bus().consumer::<String>("route.r2").unwrap(),
-        table: t2,
-    })
-    .await
-    .unwrap();
-
-    let bus = vx.event_bus();
-    let r1: String = bus.request("route.r1", "a".to_string()).await.unwrap();
-    let r2: String = bus.request("route.r2", "b".to_string()).await.unwrap();
-    let r3: String = bus.request("route.r1", "missing".to_string()).await.unwrap();
-    assert_eq!((r1.as_str(), r2.as_str(), r3.as_str()), ("north", "south", ""));
-}
-
-// ---------------------------------------------------------------------------
-// DeliveryOptions.header(k,v) is propagated to Envelope.headers().
-// ---------------------------------------------------------------------------
-
-struct HeaderEchoV {
-    consumer: Consumer<String>,
-}
-#[async_trait(?Send)]
-impl Verticle for HeaderEchoV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        self.consumer.handler(|env| async move {
-            let trace_id = env.headers().get("x-trace-id").cloned().unwrap_or_default();
-            env.reply(trace_id)?;
-            Ok(())
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn delivery_options_headers_round_trip() {
-    let vx = Vertx::new();
-    vx.deploy(|ctx| HeaderEchoV {
-        consumer: ctx.event_bus().consumer::<String>("hdr.echo").unwrap(),
-    })
-    .await
-    .unwrap();
-
-    let opts = DeliveryOptions::new()
-        .header("x-trace-id", "abc-123")
-        .with_timeout(Duration::from_secs(2));
-    let r: String = vx
-        .event_bus()
-        .request_with("hdr.echo", "ping".to_string(), opts)
+    let vx = vx();
+    let snapshot = Arc::new(vec![1, 2, 3]);
+    for _ in 0..2 {
+        let snapshot = snapshot.clone();
+        vx.deploy(move |_| {
+            local(move |ctx| async move {
+                ctx.event_bus()
+                    .consumer::<()>("snapshot")?
+                    .handler(move |env| {
+                        let values = (*snapshot).clone();
+                        async move { env.reply(values) }
+                    })
+            })
+        })
         .await
         .unwrap();
-    assert_eq!(r, "abc-123");
-}
-
-// ---------------------------------------------------------------------------
-// Global exception handler: handler errors are forwarded.
-// ---------------------------------------------------------------------------
-
-struct BoomV {
-    consumer: Consumer<()>,
-}
-#[async_trait(?Send)]
-impl Verticle for BoomV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        self.consumer.handler(|_env| async move {
-            Err(VertxError::Other("boom".into()))
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
     }
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, Vec<i32>>("snapshot", ())
+            .await
+            .unwrap(),
+        vec![1, 2, 3]
+    );
+    vx.close().await.unwrap();
 }
-
 #[tokio::test]
-async fn exception_handler_receives_handler_errors() {
-    let vx = Vertx::new();
-    let caught: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-    let sink = caught.clone();
-    vx.set_exception_handler(move |e| {
-        sink.lock().unwrap().push(e.to_string());
-    });
-
-    vx.deploy(|ctx| BoomV {
-        consumer: ctx.event_bus().consumer::<()>("boom").unwrap(),
+async fn delivery_options_headers_round_trip() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            ctx.event_bus()
+                .consumer::<()>("headers")?
+                .handler(|env| async move {
+                    assert_eq!(
+                        env.headers().get_all("tag").collect::<Vec<_>>(),
+                        vec!["a", "b"]
+                    );
+                    env.reply_with(42u32, DeliveryOptions::new().header("reply", "yes"))
+                })
+        })
     })
     .await
     .unwrap();
-
-    // Fire-and-forget; handler errors are async, give it a beat.
-    vx.event_bus().send("boom", ()).await.unwrap();
-    vx.event_bus().send("boom", ()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let got = caught.lock().unwrap();
-    assert_eq!(got.len(), 2);
-    assert!(got.iter().all(|s| s.contains("boom")));
+    let reply = vx
+        .event_bus()
+        .request_message_with::<_, u32>(
+            "headers",
+            (),
+            DeliveryOptions::new().header("tag", "a").header("tag", "b"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*reply.body(), 42);
+    assert_eq!(reply.headers().get("reply").unwrap(), "yes");
+    vx.close().await.unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// DeploymentOptions: multiple instances on round-robin EventLoops, typed config.
-// ---------------------------------------------------------------------------
-
-use vertx_rs::DeploymentOptions;
-
-#[derive(Clone)]
-struct EchoCfg { prefix: String }
-
-struct CfgEchoV {
-    consumer: Consumer<String>,
-    prefix: String,
+#[tokio::test]
+async fn exception_handler_receives_handler_errors() {
+    let vx = vx();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    vx.set_exception_handler(move |e| {
+        tx.send(e.to_string()).ok();
+    });
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            ctx.event_bus()
+                .consumer::<()>("error")?
+                .handler(|_| async { Err(VertxError::Other("expected".into())) })
+        })
+    })
+    .await
+    .unwrap();
+    vx.event_bus().send("error", ()).await.unwrap();
+    assert!(rx.recv().await.unwrap().contains("expected"));
+    vx.close().await.unwrap();
 }
-#[async_trait(?Send)]
-impl Verticle for CfgEchoV {
-    async fn run(self, ctx: Context) -> Result<()> {
-        let prefix = self.prefix.clone();
-        self.consumer.handler(move |env| {
-            let p = prefix.clone();
-            async move {
-                let reply = format!("{p}:{}", env.body());
-                env.reply(reply)?;
-                Ok(())
-            }
-        });
-        ctx.cancellation_token().cancelled().await;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn deploy_with_instances_and_typed_config() {
-    let vx = Vertx::builder().event_loop_threads(2).build();
-
+    let vx = vx();
     let ids = vx
         .deploy_with(
-            |ctx, cfg: Arc<EchoCfg>| CfgEchoV {
-                consumer: ctx.event_bus().consumer::<String>("cfg.echo").unwrap(),
-                prefix: cfg.prefix.clone(),
+            |_, cfg: Arc<String>| {
+                local(move |ctx| async move {
+                    ctx.event_bus()
+                        .consumer::<String>("configured")?
+                        .handler(move |env| {
+                            let body = format!("{}:{}", cfg, env.body());
+                            async move { env.reply(body) }
+                        })
+                })
             },
-            DeploymentOptions::new()
-                .instances(3)
-                .config(EchoCfg { prefix: "P".into() }),
+            DeploymentOptions::new().instances(3).config("P".to_owned()),
         )
         .await
         .unwrap();
     assert_eq!(ids.len(), 3);
-
-    // round-robin send across the 3 instances → all reply with prefix
-    let bus = vx.event_bus();
-    for i in 0..6u32 {
-        let r: String = bus.request("cfg.echo", format!("{i}")).await.unwrap();
-        assert!(r.starts_with("P:"), "got {r}");
+    for _ in 0..6 {
+        assert_eq!(
+            vx.event_bus()
+                .request::<_, String>("configured", "x".to_owned())
+                .await
+                .unwrap(),
+            "P:x"
+        );
     }
+    vx.close().await.unwrap();
+}
+
+// Regression coverage for Context isolation, lifecycle races and cancellation.
+#[tokio::test]
+async fn two_contexts_on_one_event_loop_never_leak_identity() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(2)
+        .build();
+    for address in ["a", "b"] {
+        vx.deploy(move |_| {
+            local(move |ctx| async move {
+                let id = ctx.deployment_id();
+                ctx.event_bus()
+                    .consumer::<()>(address)?
+                    .handler(move |env| async move {
+                        for _ in 0..100 {
+                            tokio::task::yield_now().await;
+                            assert_eq!(Context::current().unwrap().deployment_id(), id);
+                        }
+                        env.reply(id)
+                    })
+            })
+        })
+        .await
+        .unwrap();
+    }
+    let bus = vx.event_bus();
+    let (a, b) = tokio::join!(
+        bus.request::<_, Option<vertx_rs::DeploymentId>>("a", ()),
+        bus.request::<_, Option<vertx_rs::DeploymentId>>("b", ())
+    );
+    assert_ne!(a.unwrap(), b.unwrap());
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn raw_tokio_spawn_has_no_logical_context() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            let own = ctx.deployment_id();
+            tokio::spawn(async {
+                assert!(Context::current().is_none());
+                assert!(Context::is_on_event_loop_thread());
+            })
+            .await?;
+            assert_eq!(Context::current().unwrap().deployment_id(), own);
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn spawn_local_rejects_other_context_even_on_same_thread() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(2)
+        .build();
+    let (_, a) = capture(&vx).await;
+    let (tx, rx) = oneshot::channel();
+    let other = a.clone();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            assert!(matches!(
+                other.spawn_local(async { Ok(()) }),
+                Err(VertxError::ContextMismatch)
+            ));
+            assert!(matches!(
+                other
+                    .event_bus()
+                    .consumer::<()>("wrong")?
+                    .handler(|_| async { Ok(()) }),
+                Err(VertxError::ContextMismatch)
+            ));
+            let id = ctx.deployment_id();
+            ctx.spawn_local(async move {
+                tokio::task::yield_now().await;
+                assert_eq!(Context::current().unwrap().deployment_id(), id);
+                tx.send(()).ok();
+                Ok(())
+            })?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap();
+    assert!(matches!(
+        a.spawn_local(async { Ok(()) }),
+        Err(VertxError::ContextMismatch)
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn spawn_local_rejects_another_vertx_instance() {
+    let a = vx();
+    let b = vx();
+    let (_, ctx) = capture(&a).await;
+    b.deploy(move |_| {
+        local(move |_| async move {
+            assert!(matches!(
+                ctx.spawn_local(async { Ok(()) }),
+                Err(VertxError::ContextMismatch)
+            ));
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
+#[tokio::test]
+async fn worker_context_serializes_all_ordinary_executions() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(4)
+        .build();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = oneshot::channel();
+    let (a, m) = (active.clone(), maximum.clone());
+    vx.deploy_worker(move |_| {
+        worker(move |ctx| async move {
+            let id = ctx.deployment_id();
+            let mut handles = Vec::new();
+            for _ in 0..32 {
+                let (a, m) = (a.clone(), m.clone());
+                handles.push(ctx.spawn(async move {
+                    for _ in 0..5 {
+                        let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+                        m.fetch_max(n, Ordering::SeqCst);
+                        assert_eq!(Context::current().unwrap().deployment_id(), id);
+                        std::thread::sleep(Duration::from_micros(100));
+                        a.fetch_sub(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(())
+                })?);
+            }
+            ctx.spawn(async move {
+                for handle in handles {
+                    handle.await??;
+                }
+                tx.send(()).ok();
+                Ok(())
+            })?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn worker_contexts_can_execute_in_parallel() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(4)
+        .build();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut jobs = Vec::new();
+    for _ in 0..2 {
+        let v = vx.clone();
+        let b = barrier.clone();
+        jobs.push(tokio::spawn(async move {
+            v.deploy_worker(move |_| {
+                worker(move |_| async move {
+                    b.wait();
+                    Ok(())
+                })
+            })
+            .await
+        }));
+    }
+    for job in jobs {
+        tokio::time::timeout(Duration::from_secs(2), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn execute_blocking_is_fifo_by_default() {
+    let vx = vx();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let o = order.clone();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            let (a, b, c) = (o.clone(), o.clone(), o.clone());
+            let (x, y, z) = tokio::join!(
+                ctx.execute_blocking(move || {
+                    a.lock().unwrap().push(0);
+                    std::thread::sleep(Duration::from_millis(5));
+                }),
+                ctx.execute_blocking(move || {
+                    b.lock().unwrap().push(1);
+                }),
+                ctx.execute_blocking(move || {
+                    c.lock().unwrap().push(2);
+                })
+            );
+            x?;
+            y?;
+            z?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn unordered_blocking_obeys_configured_limit_and_can_overlap() {
+    let vx = vx();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let m = maximum.clone();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let jobs = (0..8).map(|_| {
+                let (a, m, b) = (active.clone(), m.clone(), barrier.clone());
+                ctx.execute_blocking_with(
+                    move || {
+                        let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+                        m.fetch_max(n, Ordering::SeqCst);
+                        b.wait();
+                        a.fetch_sub(1, Ordering::SeqCst);
+                    },
+                    false,
+                )
+            });
+            for r in futures::future::join_all(jobs).await {
+                r?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn task_error_and_handler_panic_preserve_context_and_subscription() {
+    let vx = vx();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    vx.set_exception_handler(move |e| {
+        tx.send((Context::current().unwrap().deployment_id(), e.to_string()))
+            .ok();
+    });
+    let id = vx
+        .deploy(|_| {
+            local(|ctx| async move {
+                ctx.event_bus()
+                    .consumer::<bool>("panic")?
+                    .handler(|env| async move {
+                        if *env.body() {
+                            panic!("test panic");
+                        }
+                        env.reply(42u32)
+                    })
+            })
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        vx.event_bus().request::<_, u32>("panic", true).await,
+        Err(VertxError::ReplyClosed)
+    ));
+    let (owner, message) = rx.recv().await.unwrap();
+    assert_eq!(owner, Some(id));
+    assert!(message.contains("test panic"));
+    assert_eq!(
+        vx.event_bus()
+            .request::<_, u32>("panic", false)
+            .await
+            .unwrap(),
+        42
+    );
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn context_exception_handler_can_clear_itself_without_deadlock() {
+    let vx = vx();
+    let global = Arc::new(AtomicUsize::new(0));
+    let g = global.clone();
+    vx.set_exception_handler(move |_| {
+        g.fetch_add(1, Ordering::SeqCst);
+    });
+    let (tx, rx) = oneshot::channel();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            let tx = Mutex::new(Some(tx));
+            let own = ctx.clone();
+            ctx.set_exception_handler(move |_| {
+                own.clear_exception_handler();
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    tx.send(()).ok();
+                }
+            });
+            ctx.event_bus()
+                .consumer::<()>("fail")?
+                .handler(|_| async { Err(VertxError::Other("error".into())) })
+        })
+    })
+    .await
+    .unwrap();
+    vx.event_bus().send("fail", ()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(global.load(Ordering::SeqCst), 0);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn request_timeout_includes_waiting_for_full_queue() {
+    let vx = vx();
+    let bus = vx.event_bus();
+    let _consumer = bus.consumer::<u32>("full").unwrap();
+    for n in 0..256u32 {
+        bus.try_send("full", n).unwrap();
+    }
+    assert!(matches!(
+        bus.try_send("full", 999u32),
+        Err(VertxError::QueueFull(_))
+    ));
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        bus.request_with::<_, ()>(
+            "full",
+            999u32,
+            DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(VertxError::Timeout(_))));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn recipient_failure_and_late_reply_are_explicit() {
+    let vx = vx();
+    vx.deploy(|_| {
+        local(|ctx| async move {
+            ctx.event_bus()
+                .consumer::<()>("business")?
+                .handler(|env| async { env.fail(409, "conflict") })
+        })
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        vx.event_bus().request::<_, ()>("business", ()).await,
+        Err(VertxError::RecipientFailure { code: 409, .. })
+    ));
+    let bus = vx.event_bus();
+    let mut consumer = bus.consumer::<()>("late").unwrap();
+    let b = bus.clone();
+    let job = tokio::spawn(async move {
+        b.request_with::<_, ()>(
+            "late",
+            (),
+            DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+        )
+        .await
+    });
+    let env = consumer.recv().await.unwrap();
+    assert!(matches!(job.await.unwrap(), Err(VertxError::Timeout(_))));
+    assert!(matches!(env.reply(()), Err(VertxError::ReplyClosed)));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn type_conflicts_are_rejected_at_registration() {
+    let vx = vx();
+    let bus = vx.event_bus();
+    let a = bus.consumer::<u32>("typed").unwrap();
+    assert!(matches!(
+        bus.consumer::<String>("typed"),
+        Err(VertxError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        bus.try_send("typed", "bad".to_owned()),
+        Err(VertxError::TypeMismatch(_))
+    ));
+    drop(a);
+    assert!(bus.consumer::<String>("typed").is_ok());
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn broadcast_drops_only_full_subscriber_and_send_round_robins() {
+    let vx = vx();
+    let bus = vx.event_bus();
+    let mut a = bus.consumer::<u32>("pub").unwrap();
+    let mut b = bus.consumer::<u32>("pub").unwrap();
+    for n in 0..256u32 {
+        bus.publish("pub", n).unwrap();
+        assert_eq!(b.recv().await.unwrap().into_body(), n);
+    }
+    bus.publish("pub", 999u32).unwrap();
+    assert_eq!(b.recv().await.unwrap().into_body(), 999);
+    for n in 0..256u32 {
+        assert_eq!(a.recv().await.unwrap().into_body(), n);
+    }
+    bus.send("pub", 1u32).await.unwrap();
+    bus.send("pub", 2u32).await.unwrap();
+    assert_eq!(a.recv().await.unwrap().into_body(), 1);
+    assert_eq!(b.recv().await.unwrap().into_body(), 2);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn start_failure_and_factory_panic_clean_resources() {
+    let vx = vx();
+    let result = vx
+        .deploy(|_| {
+            local(|ctx| async move {
+                ctx.event_bus()
+                    .consumer::<()>("failed")?
+                    .handler(|_| async { Ok(()) })?;
+                Err(VertxError::StartFailed("expected".into()))
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(VertxError::StartFailed(_))));
+    assert!(matches!(
+        vx.event_bus().try_send("failed", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    let result = vx
+        .deploy::<_, Local<fn(Context) -> std::future::Ready<Result<()>>>>(|ctx| {
+            let _c = ctx.event_bus().consumer::<()>("panic").unwrap();
+            panic!("factory panic")
+        })
+        .await;
+    assert!(matches!(result, Err(VertxError::Panic(_))));
+    assert!(matches!(
+        vx.event_bus().try_send("panic", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn cancellation_of_pending_deploy_cleans_startup() {
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    let v = vx.clone();
+    let deploy = tokio::spawn(async move {
+        v.deploy(move |_| {
+            local(move |ctx| async move {
+                ctx.event_bus()
+                    .consumer::<()>("startup")?
+                    .handler(|_| async { Ok(()) })?;
+                tx.send(ctx).ok();
+                std::future::pending::<Result<()>>().await
+            })
+        })
+        .await
+    });
+    let ctx = rx.await.unwrap();
+    deploy.abort();
+    assert!(deploy.await.unwrap_err().is_cancelled());
+    vx.close().await.unwrap();
+    assert!(!ctx.is_alive());
+}
+#[tokio::test]
+async fn multi_instance_failure_rolls_back_successful_instances() {
+    let vx = vx();
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let result = vx
+        .deploy_with(
+            move |_, _: Arc<()>| {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                local(move |ctx| async move {
+                    if n == 1 {
+                        return Err(VertxError::StartFailed("second instance".into()));
+                    }
+                    ctx.event_bus()
+                        .consumer::<()>("group")?
+                        .handler(|_| async { Ok(()) })
+                })
+            },
+            DeploymentOptions::new().instances(3),
+        )
+        .await;
+    assert!(matches!(result, Err(VertxError::DeploymentFailed { .. })));
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        vx.event_bus().try_send("group", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn undeploy_waits_for_inflight_handler_to_be_dropped() {
+    let vx = vx();
+    let (started_tx, started_rx) = oneshot::channel();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let d = dropped.clone();
+    struct OnDrop(Arc<AtomicUsize>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            assert!(Context::current().is_some());
+        }
+    }
+    let id = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let mut start = Some(started_tx);
+                ctx.event_bus().consumer::<()>("hang")?.handler(move |_| {
+                    let start = start.take().unwrap();
+                    let guard = OnDrop(d.clone());
+                    async move {
+                        let _guard = guard;
+                        start.send(()).ok();
+                        std::future::pending::<Result<()>>().await
+                    }
+                })
+            })
+        })
+        .await
+        .unwrap();
+    vx.event_bus().send("hang", ()).await.unwrap();
+    started_rx.await.unwrap();
+    vx.undeploy(id).await.unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn stop_timeout_reports_error_then_cleanup_continues() {
+    struct SlowStop(Option<oneshot::Receiver<()>>);
+    #[async_trait(?Send)]
+    impl Verticle for SlowStop {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, ctx: Context) -> Result<()> {
+            self.0.take().unwrap().await.ok();
+            assert!(Context::current().unwrap().deployment_id() == ctx.deployment_id());
+            Ok(())
+        }
+    }
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(2)
+        .shutdown_grace(Duration::from_millis(30))
+        .build();
+    let (tx, rx) = oneshot::channel();
+    let id = vx.deploy(|_| SlowStop(Some(rx))).await.unwrap();
+    assert!(matches!(
+        vx.undeploy(id).await,
+        Err(VertxError::ShutdownTimeout(_))
+    ));
+    tx.send(()).unwrap();
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn started_blocking_task_is_not_reported_as_aborted() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(2)
+        .shutdown_grace(Duration::from_millis(40))
+        .build();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let id = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let c = ctx.clone();
+                ctx.spawn_local(async move {
+                    c.execute_blocking(move || {
+                        started_tx.send(()).ok();
+                        release_rx.recv().unwrap();
+                    })
+                    .await?;
+                    Ok(())
+                })?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    started_rx.await.unwrap();
+    assert!(matches!(
+        vx.undeploy(id).await,
+        Err(VertxError::ShutdownTimeout(_))
+    ));
+    release_tx.send(()).unwrap();
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn stop_can_execute_blocking_cleanup_during_global_close() {
+    struct Cleanup;
+    #[async_trait(?Send)]
+    impl Verticle for Cleanup {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, ctx: Context) -> Result<()> {
+            assert_eq!(
+                Context::current().unwrap().execute_blocking(|| 42).await?,
+                42
+            );
+            assert!(matches!(
+                ctx.timer(Duration::ZERO),
+                Err(VertxError::DeploymentTerminated(_))
+            ));
+            Ok(())
+        }
+    }
+    let vx = vx();
+    vx.deploy(|_| Cleanup).await.unwrap();
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn close_is_idempotent_cancels_global_resources_and_rejects_work() {
+    let vx = vx();
+    echo(&vx, "echo").await;
+    let bus = vx.event_bus();
+    let mut external = bus.consumer::<()>("external").unwrap();
+    let timer = vx.timer(Duration::from_secs(99)).unwrap();
+    let mut periodic = vx.periodic(Duration::ZERO, Duration::from_secs(1)).unwrap();
+    let (a, b) = tokio::join!(vx.close(), vx.close());
+    a.unwrap();
+    b.unwrap();
+    vx.close().await.unwrap();
+    assert!(timer.is_cancelled());
+    assert!(periodic.is_cancelled());
+    assert!(matches!(timer.await, Err(VertxError::TimerCancelled)));
+    assert!(matches!(
+        periodic.tick().await,
+        Err(VertxError::TimerCancelled)
+    ));
+    assert!(external.recv().await.is_none());
+    assert!(matches!(
+        bus.send("echo", "x".to_owned()).await,
+        Err(VertxError::VertxClosed)
+    ));
+    assert!(matches!(
+        vx.deploy(|_| local(|_| async { Ok(()) })).await,
+        Err(VertxError::VertxClosed)
+    ));
+    assert!(matches!(
+        vx.timer(Duration::ZERO),
+        Err(VertxError::VertxClosed)
+    ));
+}
+#[tokio::test]
+async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works() {
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let c = ctx.clone();
+                ctx.spawn_local(async move {
+                    let owner = c.owner().unwrap();
+                    assert!(matches!(
+                        owner.undeploy(c.deployment_id().unwrap()).await,
+                        Err(VertxError::WouldDeadlock)
+                    ));
+                    assert!(matches!(
+                        owner.close().await,
+                        Err(VertxError::WouldDeadlock)
+                    ));
+                    c.request_undeploy()?;
+                    tx.send(()).ok();
+                    Ok(())
+                })?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap();
+    match vx.undeploy(id).await {
+        Ok(()) | Err(VertxError::DeploymentNotFound(_)) => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn zero_period_is_invalid_and_cancel_wins_over_due_tick() {
+    let vx = vx();
+    assert!(matches!(
+        vx.periodic(Duration::ZERO, Duration::ZERO),
+        Err(VertxError::InvalidOptions(_))
+    ));
+    let mut p = vx.periodic(Duration::ZERO, Duration::from_secs(1)).unwrap();
+    p.cancel();
+    assert!(matches!(p.tick().await, Err(VertxError::TimerCancelled)));
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn closing_unblocks_senders_waiting_for_capacity() {
+    let vx = vx();
+    let bus = vx.event_bus();
+    let _c = bus.consumer::<()>("full").unwrap();
+    for _ in 0..256 {
+        bus.try_send("full", ()).unwrap();
+    }
+    let b = bus.clone();
+    let send = tokio::spawn(async move { b.send("full", ()).await });
+    vx.close().await.unwrap();
+    assert!(matches!(send.await.unwrap(), Err(VertxError::VertxClosed)));
+}
+
+#[tokio::test]
+async fn close_during_start_cancels_deploy_without_cleanup_error() {
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    let owner = vx.clone();
+    let deployment = tokio::spawn(async move {
+        owner
+            .deploy(move |_| {
+                local(move |_| async move {
+                    tx.send(()).ok();
+                    std::future::pending::<Result<()>>().await
+                })
+            })
+            .await
+    });
+    rx.await.unwrap();
+    vx.close().await.unwrap();
+    assert!(matches!(
+        deployment.await.unwrap(),
+        Err(VertxError::DeploymentTerminated(_))
+    ));
+}
+#[tokio::test]
+async fn stop_error_is_returned_and_resources_still_close() {
+    struct BadStop;
+    #[async_trait(?Send)]
+    impl Verticle for BadStop {
+        async fn start(&mut self, ctx: Context) -> Result<()> {
+            ctx.event_bus()
+                .consumer::<()>("bad-stop")?
+                .handler(|_| async { Ok(()) })
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            Err(VertxError::Other("stop failed".into()))
+        }
+    }
+    let vx = vx();
+    vx.deploy(|_| BadStop).await.unwrap();
+    assert!(matches!(
+        vx.close().await,
+        Err(VertxError::CleanupFailed(_))
+    ));
+    assert!(vx.is_closed());
+    assert!(matches!(
+        vx.event_bus().try_send("bad-stop", ()),
+        Err(VertxError::VertxClosed)
+    ));
+    assert!(matches!(
+        vx.close().await,
+        Err(VertxError::CleanupFailed(_))
+    ));
+}
+#[tokio::test]
+async fn concurrent_undeploy_runs_stop_exactly_once() {
+    struct OnceStop {
+        count: Arc<AtomicUsize>,
+        release: Option<oneshot::Receiver<()>>,
+        started: Option<oneshot::Sender<()>>,
+    }
+    #[async_trait(?Send)]
+    impl Verticle for OnceStop {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.started.take().unwrap().send(()).ok();
+            self.release.take().unwrap().await.ok();
+            Ok(())
+        }
+    }
+    let vx = vx();
+    let count = Arc::new(AtomicUsize::new(0));
+    let n = count.clone();
+    let (tx, rx) = oneshot::channel();
+    let (start, started) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| OnceStop {
+            count: n,
+            release: Some(rx),
+            started: Some(start),
+        })
+        .await
+        .unwrap();
+    let a = vx.clone();
+    let first = tokio::spawn(async move { a.undeploy(id).await });
+    started.await.unwrap();
+    let second = vx.undeploy(id);
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+    tx.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn cancelled_close_waiter_does_not_cancel_cleanup() {
+    struct Gate(Option<oneshot::Receiver<()>>);
+    #[async_trait(?Send)]
+    impl Verticle for Gate {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.0.take().unwrap().await.ok();
+            Ok(())
+        }
+    }
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    vx.deploy(|_| Gate(Some(rx))).await.unwrap();
+    let mut close = Box::pin(vx.close());
+    assert!(futures::poll!(close.as_mut()).is_pending());
+    drop(close);
+    tx.send(()).unwrap();
+    vx.close().await.unwrap();
+    assert!(vx.is_closed());
+}
+
+#[tokio::test]
+async fn worker_failed_start_waits_for_its_resource_cleanup() {
+    let vx = vx();
+    let result = vx
+        .deploy_worker(|_| {
+            worker(|ctx| async move {
+                ctx.event_bus()
+                    .consumer::<()>("worker-start")?
+                    .handler_worker(|_| async { Ok(()) })?;
+                Err(VertxError::StartFailed("worker startup failed".into()))
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(VertxError::StartFailed(_))));
+    assert!(matches!(
+        vx.event_bus().try_send("worker-start", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn periodic_skips_missed_ticks() {
+    let vx = vx();
+    let mut timer = vx
+        .periodic(Duration::ZERO, Duration::from_millis(10))
+        .unwrap();
+    timer.tick().await.unwrap();
+    tokio::time::advance(Duration::from_millis(95)).await;
+    timer.tick().await.unwrap();
+    let before = tokio::time::Instant::now();
+    timer.tick().await.unwrap();
+    assert!(tokio::time::Instant::now() - before >= Duration::from_millis(5));
+    tokio::time::resume();
+    vx.close().await.unwrap();
+}
+
+#[test]
+fn timers_can_be_constructed_without_an_entered_tokio_runtime() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let timer = vx.timer(Duration::from_secs(1)).unwrap();
+    let periodic = vx.periodic(Duration::ZERO, Duration::from_secs(1)).unwrap();
+    timer.cancel();
+    periodic.cancel();
+    assert!(timer.is_cancelled());
+    assert!(periodic.is_cancelled());
+}
+#[tokio::test]
+async fn completed_timer_does_not_become_cancelled_on_close() {
+    let vx = vx();
+    let mut timer = vx.timer(Duration::ZERO).unwrap();
+    (&mut timer).await.unwrap();
+    vx.close().await.unwrap();
+    timer.cancel();
+    assert!(!timer.is_cancelled());
+}
+#[tokio::test]
+async fn retained_stop_context_cannot_admit_cleanup_from_external_tasks() {
+    struct Retained {
+        tx: Option<oneshot::Sender<Context>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+    #[async_trait(?Send)]
+    impl Verticle for Retained {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, ctx: Context) -> Result<()> {
+            self.tx.take().unwrap().send(ctx).ok();
+            self.release.take().unwrap().await.ok();
+            Ok(())
+        }
+    }
+    let vx = vx();
+    let (tx, rx) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| Retained {
+            tx: Some(tx),
+            release: Some(wait),
+        })
+        .await
+        .unwrap();
+    let v = vx.clone();
+    let shutdown = tokio::spawn(async move { v.undeploy(id).await });
+    let ctx = rx.await.unwrap();
+    assert!(matches!(
+        ctx.execute_blocking(|| 42).await,
+        Err(VertxError::DeploymentTerminated(_))
+    ));
+    release.send(()).unwrap();
+    shutdown.await.unwrap().unwrap();
+    vx.close().await.unwrap();
+}
+#[tokio::test]
+async fn cancelling_multi_instance_deploy_rolls_back_prior_instances() {
+    let vx = vx();
+    let created = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = oneshot::channel();
+    let signal = Arc::new(Mutex::new(Some(tx)));
+    let v = vx.clone();
+    let future = tokio::spawn(async move {
+        v.deploy_with(
+            move |_, _: Arc<()>| {
+                let n = created.fetch_add(1, Ordering::SeqCst);
+                let signal = signal.clone();
+                local(move |ctx| async move {
+                    ctx.event_bus()
+                        .consumer::<()>("cancel-group")?
+                        .handler(|_| async { Ok(()) })?;
+                    if n == 1 {
+                        signal.lock().unwrap().take().unwrap().send(()).ok();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+            },
+            DeploymentOptions::new().instances(3),
+        )
+        .await
+    });
+    rx.await.unwrap();
+    future.abort();
+    assert!(future.await.unwrap_err().is_cancelled());
+    // Both the pending instance and the already-ready instance must stop.
+    vx.close().await.unwrap();
 }

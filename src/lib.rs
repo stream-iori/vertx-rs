@@ -1,4 +1,4 @@
-//! vertx-rs 0.2: EventLoop-affine Verticle + WorkerVerticle + Context.
+//! vertx-rs 0.3: thread-affine deployments with asynchronous start/stop.
 //!
 //! See `DESIGN.md` for the design rationale.
 
@@ -18,7 +18,7 @@ pub use context::Context;
 pub use deployment::DeploymentId;
 pub use deployment_options::DeploymentOptions;
 pub use error::{Result, VertxError};
-pub use eventbus::{Consumer, DeliveryOptions, Envelope, EventBus, ReplyHandle};
+pub use eventbus::{Consumer, DeliveryOptions, Envelope, EventBus, Headers, ReplyHandle};
 pub use eventloop::EventLoopId;
 pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};

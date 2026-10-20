@@ -1,56 +1,79 @@
-//! `DeliveryOptions` — counterpart to `io.vertx.core.eventbus.DeliveryOptions`.
-//!
-//! Carries per-call delivery configuration for `EventBus::send` /
-//! `EventBus::request` / `EventBus::publish`. Today honored: `timeout`
-//! and `headers`. `codecName` / `localOnly` reserved for future use.
-
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Vert.x default request timeout: 30 seconds.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Per-call delivery configuration.
+/// Ordered message headers. Keys are case-sensitive and can have multiple values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Headers(Vec<(String, String)>);
+impl Headers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn append(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.0.push((key.into(), value.into()));
+    }
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        self.0.retain(|(k, _)| k != &key);
+        self.append(key, value);
+    }
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.0
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+impl From<HashMap<String, String>> for Headers {
+    fn from(m: HashMap<String, String>) -> Self {
+        Self(m.into_iter().collect())
+    }
+}
+impl FromIterator<(String, String)> for Headers {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub struct DeliveryOptions {
     timeout: Option<Duration>,
-    headers: HashMap<String, String>,
+    headers: Headers,
 }
-
 impl DeliveryOptions {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Sets the request/response timeout. Mirrors
-    /// `DeliveryOptions.setSendTimeout(long)`.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
-
-    /// Add a header. Mirrors `DeliveryOptions.addHeader(k, v)`.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(key.into(), value.into());
+        self.headers.append(key, value);
         self
     }
-
-    /// Replace all headers.
-    pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
-        self.headers = headers;
+    pub fn with_headers(mut self, headers: impl Into<Headers>) -> Self {
+        self.headers = headers.into();
         self
     }
-
     pub fn timeout(&self) -> Duration {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT)
     }
-
-    pub fn headers(&self) -> &HashMap<String, String> {
+    pub fn headers(&self) -> &Headers {
         &self.headers
     }
-
-    pub(crate) fn take_headers(self) -> HashMap<String, String> {
+    pub(crate) fn take_headers(self) -> Headers {
         self.headers
     }
 }
-

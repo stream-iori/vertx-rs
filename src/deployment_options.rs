@@ -23,7 +23,10 @@ pub struct DeploymentOptions<C = ()> {
 
 impl Default for DeploymentOptions<()> {
     fn default() -> Self {
-        Self { instances: 1, config: Arc::new(()) }
+        Self {
+            instances: 1,
+            config: Arc::new(()),
+        }
     }
 }
 
@@ -43,7 +46,10 @@ impl<C> DeploymentOptions<C> {
 
     /// Attach a typed config. Each factory call receives `Arc<C>::clone`.
     pub fn config<D>(self, config: D) -> DeploymentOptions<D> {
-        DeploymentOptions { instances: self.instances, config: Arc::new(config) }
+        DeploymentOptions {
+            instances: self.instances,
+            config: Arc::new(config),
+        }
     }
 
     pub fn instances_count(&self) -> usize {

@@ -1,68 +1,72 @@
+use crate::context::{set_thread, ThreadIdentity};
+use crate::{Result, VertxError};
 use std::future::Future;
-use std::sync::Arc;
-
+use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-/// Wraps `Runtime` so it can be dropped from any context (including inside
-/// another tokio runtime, as happens in `#[tokio::test]`).
-pub(crate) struct OwnedRuntime(Option<Runtime>);
-
-impl OwnedRuntime {
-    fn new(rt: Runtime) -> Self {
-        Self(Some(rt))
-    }
-    fn get(&self) -> &Runtime {
-        self.0.as_ref().expect("runtime taken")
-    }
-}
-
-impl Drop for OwnedRuntime {
-    fn drop(&mut self) {
-        if let Some(rt) = self.0.take() {
-            rt.shutdown_background();
-        }
-    }
-}
-
-/// Dedicated multi-threaded tokio runtime for `WorkerVerticle`s and
-/// `execute_blocking` work. Independent of the EventLoop pool.
 pub(crate) struct WorkerPool {
-    rt: Arc<OwnedRuntime>,
+    rt: Mutex<Option<Runtime>>,
     threads: usize,
+    blocking_threads: usize,
+    pub permits: Arc<Semaphore>,
 }
-
 impl WorkerPool {
-    pub fn new(threads: usize) -> std::io::Result<Self> {
-        assert!(threads > 0, "worker pool size must be > 0");
+    pub fn new(threads: usize, blocking_threads: usize, instance: u64) -> std::io::Result<Self> {
+        assert!(
+            threads > 0 && blocking_threads > 0,
+            "thread counts must be > 0"
+        );
         let rt = Builder::new_multi_thread()
             .worker_threads(threads)
+            .max_blocking_threads(blocking_threads)
             .thread_name("vertx-rs-worker")
+            .on_thread_start(move || set_thread(Some(ThreadIdentity::Worker(instance))))
+            .on_thread_stop(|| set_thread(None))
             .enable_all()
             .build()?;
         Ok(Self {
-            rt: Arc::new(OwnedRuntime::new(rt)),
+            rt: Mutex::new(Some(rt)),
             threads,
+            blocking_threads,
+            permits: Arc::new(Semaphore::new(blocking_threads)),
         })
     }
-
     pub fn threads(&self) -> usize {
         self.threads
     }
-
-    pub fn spawn<F>(&self, fut: F) -> JoinHandle<F::Output>
+    pub fn blocking_threads(&self) -> usize {
+        self.blocking_threads
+    }
+    pub fn spawn<F>(&self, future: F) -> Result<JoinHandle<F::Output>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.rt.get().spawn(fut)
+        let rt = self.rt.lock().unwrap();
+        Ok(rt.as_ref().ok_or(VertxError::VertxClosed)?.spawn(future))
     }
-
-    pub fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>
+    pub fn spawn_blocking<F, R>(&self, f: F) -> Result<JoinHandle<R>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.rt.get().spawn_blocking(f)
+        let rt = self.rt.lock().unwrap();
+        Ok(rt
+            .as_ref()
+            .ok_or(VertxError::VertxClosed)?
+            .spawn_blocking(f))
+    }
+    pub fn shutdown(&self) {
+        self.permits.close();
+        if let Some(rt) = self.rt.lock().unwrap().take() {
+            rt.shutdown_background();
+        }
+    }
+}
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

@@ -1,124 +1,156 @@
+use super::envelope::ErasedEnvelope;
+use super::inner::{EventBusInner, SubscriberId};
+use crate::{Context, Envelope, Result, VertxError};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
-
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use super::envelope::{Envelope, ErasedEnvelope};
-use super::inner::{EventBusInner, SubscriberId};
-use crate::Context;
-
-/// Typed consumer for one address. Dropping unregisters from the bus.
+/// A pull consumer. Drop unregisters; scope cancellation stops receiving even
+/// when messages remain buffered. Handler tasks are tracked by the owner scope.
 pub struct Consumer<T> {
     rx: mpsc::Receiver<ErasedEnvelope>,
     address: String,
     id: SubscriberId,
     bus: Arc<EventBusInner>,
+    owner: Option<Context>,
+    cancel: CancellationToken,
     _marker: PhantomData<T>,
 }
-
 impl<T: Send + 'static> Consumer<T> {
     pub(crate) fn new(
         rx: mpsc::Receiver<ErasedEnvelope>,
         address: String,
         id: SubscriberId,
         bus: Arc<EventBusInner>,
+        owner: Option<Context>,
+        cancel: CancellationToken,
     ) -> Self {
-        Self { rx, address, id, bus, _marker: PhantomData }
-    }
-
-    /// Await the next message. Returns `None` once the consumer is unregistered.
-    pub async fn recv(&mut self) -> Option<Envelope<T>> {
-        loop {
-            let erased = self.rx.recv().await?;
-            let ErasedEnvelope { body, headers, reply_to } = erased;
-            match body.downcast::<T>() {
-                Ok(b) => return Some(Envelope::new(*b, headers, reply_to)),
-                Err(_) => {
-                    tracing::error!(
-                        address = %self.address,
-                        "dropping message: type mismatch on consumer"
-                    );
-                    continue;
-                }
-            }
+        Self {
+            rx,
+            address,
+            id,
+            bus,
+            owner,
+            cancel,
+            _marker: PhantomData,
         }
     }
-
+    pub async fn recv(&mut self) -> Option<Envelope<T>> {
+        let env = tokio::select! { biased;
+            _ = self.cancel.cancelled() => return None,
+            r = self.rx.recv() => r?,
+        };
+        env.typed(&self.address).ok()
+    }
     pub fn address(&self) -> &str {
         &self.address
     }
-
     pub(crate) fn subscriber_id(&self) -> SubscriberId {
         self.id
     }
-
-    /// Vert.x-style handler attachment. Consumes the `Consumer` and spawns a
-    /// task on the current EventLoop that pulls envelopes and runs `handler`
-    /// for each one. Equivalent to:
+    fn handler_context(&self) -> Result<Context> {
+        let ctx = self.owner.clone().ok_or(VertxError::ContextMismatch)?;
+        if !Context::current().is_some_and(|c| ctx.same(&c)) {
+            return Err(VertxError::ContextMismatch);
+        }
+        ctx.ensure_alive()?;
+        Ok(ctx)
+    }
+    /// Attach a non-Send handler on its owning EventLoop.
     ///
-    /// ```ignore
-    /// while let Some(env) = consumer.recv().await {
-    ///     handler(env).await;
-    /// }
     /// ```
-    ///
-    /// Must be called on an EventLoop context (the same one that owns the
-    /// Consumer). Termination: the spawned task ends when the consumer is
-    /// unregistered (e.g. on `undeploy`) — `recv()` returns `None` once the
-    /// bus drops the sender side.
-    ///
-    /// Returns immediately. If a handler errors, the error is logged and the
-    /// loop continues (so one bad message can't kill the subscription).
-    ///
-    /// ## Where to keep state
-    ///
-    /// Pick the *least* powerful tool that works — going further down this
-    /// list trades compile-time guarantees for runtime checks.
-    ///
-    /// 1. **Single handler, owned state** — just `move` it into the closure
-    ///    and use `FnMut`. Zero overhead, fully compile-checked.
-    ///    ```ignore
-    ///    let mut count: u64 = 0;
-    ///    consumer.handler(move |env| {
-    ///        count += 1;
-    ///        async move { env.reply(count) }
-    ///    });
-    ///    ```
-    /// 2. **Multiple handlers sharing a small `Copy` scalar** — `Rc<Cell<T>>`.
-    ///    No borrow guard, no panic possible.
-    /// 3. **Multiple handlers sharing complex state** (`HashMap`, `Vec`, ...)
-    ///    — `Rc<RefCell<T>>`. **Rule:** keep every `borrow()`/`borrow_mut()`
-    ///    scope to a single statement, and never hold a borrow across an
-    ///    `.await`. Violating either invariant turns into a runtime panic
-    ///    (`already borrowed`).
-    /// 4. **Cross-handler coordination that doesn't fit shared state** —
-    ///    route a message through another EventBus address. No shared mutability.
-    pub fn handler<F, Fut>(self, handler: F)
+    /// # use async_trait::async_trait;
+    /// # use vertx_rs::{Context, Result, Verticle};
+    /// # struct Example;
+    /// # #[async_trait(?Send)] impl Verticle for Example {
+    /// # async fn start(&mut self, ctx: Context) -> Result<()> {
+    /// let mut count = 0u64;
+    /// ctx.event_bus().consumer::<()>("count")?.handler(move |env| {
+    ///     count += 1;
+    ///     async move { env.reply(count) }
+    /// })?;
+    /// # Ok(()) } }
+    /// ```
+    pub fn handler<F, Fut>(mut self, mut handler: F) -> Result<()>
     where
         F: FnMut(Envelope<T>) -> Fut + 'static,
-        Fut: Future<Output = crate::Result<()>> + 'static,
+        Fut: Future<Output = Result<()>> + 'static,
     {
-        let ctx = Context::current().expect(
-            "Consumer::handler must be called on a Vertx EventLoop context",
-        );
-        let address = self.address.clone();
-        let mut consumer = self;
-        let mut handler = handler;
+        let ctx = self.handler_context()?;
+        ctx.check_local()?;
         let err_ctx = ctx.clone();
         ctx.spawn_local(async move {
-            while let Some(env) = consumer.recv().await {
-                if let Err(e) = handler(env).await {
-                    tracing::error!(%address, error = %e, "handler returned error");
+            while let Some(env) = self.recv().await {
+                // Catch each message separately so one panic does not kill the consumer.
+                let result =
+                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+                        handler(env).await
+                    }))
+                    .await
+                    .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
+                if let Err(e) = result {
                     err_ctx.report_error(&e);
                 }
             }
-        });
+            Ok(())
+        })?;
+        Ok(())
+    }
+    /// Worker counterpart; the closure and its future must be Send.
+    ///
+    /// ```
+    /// use async_trait::async_trait;
+    /// use vertx_rs::{Context, Result, WorkerVerticle};
+    /// struct Worker;
+    /// #[async_trait]
+    /// impl WorkerVerticle for Worker {
+    ///     async fn start(&mut self, ctx: Context) -> Result<()> {
+    ///         ctx.event_bus().consumer::<u32>("worker")?.handler_worker(|env| async move {
+    ///             let answer = *env.body() * 2;
+    ///             env.reply(answer)
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    pub fn handler_worker<F, Fut>(mut self, mut handler: F) -> Result<()>
+    where
+        F: FnMut(Envelope<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let ctx = self.handler_context()?;
+        if !ctx.is_worker() {
+            return Err(VertxError::ContextMismatch);
+        }
+        let err_ctx = ctx.clone();
+        ctx.spawn(async move {
+            while let Some(env) = self.recv().await {
+                let result =
+                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+                        handler(env).await
+                    }))
+                    .await
+                    .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
+                if let Err(e) = result {
+                    err_ctx.report_error(&e);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 }
-
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.bus.unregister(&self.address, self.id);
+        if let Some(ctx) = &self.owner {
+            ctx.scope
+                .state
+                .lock()
+                .unwrap()
+                .subscribers
+                .retain(|(_, id)| *id != self.id);
+        }
     }
 }

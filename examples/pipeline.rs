@@ -1,105 +1,70 @@
-//! Pipeline: Source -> Doubler×2 -> Sink, demonstrating `Context::execute_blocking`
-//! mid-flow and a mix of `Verticle` (EventLoop) + `WorkerVerticle`.
-//!
-//! Run with: `cargo run --example pipeline`
-
+//! Source -> Doubler x 2 -> Worker Sink, using managed tasks and bounded queues.
 use async_trait::async_trait;
 use tokio::sync::oneshot;
-use vertx_rs::{Consumer, Context, EventBus, Result, Verticle, Vertx, WorkerVerticle};
-
-struct Source {
-    items: Vec<i64>,
-    bus: EventBus,
-}
-
+use vertx_rs::{Context, Result, Verticle, Vertx, WorkerVerticle};
+struct Source;
 #[async_trait(?Send)]
 impl Verticle for Source {
-    async fn run(self, _ctx: Context) -> Result<()> {
-        for v in self.items {
-            self.bus.send("stage1", v).await?;
-        }
+    async fn start(&mut self, ctx: Context) -> Result<()> {
+        let bus = ctx.event_bus();
+        ctx.spawn_local(async move {
+            for value in 1..=5i64 {
+                bus.send("stage1", value).await?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 }
-
-struct Doubler {
-    label: &'static str,
-    consumer: Consumer<i64>,
-    bus: EventBus,
-}
-
+struct Doubler;
 #[async_trait(?Send)]
 impl Verticle for Doubler {
-    async fn run(mut self, ctx: Context) -> Result<()> {
-        let cancel = ctx.cancellation_token();
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                msg = self.consumer.recv() => {
-                    let Some(env) = msg else { return Ok(()) };
-                    let n = *env.body();
-                    let doubled = ctx.execute_blocking(move || n * 2).await?;
-                    println!("[{}] {} -> {}", self.label, n, doubled);
-                    self.bus.send("stage2", doubled).await?;
+    async fn start(&mut self, ctx: Context) -> Result<()> {
+        ctx.event_bus()
+            .consumer::<i64>("stage1")?
+            .handler(move |env| {
+                let ctx = ctx.clone();
+                async move {
+                    let value = *env.body();
+                    let doubled = ctx.execute_blocking(move || value * 2).await?;
+                    ctx.event_bus().send("stage2", doubled).await
                 }
-            }
-        }
+            })
     }
 }
-
 struct Sink {
-    expected: usize,
-    done: oneshot::Sender<Vec<i64>>,
-    consumer: Consumer<i64>,
+    done: Option<oneshot::Sender<Vec<i64>>>,
 }
-
 #[async_trait]
 impl WorkerVerticle for Sink {
-    async fn run(mut self, _ctx: Context) -> Result<()> {
-        let mut buf = Vec::with_capacity(self.expected);
-        while let Some(env) = self.consumer.recv().await {
-            buf.push(*env.body());
-            if buf.len() == self.expected {
-                let _ = self.done.send(buf);
-                return Ok(());
+    async fn start(&mut self, ctx: Context) -> Result<()> {
+        let done = self.done.take().unwrap();
+        let mut consumer = ctx.event_bus().consumer::<i64>("stage2")?;
+        ctx.spawn(async move {
+            let mut results = Vec::new();
+            while let Some(env) = consumer.recv().await {
+                results.push(env.into_body());
+                if results.len() == 5 {
+                    let _ = done.send(results);
+                    return Ok(());
+                }
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let vx = Vertx::new();
-
+    let vx = Vertx::builder().event_loop_threads(2).build();
     let (tx, rx) = oneshot::channel();
-    vx.deploy_worker(Sink {
-        expected: 5,
-        done: tx,
-        consumer: vx.event_bus().consumer::<i64>("stage2").unwrap(),
-    })
-    .await?;
-    vx.deploy(|ctx| Doubler {
-        label: "A",
-        consumer: ctx.event_bus().consumer::<i64>("stage1").unwrap(),
-        bus: ctx.event_bus(),
-    })
-    .await?;
-    vx.deploy(|ctx| Doubler {
-        label: "B",
-        consumer: ctx.event_bus().consumer::<i64>("stage1").unwrap(),
-        bus: ctx.event_bus(),
-    })
-    .await?;
-    vx.deploy(|ctx| Source {
-        items: vec![1, 2, 3, 4, 5],
-        bus: ctx.event_bus(),
-    })
-    .await?;
-
+    vx.deploy_worker(|_| Sink { done: Some(tx) }).await?;
+    vx.deploy(|_| Doubler).await?;
+    vx.deploy(|_| Doubler).await?;
+    vx.deploy(|_| Source).await?;
     let mut results = rx.await.unwrap();
     results.sort();
-    println!("sink got: {results:?}");
     assert_eq!(results, vec![2, 4, 6, 8, 10]);
-    Ok(())
+    println!("sink got: {results:?}");
+    vx.close().await
 }

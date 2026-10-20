@@ -1,44 +1,37 @@
+use crate::{Context, Result};
 use async_trait::async_trait;
 
-use crate::{Context, Result};
-
-/// A unit of deployment pinned to a single EventLoop.
+/// A deployment whose construction, lifecycle, tasks and destruction stay on
+/// one OS thread. Start message loops with `Context::spawn_local` in `start`.
 ///
-/// `Verticle` is **not required to be `Send`** — it lives on one thread for
-/// its entire lifetime, so it may hold `Rc`, `RefCell`, raw pointers, etc.
-///
-/// The trait has a single method `run(self, ctx)`. The verticle is moved
-/// into the framework's task and **owns its own run loop**. Typical shape:
-///
-/// ```ignore
-/// async fn run(mut self, ctx: Context) -> Result<()> {
-///     let mut c = ctx.event_bus().consumer::<Req>("addr")?;
-///     let cancel = ctx.cancellation_token();
-///     loop {
-///         tokio::select! {
-///             _ = cancel.cancelled() => return Ok(()),
-///             msg = c.recv() => {
-///                 let Some(env) = msg else { return Ok(()) };
-///                 // ... handle env ...
-///             }
-///         }
+/// ```
+/// use async_trait::async_trait;
+/// use vertx_rs::{Context, Result, Verticle};
+/// struct Service;
+/// #[async_trait(?Send)]
+/// impl Verticle for Service {
+///     async fn start(&mut self, ctx: Context) -> Result<()> {
+///         ctx.event_bus().consumer::<String>("echo")?.handler(|env| async move {
+///             let body = env.body().clone();
+///             env.reply(body)
+///         })?;
+///         Ok(())
 ///     }
 /// }
 /// ```
-///
-/// To **deploy** a verticle, supply a factory closure to `Vertx::deploy`
-/// that receives `Context` and returns `Self`. The factory runs synchronously
-/// on the target EventLoop thread, so it's the right place to register
-/// EventBus consumers before `run` starts polling them.
 #[async_trait(?Send)]
 pub trait Verticle: 'static {
-    async fn run(self, ctx: Context) -> Result<()>;
+    async fn start(&mut self, ctx: Context) -> Result<()>;
+    async fn stop(&mut self, _ctx: Context) -> Result<()> {
+        Ok(())
+    }
 }
-
-/// A unit of deployment that runs on the multi-threaded worker pool.
-///
-/// Same single-method shape as `Verticle`, with `Send` required.
+/// Worker executions may migrate threads, but ordinary polls sharing a
+/// Context are serialized. Blocking closures are separately ordered.
 #[async_trait]
 pub trait WorkerVerticle: Send + 'static {
-    async fn run(self, ctx: Context) -> Result<()>;
+    async fn start(&mut self, ctx: Context) -> Result<()>;
+    async fn stop(&mut self, _ctx: Context) -> Result<()> {
+        Ok(())
+    }
 }

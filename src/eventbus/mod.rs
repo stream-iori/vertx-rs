@@ -2,102 +2,50 @@ mod consumer;
 mod envelope;
 mod inner;
 mod options;
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use tokio_util::sync::CancellationToken;
-
-use crate::{DeploymentId, Result, VertxError};
-
+use crate::deployment::DeploymentScope;
+use crate::{Context, Result, VertxError};
 pub use consumer::Consumer;
 pub use envelope::{Envelope, ReplyHandle};
-pub use options::DeliveryOptions;
+use inner::EventBusInner;
+pub use options::{DeliveryOptions, Headers};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
-use inner::{EventBusInner, SubscriberId};
-
-/// Lifecycle state shared between a deployed Verticle and any Context handle
-/// derived from it. Outlives the Verticle's `start`/`stop` so that callers
-/// holding a Context clone can detect post-undeploy state.
-pub(crate) struct DeploymentScope {
-    pub(crate) deployment: DeploymentId,
-    /// Flipped to false by `undeploy` before tearing down. All Vertx-driven
-    /// schedulers must check this before doing work on behalf of the verticle.
-    pub(crate) alive: AtomicBool,
-    /// Cancellation signal for the verticle's main task and any cooperative
-    /// children the user wires up via `Context::cancellation_token`.
-    pub(crate) cancel: CancellationToken,
-    pub(crate) subscribers: Mutex<Vec<(String, SubscriberId)>>,
-}
-
-impl DeploymentScope {
-    pub(crate) fn new(deployment: DeploymentId, cancel: CancellationToken) -> Self {
-        Self {
-            deployment,
-            alive: AtomicBool::new(true),
-            cancel,
-            subscribers: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub(crate) fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn mark_dead(&self) {
-        self.alive.store(false, Ordering::Release);
-    }
-}
-
-/// Handle to the local event bus. Cheap to clone.
-///
-/// A handle obtained from `Context::event_bus()` is **bound** to a Verticle:
-/// consumers registered through it are automatically unregistered when the
-/// Verticle is undeployed. A handle obtained from `Vertx::event_bus()` is
-/// **unbound** — its consumers live until their `Consumer<T>` is dropped.
+/// Local typed address router. Context handles bind registration to a deployment;
+/// Vertx handles are unbound. Send awaits capacity; publish drops on full queues.
 #[derive(Clone)]
 pub struct EventBus {
-    inner: Arc<EventBusInner>,
-    scope: Option<Arc<DeploymentScope>>,
+    pub(crate) inner: Arc<EventBusInner>,
+    owner: Option<Context>,
 }
-
 impl EventBus {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(cancel: CancellationToken) -> Self {
         Self {
-            inner: Arc::new(EventBusInner::new()),
-            scope: None,
+            inner: Arc::new(EventBusInner::new(cancel)),
+            owner: None,
         }
     }
-
-    /// Produce a bound handle for the given deployment scope.
-    pub(crate) fn bound(&self, scope: Arc<DeploymentScope>) -> Self {
+    pub(crate) fn bound(&self, ctx: Context) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
-            scope: Some(scope),
+            inner: self.inner.clone(),
+            owner: Some(ctx),
         }
     }
-
-    /// Unregister all subscribers belonging to a scope.
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        self.inner.ensure_open()
+    }
+    pub(crate) fn close(&self) {
+        self.inner.close();
+    }
     pub(crate) fn cleanup_scope(&self, scope: &DeploymentScope) {
-        let mut subs = scope.subscribers.lock().unwrap();
-        let n = subs.len();
-        for (addr, id) in subs.drain(..) {
-            self.inner.unregister(&addr, id);
+        let subscribers = std::mem::take(&mut scope.state.lock().unwrap().subscribers);
+        for (address, id) in subscribers {
+            self.inner.unregister(&address, id);
         }
-        tracing::debug!(
-            deployment = %scope.deployment,
-            unregistered = n,
-            "cleaned up bound subscribers"
-        );
     }
-
-    /// Fire-and-forget broadcast: every subscriber on `address` receives a
-    /// clone of `body`. Per-subscriber delivery is best-effort (drop-on-full).
     pub fn publish<T: Clone + Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.publish(address, body, Default::default())
+        self.publish_with(address, body, DeliveryOptions::new())
     }
-
-    /// `publish` with explicit `DeliveryOptions` (today: headers).
     pub fn publish_with<T: Clone + Send + 'static>(
         &self,
         address: &str,
@@ -106,13 +54,9 @@ impl EventBus {
     ) -> Result<()> {
         self.inner.publish(address, body, options.take_headers())
     }
-
-    /// Point-to-point with cooperative backpressure.
     pub async fn send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.send(address, body, Default::default()).await
+        self.send_with(address, body, DeliveryOptions::new()).await
     }
-
-    /// `send` with explicit `DeliveryOptions` (today: headers).
     pub async fn send_with<T: Send + 'static>(
         &self,
         address: &str,
@@ -121,13 +65,9 @@ impl EventBus {
     ) -> Result<()> {
         self.inner.send(address, body, options.take_headers()).await
     }
-
-    /// Non-blocking variant of `send`.
     pub fn try_send<T: Send + 'static>(&self, address: &str, body: T) -> Result<()> {
-        self.inner.try_send(address, body, Default::default())
+        self.try_send_with(address, body, DeliveryOptions::new())
     }
-
-    /// Non-blocking variant of `send_with`.
     pub fn try_send_with<T: Send + 'static>(
         &self,
         address: &str,
@@ -136,69 +76,69 @@ impl EventBus {
     ) -> Result<()> {
         self.inner.try_send(address, body, options.take_headers())
     }
-
-    /// Request/response with default `DeliveryOptions` (30s timeout).
-    /// Mirrors `EventBus.request(address, message)`.
-    pub async fn request<T, R>(&self, address: &str, body: T) -> Result<R>
-    where
-        T: Send + 'static,
-        R: Send + 'static,
-    {
-        self.request_with(address, body, DeliveryOptions::default()).await
+    pub async fn request<T: Send + 'static, R: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+    ) -> Result<R> {
+        self.request_with(address, body, DeliveryOptions::new())
+            .await
     }
-
-    /// Request/response with explicit `DeliveryOptions`. Mirrors
-    /// `EventBus.request(address, message, options)`.
-    pub async fn request_with<T, R>(
+    pub async fn request_with<T: Send + 'static, R: Send + 'static>(
         &self,
         address: &str,
         body: T,
         options: DeliveryOptions,
-    ) -> Result<R>
-    where
-        T: Send + 'static,
-        R: Send + 'static,
-    {
+    ) -> Result<R> {
+        Ok(self
+            .request_message_with::<T, R>(address, body, options)
+            .await?
+            .into_body())
+    }
+    pub async fn request_message<T: Send + 'static, R: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+    ) -> Result<Envelope<R>> {
+        self.request_message_with(address, body, DeliveryOptions::new())
+            .await
+    }
+    pub async fn request_message_with<T: Send + 'static, R: Send + 'static>(
+        &self,
+        address: &str,
+        body: T,
+        options: DeliveryOptions,
+    ) -> Result<Envelope<R>> {
         let timeout = options.timeout();
-        let rx = self
-            .inner
-            .send_with_reply(address, body, options.take_headers())
-            .await?;
-        let erased = tokio::time::timeout(timeout, rx)
+        let request = async {
+            let rx = self
+                .inner
+                .send_with_reply(address, body, options.take_headers())
+                .await?;
+            let response = tokio::select! { biased;
+                _ = self.inner.closed.cancelled() => return Err(VertxError::VertxClosed),
+                r = rx => r.map_err(|_| VertxError::ReplyClosed)??,
+            };
+            response.typed(address)
+        };
+        tokio::time::timeout(timeout, request)
             .await
             .map_err(|_| VertxError::Timeout(timeout))?
-            .map_err(|_| VertxError::ReplyClosed)?;
-        erased
-            .downcast::<R>()
-            .map(|b| *b)
-            .map_err(|_| VertxError::TypeMismatch(address.to_string()))
     }
-
-    /// Register a typed consumer.
-    ///
-    /// For an **unbound** handle (from `Vertx::event_bus`) this always
-    /// succeeds. For a **bound** handle (from `Context::event_bus`) returns
-    /// `DeploymentTerminated` if the owning verticle has already been
-    /// undeployed.
     pub fn consumer<T: Send + 'static>(&self, address: &str) -> Result<Consumer<T>> {
-        if let Some(scope) = &self.scope {
-            if !scope.is_alive() {
-                return Err(VertxError::DeploymentTerminated(scope.deployment));
-            }
-        }
-        let c = self.inner.register::<T>(address);
-        if let Some(scope) = &self.scope {
-            // Close the small race window between register and undeploy.
-            if !scope.is_alive() {
-                self.inner.unregister(address, c.subscriber_id());
-                return Err(VertxError::DeploymentTerminated(scope.deployment));
-            }
-            scope
+        self.ensure_open()?;
+        let owner = self.owner.clone().or_else(|| {
+            Context::current().filter(|c| Arc::ptr_eq(&c.inner.event_bus.inner, &self.inner))
+        });
+        if let Some(ctx) = &owner {
+            let mut state = ctx.scope.admit()?;
+            let consumer = self.inner.register(address, Some(ctx.clone()))?;
+            state
                 .subscribers
-                .lock()
-                .unwrap()
-                .push((address.to_string(), c.subscriber_id()));
+                .push((address.into(), consumer.subscriber_id()));
+            Ok(consumer)
+        } else {
+            self.inner.register(address, None)
         }
-        Ok(c)
     }
 }

@@ -1,132 +1,102 @@
-//! Timer and Periodic — Vert.x-style timer API.
-//!
-//! - `Timer` is one-shot, implements `Future<Output = Result<()>>`. `cancel()`
-//!   makes the future resolve with `VertxError::TimerCancelled`.
-//! - `Periodic` is repeated. Call `tick().await` for each fire. `cancel()` is
-//!   the same as for `Timer`.
-//!
-//! A timer obtained from `Vertx::timer` / `Vertx::periodic` is **unbound** —
-//! it lives until cancelled or completed. A timer obtained from
-//! `Context::timer` / `Context::periodic` is **bound to the verticle's
-//! deployment** — undeploy will cancel it automatically, just like a bound
-//! `EventBus::consumer`.
-
+use crate::{Result, VertxError};
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context as StdContext, Poll};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-
-use tokio::time::{interval, Instant, Interval};
+use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Result, VertxError};
-
-/// A one-shot timer. Awaiting yields `Ok(())` when the deadline fires, or
-/// `Err(VertxError::TimerCancelled)` if it was cancelled (explicitly or
-/// because the owning Verticle was undeployed).
+/// One-shot future whose deadline is fixed at construction, even if first
+/// polled later. Cancellation wins when both branches are ready.
 pub struct Timer {
-    fut: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
-    own_cancel: CancellationToken,
+    future: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
+    own: CancellationToken,
+    scope: CancellationToken,
+    state: Arc<AtomicU8>,
 }
-
 impl Timer {
-    pub(crate) fn new(delay: Duration, scope_cancel: Option<CancellationToken>) -> Self {
-        let own_cancel = CancellationToken::new();
-        let own_clone = own_cancel.clone();
-        let fut = Box::pin(async move {
-            let cancelled = async {
-                if let Some(c) = scope_cancel {
-                    c.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
+    pub(crate) fn new(delay: Duration, scope: CancellationToken) -> Self {
+        let deadline = Instant::now() + delay;
+        let own = CancellationToken::new();
+        let state = Arc::new(AtomicU8::new(0));
+        let (own_c, scope_c, state_c) = (own.clone(), scope.clone(), state.clone());
+        let future = Box::pin(async move {
+            let result = tokio::select! { biased;
+                _ = own_c.cancelled() => Err(VertxError::TimerCancelled),
+                _ = scope_c.cancelled() => Err(VertxError::TimerCancelled),
+                _ = tokio::time::sleep_until(deadline) => Ok(()),
             };
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => Ok(()),
-                _ = own_clone.cancelled() => Err(VertxError::TimerCancelled),
-                _ = cancelled => Err(VertxError::TimerCancelled),
-            }
+            state_c.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+            result
         });
-        Self { fut, own_cancel }
+        Self {
+            future,
+            own,
+            scope,
+            state,
+        }
     }
-
-    /// Cancel the timer. Subsequent (or in-flight) awaits resolve to
-    /// `Err(VertxError::TimerCancelled)`.
     pub fn cancel(&self) {
-        self.own_cancel.cancel();
+        if self
+            .state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.own.cancel();
+        }
     }
-
     pub fn is_cancelled(&self) -> bool {
-        self.own_cancel.is_cancelled()
+        self.state.load(Ordering::Acquire) == 2
+            || self.state.load(Ordering::Acquire) == 0 && self.scope.is_cancelled()
     }
 }
-
 impl Future for Timer {
     type Output = Result<()>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut StdContext<'_>) -> Poll<Self::Output> {
-        self.fut.as_mut().poll(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
     }
 }
-
-/// A periodic timer. `tick().await` resolves once per period, until either
-/// `cancel()` is called or the owning Verticle is undeployed.
 pub struct Periodic {
-    interval: Interval,
-    own_cancel: CancellationToken,
-    scope_cancel: Option<CancellationToken>,
-    cancelled: bool,
+    interval: Option<Interval>,
+    deadline: Instant,
+    period: Duration,
+    own: CancellationToken,
+    scope: CancellationToken,
 }
-
 impl Periodic {
-    pub(crate) fn new(
-        initial_delay: Duration,
-        period: Duration,
-        scope_cancel: Option<CancellationToken>,
-    ) -> Self {
-        let mut iv = interval(period);
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Push the first tick out by `initial_delay`.
-        iv.reset_at(Instant::now() + initial_delay);
-        Self {
-            interval: iv,
-            own_cancel: CancellationToken::new(),
-            scope_cancel,
-            cancelled: false,
+    pub(crate) fn new(init: Duration, period: Duration, scope: CancellationToken) -> Result<Self> {
+        if period.is_zero() {
+            return Err(VertxError::InvalidOptions("period must be positive".into()));
         }
+        Ok(Self {
+            interval: None,
+            deadline: Instant::now() + init,
+            period,
+            own: CancellationToken::new(),
+            scope,
+        })
     }
-
-    /// Wait for the next tick. Returns `Err(TimerCancelled)` after the timer
-    /// has been cancelled (explicitly or by undeploy of the owning Verticle).
     pub async fn tick(&mut self) -> Result<()> {
-        if self.cancelled {
+        if self.is_cancelled() {
             return Err(VertxError::TimerCancelled);
         }
-        let scope_cancel = self.scope_cancel.clone();
-        let own_cancel = self.own_cancel.clone();
-        let fired = tokio::select! {
-            _ = self.interval.tick() => true,
-            _ = own_cancel.cancelled() => false,
-            _ = async {
-                if let Some(c) = scope_cancel {
-                    c.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => false,
-        };
-        if fired {
-            Ok(())
-        } else {
-            self.cancelled = true;
-            Err(VertxError::TimerCancelled)
+        let interval = self.interval.get_or_insert_with(|| {
+            let mut iv = tokio::time::interval_at(self.deadline, self.period);
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            iv
+        });
+        tokio::select! { biased;
+            _ = self.own.cancelled() => Err(VertxError::TimerCancelled),
+            _ = self.scope.cancelled() => Err(VertxError::TimerCancelled),
+            _ = interval.tick() => Ok(()),
         }
     }
-
     pub fn cancel(&self) {
-        self.own_cancel.cancel();
+        self.own.cancel();
     }
-
     pub fn is_cancelled(&self) -> bool {
-        self.own_cancel.is_cancelled()
+        self.own.is_cancelled() || self.scope.is_cancelled()
     }
 }
