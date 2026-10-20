@@ -1,6 +1,6 @@
 use crate::context::{Context, ContextShared};
 use crate::deployment::{CancelOnDrop, DeploymentScope};
-use crate::error::panic_error;
+use crate::error::{panic_error, retain_failure};
 use crate::eventloop::EventLoopPool;
 use crate::worker_pool::WorkerPool;
 use crate::{DeploymentId, EventBus, Result, Verticle, VertxError, WorkerVerticle};
@@ -33,12 +33,51 @@ pub struct Vertx {
     pub(crate) inner: Arc<VertxInner>,
 }
 
+async fn quiesce_deployment(ctx: &Context) {
+    ctx.inner
+        .diagnostics
+        .deployment(ctx.scope.deployment, "quiescing");
+    ctx.scope.request_stop();
+    ctx.inner.event_bus.cleanup_scope(&ctx.scope);
+    ctx.scope.quiesce(ctx.inner.shutdown_grace).await;
+}
+fn finish_deployment(
+    ctx: &Context,
+    outcome: Result<()>,
+    startup_failure: Option<VertxError>,
+    ready: Option<oneshot::Sender<Result<()>>>,
+) {
+    if let Err(error) = &outcome {
+        ctx.report_error(error);
+    }
+    ctx.clear_exception_handler();
+    ctx.scope.finish(outcome.clone());
+    if let Some(tx) = ready {
+        let error = outcome
+            .err()
+            .or(startup_failure)
+            .unwrap_or_else(|| VertxError::StartFailed("startup cancelled".into()));
+        let _ = tx.send(Err(error));
+    }
+    if let Some(owner) = ctx.inner.vertx.upgrade() {
+        owner
+            .deployments
+            .lock()
+            .unwrap()
+            .remove(&ctx.scope.deployment);
+    }
+    ctx.inner
+        .diagnostics
+        .deployment(ctx.scope.deployment, "stopped");
+}
+
 // Generate separate drivers so worker futures retain their Send bound while
 // EventLoop instances and their lifecycle futures can remain non-Send.
 macro_rules! lifecycle_driver {
     ($name:ident, $trait:ident) => {
         async fn $name<V, F>(ctx: Context, factory: F, ready: oneshot::Sender<Result<()>>)
         where V: $trait, F: FnOnce(Context) -> V {
+            ctx.inner.diagnostics.deployment(ctx.scope.deployment, "starting");
             let mut ready = Some(ready);
             let scope = ctx.scope.clone();
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(ctx.clone())));
@@ -55,7 +94,8 @@ macro_rules! lifecycle_driver {
                         },
                     };
                     if start.is_ok() && scope.running() {
-                        if ready.take().unwrap().send(Ok(())).is_err() { scope.request_stop(); }
+                        ctx.inner.diagnostics.deployment(scope.deployment, "running");
+                        if ready.take().expect("readiness sent only once").send(Ok(())).is_err() { scope.request_stop(); }
                         scope.cancel.cancelled().await;
                     } else {
                         let error = start.err().unwrap_or(VertxError::DeploymentTerminated(scope.deployment));
@@ -64,35 +104,20 @@ macro_rules! lifecycle_driver {
                         if !matches!(error, VertxError::DeploymentTerminated(_)) { outcome = Err(error.clone()); }
                         startup_failure = Some(error);
                     }
-                    scope.request_stop();
-                    ctx.inner.event_bus.cleanup_scope(&scope);
-                    scope.quiesce(ctx.inner.shutdown_grace).await;
+                    quiesce_deployment(&ctx).await;
                     if !panicked {
+                        ctx.inner.diagnostics.deployment(scope.deployment, "stopping");
                         let stopped = std::panic::AssertUnwindSafe(ctx.for_stop().scope_future(v.stop(ctx.for_stop()))).catch_unwind().await
                             .unwrap_or_else(|e| Err(panic_error(e)));
-                        if let Err(e) = stopped {
-                            outcome = match outcome { Ok(()) => Err(e), Err(cause) =>
-                                Err(VertxError::DeploymentFailed { cause: Box::new(cause), rollback: vec![e] }) };
-                        }
+                        if let Err(e) = stopped { retain_failure(&mut outcome, e); }
                     }
                     if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(v))) {
-                        outcome = Err(panic_error(e));
+                        retain_failure(&mut outcome, panic_error(e));
                     }
                 }
             }
-            scope.request_stop();
-            ctx.inner.event_bus.cleanup_scope(&scope);
-            scope.quiesce(ctx.inner.shutdown_grace).await;
-            if let Err(e) = &outcome { ctx.report_error(e); }
-            ctx.clear_exception_handler();
-            scope.finish(outcome.clone());
-            if let Some(tx) = ready {
-                let error = outcome.err().or(startup_failure).unwrap_or_else(|| VertxError::StartFailed("startup cancelled".into()));
-                let _ = tx.send(Err(error));
-            }
-            if let Some(owner) = ctx.inner.vertx.upgrade() {
-                owner.deployments.lock().unwrap().remove(&scope.deployment);
-            }
+            quiesce_deployment(&ctx).await;
+            finish_deployment(&ctx, outcome, startup_failure, ready);
         }
     }
 }
@@ -108,6 +133,15 @@ impl Vertx {
     }
     pub fn builder() -> VertxBuilder {
         VertxBuilder::default()
+    }
+    pub fn diagnostics(&self) -> crate::DiagnosticsSnapshot {
+        let mut snapshot = self.inner.shared.diagnostics.snapshot();
+        if snapshot.enabled {
+            if let Some(result) = self.inner.close_result.borrow().as_ref() {
+                snapshot.close_stage = if result.is_ok() { "closed" } else { "failed" };
+            }
+        }
+        snapshot
     }
     pub fn event_bus(&self) -> EventBus {
         self.inner.shared.event_bus.clone()
@@ -154,6 +188,7 @@ impl Vertx {
             let loop_id = self.inner.shared.event_loops.pick();
             let ctx = Context::new_event_loop(loop_id, self.inner.shared.clone(), scope.clone());
             let (tx, rx) = oneshot::channel();
+            self.inner.shared.diagnostics.deployment(id, "queued");
             self.inner
                 .deployments
                 .lock()
@@ -171,6 +206,7 @@ impl Vertx {
                 })
             {
                 self.inner.deployments.lock().unwrap().remove(&id);
+                self.inner.shared.diagnostics.deployment(id, "stopped");
                 return Err(e);
             }
             (scope, rx)
@@ -198,6 +234,7 @@ impl Vertx {
             ));
             let ctx = Context::new_worker(self.inner.shared.clone(), scope.clone());
             let (tx, rx) = oneshot::channel();
+            self.inner.shared.diagnostics.deployment(id, "queued");
             self.inner
                 .deployments
                 .lock()
@@ -212,6 +249,7 @@ impl Vertx {
                 }),
             ) {
                 self.inner.deployments.lock().unwrap().remove(&id);
+                self.inner.shared.diagnostics.deployment(id, "stopped");
                 return Err(e);
             }
             (scope, rx)
@@ -323,6 +361,7 @@ impl Vertx {
                     .values()
                     .cloned()
                     .collect();
+                owner.shared.diagnostics.close_stage("deployments");
                 owner.shared.cancel.cancel();
                 owner.shared.event_bus.close();
                 for scope in &scopes {
@@ -340,9 +379,12 @@ impl Vertx {
                                 errors.push(e);
                             }
                         }
+                        owner.shared.diagnostics.close_stage("blocking");
                         owner.shared.blocking.wait().await;
                         owner.shared.exception_handler.write().unwrap().take();
-                        owner.shared.workers.shutdown().await;
+                        owner.shared.diagnostics.close_stage("worker_join");
+                        errors.extend(owner.shared.workers.shutdown().await);
+                        owner.shared.diagnostics.close_stage("event_loop_join");
                         owner
                             .shared
                             .event_loops
@@ -374,6 +416,7 @@ pub struct VertxBuilder {
     event_loop_threads: Option<usize>,
     worker_threads: usize,
     shutdown_grace: Duration,
+    diagnostics: crate::DiagnosticsOptions,
 }
 impl Default for VertxBuilder {
     fn default() -> Self {
@@ -381,11 +424,16 @@ impl Default for VertxBuilder {
             event_loop_threads: None,
             worker_threads: 20,
             shutdown_grace: Duration::from_secs(1),
+            diagnostics: crate::DiagnosticsOptions::default(),
         }
     }
 }
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 impl VertxBuilder {
+    pub fn diagnostics(mut self, options: crate::DiagnosticsOptions) -> Self {
+        self.diagnostics = options;
+        self
+    }
     pub fn event_loop_threads(mut self, n: usize) -> Self {
         self.event_loop_threads = Some(n);
         self
@@ -415,10 +463,12 @@ impl VertxBuilder {
             WorkerPool::new(self.worker_threads, instance)
                 .expect("failed to initialize worker pool"),
         );
+        let diagnostics = crate::diagnostics::Diagnostics::new(instance, self.diagnostics);
         let cancel = CancellationToken::new();
-        let event_bus = EventBus::new(cancel.clone());
+        let event_bus = EventBus::new(cancel.clone(), diagnostics.clone());
         let inner = Arc::new_cyclic(|weak| {
             let shared = Arc::new(ContextShared {
+                diagnostics,
                 event_bus,
                 event_loops,
                 workers,

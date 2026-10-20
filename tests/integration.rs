@@ -2526,3 +2526,697 @@ async fn eventloop_can_await_close_of_a_different_vertx_instance() {
     assert!(!first.is_closed());
     first.close().await.unwrap();
 }
+
+// Diagnostics and lifecycle error retention.
+#[tokio::test]
+async fn lifecycle_keeps_start_stop_and_drop_errors_and_source() {
+    struct Broken;
+    impl Drop for Broken {
+        fn drop(&mut self) {
+            panic!("drop failure");
+        }
+    }
+    #[async_trait(?Send)]
+    impl Verticle for Broken {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Err(VertxError::StartFailed("start failure".into()))
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            Err(VertxError::Other("stop failure".into()))
+        }
+    }
+    let vx = vx();
+    let error = vx.deploy(|_| Broken).await.unwrap_err();
+    assert!(std::error::Error::source(&error)
+        .unwrap()
+        .to_string()
+        .contains("start failure"));
+    let VertxError::LifecycleFailed { cause, cleanup } = error else {
+        panic!("missing lifecycle errors")
+    };
+    assert!(matches!(*cause, VertxError::StartFailed(_)));
+    assert!(
+        matches!(&cleanup[..], [VertxError::Other(s), VertxError::Panic(p)] if s == "stop failure" && p == "drop failure")
+    );
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
+    use vertx_rs::DiagnosticsOptions;
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .diagnostics(DiagnosticsOptions {
+            task_details: true,
+            max_task_details: 2,
+            ..Default::default()
+        })
+        .build();
+    let (_, ctx) = capture(&vx).await;
+    let before = vx.diagnostics();
+    let ok = ctx.spawn(async { Ok(()) }).unwrap();
+    ok.await.unwrap();
+    let err = ctx
+        .spawn(async { Err(VertxError::Other("task failed".into())) })
+        .unwrap();
+    assert!(err.await.is_err());
+    let panic = ctx
+        .spawn(async {
+            panic!("task panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(panic.await, Err(VertxError::Panic(_))));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        handles.push(ctx.spawn(futures::future::pending()).unwrap());
+    }
+    let snapshot = vx.diagnostics();
+    assert_eq!(snapshot.active_tasks, before.active_tasks + 4);
+    assert_eq!(snapshot.tasks.len(), 2);
+    assert!(snapshot.task_details_truncated);
+    for handle in handles {
+        handle.abort();
+        assert!(matches!(handle.await, Err(VertxError::TaskCancelled)));
+    }
+    let snapshot = vx.diagnostics();
+    assert_eq!(snapshot.active_tasks, before.active_tasks);
+    assert_eq!(snapshot.completed, before.completed + 1);
+    assert_eq!(snapshot.failed, before.failed + 2);
+    assert_eq!(snapshot.cancelled, before.cancelled + 4);
+    vx.close().await.unwrap();
+    let snapshot = vx.diagnostics();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.threads.is_empty());
+    assert_eq!(snapshot.active_deployments, 0);
+    assert_eq!(snapshot.close_stage, "closed");
+}
+
+#[tokio::test]
+async fn diagnostics_read_current_poll_without_waiting_for_blocked_eventloop() {
+    let output = TraceOutput::default();
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .diagnostics(vertx_rs::DiagnosticsOptions {
+            event_loop_poll_threshold: Duration::ZERO,
+            ..Default::default()
+        })
+        .build();
+    let (_, ctx) = capture(&vx).await;
+    let dispatch = output.dispatch();
+    let (entered, ready) = oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let task = tracing::dispatcher::with_default(&dispatch, || {
+        ctx.spawn(async move {
+            entered.send(()).ok();
+            gate.recv().unwrap();
+            Ok(())
+        })
+    })
+    .unwrap();
+    ready.await.unwrap();
+    let snapshot = vx.diagnostics();
+    let warned_before_return = output
+        .text()
+        .contains("slow synchronous operation returned");
+    let operation = snapshot
+        .threads
+        .iter()
+        .find(|t| t.task_id == task.id())
+        .unwrap();
+    let correct = operation.context_id == ctx.id() && operation.operation == "future_poll";
+    release.send(()).unwrap();
+    task.await.unwrap();
+    assert!(correct);
+    assert!(!warned_before_return);
+    assert!(
+        output
+            .text()
+            .contains("slow synchronous operation returned"),
+        "trace: {}",
+        output.text()
+    );
+    assert!(snapshot.tasks.is_empty(), "details must be opt-in");
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn diagnostics_can_be_disabled_and_consumers_do_not_double_decrement() {
+    for enabled in [true, false] {
+        let vx = Vertx::builder()
+            .event_loop_threads(1)
+            .worker_threads(1)
+            .diagnostics(vertx_rs::DiagnosticsOptions {
+                enabled,
+                ..Default::default()
+            })
+            .build();
+        let consumer = vx.event_bus().consumer::<()>("diagnostic-count").unwrap();
+        assert_eq!(vx.diagnostics().active_consumers, usize::from(enabled));
+        vx.close().await.unwrap();
+        drop(consumer);
+        let snapshot = vx.diagnostics();
+        assert_eq!(snapshot.active_consumers, 0);
+        assert_eq!(snapshot.enabled, enabled);
+    }
+}
+
+#[derive(Clone, Default)]
+struct TraceOutput(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for TraceOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceOutput {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+impl TraceOutput {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+    fn dispatch(&self) -> tracing::Dispatch {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(self.clone())
+                .finish(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
+    use tracing::{instrument::WithSubscriber, Instrument};
+    let output = TraceOutput::default();
+    let dispatch = output.dispatch();
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let (_, a) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let (_, b) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let alpha = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("alpha"));
+    let beta = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("beta"));
+    let gate = barrier.clone();
+    let aid = a.id();
+    let ah = async {
+        a.spawn(async move {
+            tracing::info!(probe = "alpha", "user probe before wait");
+            gate.wait().await;
+            assert_eq!(Context::current().unwrap().id(), aid);
+            tracing::info!(probe = "alpha", "user probe after wait");
+            Ok(())
+        })
+    }
+    .instrument(alpha)
+    .with_subscriber(dispatch.clone())
+    .await
+    .unwrap();
+    let bid = b.id();
+    let bh = async {
+        b.spawn(async move {
+            tracing::info!(probe = "beta", "user probe before wait");
+            barrier.wait().await;
+            assert_eq!(Context::current().unwrap().id(), bid);
+            tracing::info!(probe = "beta", "user probe after wait");
+            Ok(())
+        })
+    }
+    .instrument(beta)
+    .with_subscriber(dispatch.clone())
+    .await
+    .unwrap();
+    ah.await.unwrap();
+    bh.await.unwrap();
+    vx.close().with_subscriber(dispatch).await.unwrap();
+    let text = output.text();
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("user probe"))
+        .collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    for line in lines {
+        if line.contains("probe=\"alpha\"") {
+            assert!(
+                line.contains(&format!("context_id={aid}")) && !line.contains("beta:"),
+                "{line}"
+            );
+        } else {
+            assert!(
+                line.contains(&format!("context_id={bid}")) && !line.contains("alpha:"),
+                "{line}"
+            );
+        }
+    }
+    assert!(text.contains("task finished after user drop"));
+    assert!(Context::current().is_none());
+}
+
+#[tokio::test]
+async fn diagnostic_logs_separate_admission_queue_timeout_and_user_hook() {
+    use tracing::instrument::WithSubscriber;
+    let output = TraceOutput::default();
+    let dispatch = output.dispatch();
+    async {
+        let vx = vx();
+        let mut consumer = vx.event_bus().consumer::<()>("stages").unwrap();
+        for _ in 0..256 {
+            vx.event_bus().try_send("stages", ()).unwrap();
+        }
+        vx.event_bus().publish("stages", ()).unwrap();
+        let reply: Result<()> = vx
+            .event_bus()
+            .request_with(
+                "stages",
+                (),
+                DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(reply, Err(VertxError::Timeout(_))));
+        assert_eq!(vx.diagnostics().request_timeouts, 1);
+        assert_eq!(vx.diagnostics().broadcast_dropped, 1);
+        let envelope = consumer.recv().await.unwrap();
+        drop(envelope);
+        vx.event_bus().send("stages", ()).await.unwrap();
+        let (_, ctx) = capture(&vx).await;
+        let hook = Arc::new(AtomicUsize::new(0));
+        let calls = hook.clone();
+        ctx.set_exception_handler(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(ctx
+            .spawn(async { Err(VertxError::Other("diagnostic-hook-error".into())) })
+            .unwrap()
+            .await
+            .is_err());
+        assert_eq!(hook.load(Ordering::SeqCst), 1);
+        vx.close().await.unwrap();
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let text = output.text();
+    assert!(
+        text.contains("admission_wait=") && text.contains("queue_residence="),
+        "{text}"
+    );
+    assert!(text
+        .lines()
+        .any(|line| line.contains("request timed out") && line.contains("request_id=")));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("framework operation failed")
+                && line.contains("diagnostic-hook-error"))
+            .count(),
+        1
+    );
+    assert!(text.contains("worker_join") && text.contains("event_loop_join"));
+}
+
+#[tokio::test]
+async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
+    use tracing::instrument::WithSubscriber;
+    use vertx_rs::{DiagnosticsOptions, TaskStage};
+    let output = TraceOutput::default();
+    let dispatch = output.dispatch();
+    async {
+        let vx = Vertx::builder()
+            .event_loop_threads(1)
+            .worker_threads(1)
+            .diagnostics(DiagnosticsOptions {
+                task_details: true,
+                blocking_threshold: Duration::ZERO,
+                ..Default::default()
+            })
+            .build();
+        let (_, ctx) = capture(&vx).await;
+        let (entered, ready) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        let first = ctx
+            .spawn(async move {
+                c.execute_blocking(move || {
+                    entered.send(()).ok();
+                    gate.recv().unwrap();
+                })
+                .await
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let c = ctx.clone();
+        let (submitted, observed) = oneshot::channel();
+        let second = ctx
+            .spawn(async move {
+                submitted.send(()).ok();
+                c.execute_blocking(|| ()).await
+            })
+            .unwrap();
+        observed.await.unwrap();
+        let c = ctx.clone();
+        let (submitted, observed) = oneshot::channel();
+        let third = ctx
+            .spawn(async move {
+                submitted.send(()).ok();
+                c.execute_blocking_with(|| (), false).await
+            })
+            .unwrap();
+        observed.await.unwrap();
+        // A round trip on this EventLoop follows the submitters' synchronous polls.
+        ctx.spawn(async { Ok(()) }).unwrap().await.unwrap();
+        let snapshot = vx.diagnostics();
+        release.send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+        third.await.unwrap();
+        assert_eq!(snapshot.blocking_running, 1);
+        assert_eq!(snapshot.blocking_waiting, 2);
+        for stage in [
+            TaskStage::BlockingOrderedWait,
+            TaskStage::BlockingQueued,
+            TaskStage::BlockingRunning,
+        ] {
+            assert!(
+                snapshot.tasks.iter().any(|t| t.stage == stage),
+                "missing {stage:?}: {snapshot:?}"
+            );
+        }
+        vx.close().await.unwrap();
+        assert_eq!(vx.diagnostics().blocking_running, 0);
+        assert_eq!(vx.diagnostics().blocking_waiting, 0);
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let text = output.text();
+    assert!(
+        text.contains("ordered_wait=") && text.contains("worker_queue_wait="),
+        "{text}"
+    );
+    assert!(
+        text.contains("slow synchronous operation returned")
+            && text.contains("synchronous_elapsed=")
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_show_cleanup_stage_while_stop_is_pending() {
+    struct StopGate {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+    #[async_trait(?Send)]
+    impl Verticle for StopGate {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.entered.take().unwrap().send(()).ok();
+            self.release
+                .take()
+                .unwrap()
+                .await
+                .map_err(|_| VertxError::ReplyClosed)
+        }
+    }
+    let vx = vx();
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    let id = vx
+        .deploy(|_| StopGate {
+            entered: Some(entered),
+            release: Some(wait),
+        })
+        .await
+        .unwrap();
+    let owner = vx.clone();
+    let close = tokio::spawn(async move { owner.close().await });
+    ready.await.unwrap();
+    let snapshot = vx.diagnostics();
+    release.send(()).unwrap();
+    close.await.unwrap().unwrap();
+    assert_eq!(snapshot.close_stage, "deployments");
+    assert!(snapshot
+        .deployments
+        .iter()
+        .any(|d| d.deployment_id == id && d.stage == "stopping"));
+    assert!(vx.diagnostics().deployments.is_empty());
+}
+
+#[tokio::test]
+async fn scoped_tracing_follows_worker_migration_and_restores_context() {
+    use tracing::{instrument::WithSubscriber, Instrument};
+    let output = TraceOutput::default();
+    let dispatch = output.dispatch();
+    let vx = vx();
+    let (send, receive) = oneshot::channel();
+    vx.deploy_worker(move |_| {
+        worker(move |ctx| async move {
+            send.send(ctx).ok();
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    let ctx = receive.await.unwrap();
+    let (send, receive) = oneshot::channel();
+    let mut send = Some(send);
+    let mut first = None;
+    let context_id = ctx.id();
+    let span = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("worker_probe"));
+    let task = async {
+        ctx.spawn(futures::future::poll_fn(move |cx| {
+            assert_eq!(Context::current().unwrap().id(), context_id);
+            let current = std::thread::current().id();
+            tracing::info!(thread_id = ?current, "migration probe");
+            if let Some(first) = first {
+                assert_ne!(first, current);
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                first = Some(current);
+                send.take()
+                    .unwrap()
+                    .send((current, cx.waker().clone()))
+                    .ok();
+                std::task::Poll::Pending
+            }
+        }))
+    }
+    .instrument(span)
+    .with_subscriber(dispatch)
+    .await
+    .unwrap();
+    let (first, wake) = receive.await.unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let (release, wait) = std::sync::mpsc::channel();
+    let wait = Arc::new(Mutex::new(wait));
+    let (blocked, blocking) = oneshot::channel();
+    let blocked = Arc::new(Mutex::new(Some(blocked)));
+    let mut jobs = Vec::new();
+    for _ in 0..2 {
+        let (ctx, barrier, wait, blocked) =
+            (ctx.clone(), barrier.clone(), wait.clone(), blocked.clone());
+        jobs.push(tokio::spawn(async move {
+            ctx.execute_blocking_with(
+                move || {
+                    barrier.wait();
+                    if std::thread::current().id() == first {
+                        blocked.lock().unwrap().take().unwrap().send(()).ok();
+                        wait.lock().unwrap().recv().unwrap();
+                    }
+                },
+                false,
+            )
+            .await
+        }));
+    }
+    blocking.await.unwrap();
+    wake.wake();
+    let result = tokio::time::timeout(Duration::from_secs(2), task).await;
+    release.send(()).unwrap();
+    result.unwrap().unwrap();
+    for job in jobs {
+        job.await.unwrap().unwrap();
+    }
+    vx.close().await.unwrap();
+    let text = output.text();
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("migration probe"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for line in lines {
+        assert!(
+            line.contains("worker_probe:") && line.contains(&format!("context_id={context_id}")),
+            "{line}"
+        );
+    }
+    assert!(Context::current().is_none());
+}
+
+#[tokio::test]
+async fn handler_destructor_uses_message_dispatch_even_when_consumer_has_another_subscriber() {
+    use tracing::instrument::WithSubscriber;
+    struct DropProbe(vertx_rs::ContextId);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            assert_eq!(Context::current().unwrap().id(), self.0);
+            tracing::info!("message destructor probe");
+        }
+    }
+    let receiver = TraceOutput::default();
+    let sender = TraceOutput::default();
+    let vx = vx();
+    let (send, ready) = oneshot::channel();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            let mut send = Some(send);
+            let id = ctx.id();
+            ctx.event_bus()
+                .consumer::<()>("drop-trace")?
+                .handler(move |_| {
+                    let send = send.take();
+                    async move {
+                        let _probe = DropProbe(id);
+                        send.unwrap().send(()).ok();
+                        futures::future::pending::<()>().await;
+                        Ok(())
+                    }
+                })
+        })
+    })
+    .with_subscriber(receiver.dispatch())
+    .await
+    .unwrap();
+    vx.event_bus()
+        .send("drop-trace", ())
+        .with_subscriber(sender.dispatch())
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    vx.close().await.unwrap();
+    assert!(sender.text().contains("message destructor probe"));
+    assert!(!receiver.text().contains("message destructor probe"));
+}
+
+#[tokio::test]
+async fn diagnostics_keep_detached_blocking_work_until_its_actual_completion() {
+    let vx = vx();
+    let (_, ctx) = capture(&vx).await;
+    let (send, ready) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let c = ctx.clone();
+    let task = ctx
+        .spawn(async move {
+            c.execute_blocking(move || {
+                send.send(()).ok();
+                wait.recv().unwrap();
+            })
+            .await
+        })
+        .unwrap();
+    ready.await.unwrap();
+    task.abort();
+    assert!(matches!(task.await, Err(VertxError::TaskCancelled)));
+    let snapshot = vx.diagnostics();
+    release.send(()).unwrap();
+    vx.close().await.unwrap();
+    assert_eq!(snapshot.blocking_running, 1);
+    assert_eq!(vx.diagnostics().active_tasks, 0);
+}
+
+#[tokio::test]
+async fn diagnostics_mark_destructor_panics_failed_and_invoke_hook_once() {
+    struct DropPanic;
+    impl Future for DropPanic {
+        type Output = Result<()>;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl Drop for DropPanic {
+        fn drop(&mut self) {
+            panic!("diagnostic drop panic");
+        }
+    }
+    let vx = vx();
+    let (_, ctx) = capture(&vx).await;
+    let before = vx.diagnostics().failed;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = calls.clone();
+    ctx.set_exception_handler(move |_| {
+        hook.fetch_add(1, Ordering::SeqCst);
+    });
+    let result = ctx.spawn(DropPanic).unwrap().await;
+    assert!(matches!(result, Err(VertxError::Panic(_))));
+    assert_eq!(vx.diagnostics().failed, before + 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn message_span_names_receiving_context_separately_from_sender_ancestry() {
+    use tracing::instrument::WithSubscriber;
+    let output = TraceOutput::default();
+    let dispatch = output.dispatch();
+    let vx = vx();
+    let (send, receive) = oneshot::channel();
+    vx.deploy(move |_| {
+        local(move |ctx| async move {
+            let id = ctx.id();
+            send.send(id).ok();
+            ctx.event_bus()
+                .consumer::<()>("trace-hop")?
+                .handler(move |env| async move {
+                    assert_eq!(Context::current().unwrap().id(), id);
+                    tracing::info!("receiver execution probe");
+                    env.reply(())
+                })
+        })
+    })
+    .with_subscriber(dispatch.clone())
+    .await
+    .unwrap();
+    let receiver_id = receive.await.unwrap();
+    let (_, source) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    assert_ne!(source.id(), receiver_id);
+    let bus = source.event_bus();
+    let task = async { source.spawn(async move { bus.request::<_, ()>("trace-hop", ()).await }) }
+        .with_subscriber(dispatch)
+        .await
+        .unwrap();
+    task.await.unwrap();
+    vx.close().await.unwrap();
+    let text = output.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("receiver execution probe"))
+        .unwrap();
+    let handler_fields = line
+        .split("message_handler{")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(
+        handler_fields.contains(&format!("context_id={receiver_id}")),
+        "{line}"
+    );
+    assert!(handler_fields.contains("task_id=task#"), "{line}");
+}

@@ -19,9 +19,12 @@ pub struct EventBus {
     owner: Option<Context>,
 }
 impl EventBus {
-    pub(crate) fn new(cancel: CancellationToken) -> Self {
+    pub(crate) fn new(
+        cancel: CancellationToken,
+        diagnostics: Arc<crate::diagnostics::Diagnostics>,
+    ) -> Self {
         Self {
-            inner: Arc::new(EventBusInner::new(cancel)),
+            inner: Arc::new(EventBusInner::new(cancel, diagnostics)),
             owner: None,
         }
     }
@@ -109,21 +112,34 @@ impl EventBus {
         body: T,
         options: DeliveryOptions,
     ) -> Result<Envelope<R>> {
+        let request_id = envelope::next_message_id();
         let timeout = options.timeout();
         let request = async {
             let rx = self
                 .inner
-                .send_with_reply(address, body, options.take_headers())
+                .send_with_reply(request_id, address, body, options.take_headers())
                 .await?;
             let response = tokio::select! { biased;
                 _ = self.inner.closed.cancelled() => return Err(VertxError::VertxClosed),
                 r = rx => r.map_err(|_| VertxError::ReplyClosed)??,
             };
+            response.trace.reply("received");
             response.typed(address)
         };
-        tokio::time::timeout(timeout, request)
-            .await
-            .map_err(|_| VertxError::Timeout(timeout))?
+        tokio::time::timeout(timeout, request).await.map_err(|_| {
+            self.inner.diagnostics.timeout();
+            if self.inner.diagnostics.options.enabled {
+                tracing::warn!(
+                    instance_id = self.inner.diagnostics.instance,
+                    address,
+                    request_id,
+                    error_kind = "timeout",
+                    ?timeout,
+                    "request timed out"
+                );
+            }
+            VertxError::Timeout(timeout)
+        })?
     }
     pub fn consumer<T: Send + 'static>(&self, address: &str) -> Result<Consumer<T>> {
         self.ensure_open()?;

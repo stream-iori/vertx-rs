@@ -1,6 +1,6 @@
 use crate::context::{set_thread, ThreadIdentity};
 use crate::error::panic_error;
-use crate::eventloop::LocalTaskControl;
+use crate::TaskHandle;
 use crate::{Result, VertxError};
 use futures::task::{waker_ref, ArcWake};
 use std::collections::{HashMap, VecDeque};
@@ -13,97 +13,18 @@ use std::thread::JoinHandle;
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, Notify};
 
-/// An owned task result. Dropping this handle detaches the waiter; it does not
-/// cancel the task or remove it from its deployment.
-pub struct TaskHandle<T> {
-    backend: TaskBackend<T>,
-    abort: TaskAbortHandle,
+struct WorkerControl {
+    task: Weak<Task>,
+    finished: Arc<AtomicBool>,
 }
-enum TaskBackend<T> {
-    Tokio(tokio::task::JoinHandle<Result<T>>),
-    Channel(oneshot::Receiver<Result<T>>),
-}
-/// A clonable cancellation handle. Cancellation takes effect on the owning
-/// executor, after an in-progress poll has returned.
-#[derive(Clone)]
-pub struct TaskAbortHandle {
-    backend: AbortBackend,
-}
-#[derive(Clone)]
-enum AbortBackend {
-    Tokio(tokio::task::AbortHandle),
-    EventLoop(Arc<LocalTaskControl>),
-    Worker {
-        task: Weak<Task>,
-        finished: Arc<AtomicBool>,
-    },
-}
-impl TaskAbortHandle {
-    pub fn abort(&self) {
-        match &self.backend {
-            AbortBackend::Tokio(handle) => handle.abort(),
-            AbortBackend::EventLoop(task) => task.abort(),
-            AbortBackend::Worker { task, .. } => {
-                if let Some(task) = task.upgrade() {
-                    task.schedule(true);
-                }
-            }
+impl crate::task::TaskControl for WorkerControl {
+    fn abort(&self) {
+        if let Some(task) = self.task.upgrade() {
+            task.schedule(true);
         }
     }
-    pub fn is_finished(&self) -> bool {
-        match &self.backend {
-            AbortBackend::Tokio(handle) => handle.is_finished(),
-            AbortBackend::EventLoop(task) => task.is_finished(),
-            AbortBackend::Worker { finished, .. } => finished.load(Ordering::Acquire),
-        }
-    }
-}
-impl<T> TaskHandle<T> {
-    pub(crate) fn from_event_loop(
-        receiver: oneshot::Receiver<Result<T>>,
-        task: Arc<LocalTaskControl>,
-    ) -> Self {
-        Self {
-            backend: TaskBackend::Channel(receiver),
-            abort: TaskAbortHandle {
-                backend: AbortBackend::EventLoop(task),
-            },
-        }
-    }
-    pub(crate) fn from_tokio(handle: tokio::task::JoinHandle<Result<T>>) -> Self {
-        let abort = TaskAbortHandle {
-            backend: AbortBackend::Tokio(handle.abort_handle()),
-        };
-        Self {
-            backend: TaskBackend::Tokio(handle),
-            abort,
-        }
-    }
-    pub fn abort(&self) {
-        self.abort.abort();
-    }
-    pub fn abort_handle(&self) -> TaskAbortHandle {
-        self.abort.clone()
-    }
-    pub fn is_finished(&self) -> bool {
-        self.abort.is_finished()
-    }
-}
-impl<T> Future for TaskHandle<T> {
-    type Output = Result<T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.get_mut().backend {
-            TaskBackend::Tokio(handle) => Pin::new(handle).poll(cx).map(|result| match result {
-                Ok(result) => result,
-                Err(error) if error.is_cancelled() => Err(VertxError::TaskCancelled),
-                Err(error) if error.is_panic() => Err(panic_error(error.into_panic())),
-                Err(error) => Err(VertxError::Join(error.to_string())),
-            }),
-            TaskBackend::Channel(receiver) => Pin::new(receiver).poll(cx).map(|result| {
-                result
-                    .unwrap_or_else(|_| Err(VertxError::Join("task result channel closed".into())))
-            }),
-        }
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
     }
 }
 
@@ -124,7 +45,13 @@ where
     T: Send + 'static,
 {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match self.future.as_mut().unwrap().as_mut().poll(cx) {
+        match self
+            .future
+            .as_mut()
+            .expect("unfinished work owns its future")
+            .as_mut()
+            .poll(cx)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(output) => {
                 self.output = Some(output);
@@ -137,20 +64,28 @@ where
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.future.take())));
         let output = match dropped {
             Err(error) => Err(panic_error(error)),
-            Ok(()) => error.map_or_else(|| self.output.take().unwrap(), Err),
+            Ok(()) => error.map_or_else(
+                || self.output.take().expect("Ready work has an output"),
+                Err,
+            ),
         };
         Box::new(move || {
             let _ = self.sender.send(output);
         })
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskPhase {
+    Waiting,
+    Queued,
+    Running,
+    Complete,
+}
 struct TaskState {
     work: Option<Box<dyn Work>>,
-    queued: bool,
-    running: bool,
+    phase: TaskPhase,
     notified: bool,
     cancelled: bool,
-    complete: bool,
 }
 struct Task {
     id: u64,
@@ -165,17 +100,17 @@ impl Task {
     fn schedule(self: &Arc<Self>, cancel: bool) {
         let enqueue = {
             let mut state = self.state.lock().unwrap();
-            if state.complete {
+            if state.phase == TaskPhase::Complete {
                 return;
             }
             state.cancelled |= cancel;
-            if state.running {
+            if state.phase == TaskPhase::Running {
                 state.notified = true;
                 false
-            } else if state.queued {
+            } else if state.phase == TaskPhase::Queued {
                 false
             } else {
-                state.queued = true;
+                state.phase = TaskPhase::Queued;
                 true
             }
         };
@@ -188,10 +123,12 @@ impl Task {
     fn run(self: &Arc<Self>, pool: &Core) {
         let (mut work, cancelled) = {
             let mut state = self.state.lock().unwrap();
-            state.queued = false;
-            state.running = true;
+            state.phase = TaskPhase::Running;
             state.notified = false;
-            (state.work.take().unwrap(), state.cancelled)
+            (
+                state.work.take().expect("queued task owns unpolled work"),
+                state.cancelled,
+            )
         };
         assert!(crate::context::thread_identity() == Some(ThreadIdentity::Worker(self.instance)));
         let _runtime = self.driver.enter();
@@ -215,12 +152,15 @@ impl Task {
             };
             let finish = error.is_some() || ready;
             if finish {
-                state.complete = true;
+                state.phase = TaskPhase::Complete;
             } else {
-                state.running = false;
-                state.queued = state.notified;
+                state.phase = if state.notified {
+                    TaskPhase::Queued
+                } else {
+                    TaskPhase::Waiting
+                };
             }
-            (finish, !finish && state.queued, error)
+            (finish, !finish && state.phase == TaskPhase::Queued, error)
         };
         if finish {
             let complete = work.finish(error);
@@ -400,11 +340,9 @@ impl WorkerPool {
                     output: None,
                     sender,
                 })),
-                queued: false,
-                running: false,
+                phase: TaskPhase::Waiting,
                 notified: false,
                 cancelled: false,
-                complete: false,
             }),
         });
         {
@@ -415,15 +353,13 @@ impl WorkerPool {
             state.tasks.insert(task.id, task.clone());
         }
         task.schedule(false);
-        Ok(TaskHandle {
-            backend: TaskBackend::Channel(receiver),
-            abort: TaskAbortHandle {
-                backend: AbortBackend::Worker {
-                    task: Arc::downgrade(&task),
-                    finished,
-                },
-            },
-        })
+        Ok(TaskHandle::from_channel(
+            receiver,
+            Arc::new(WorkerControl {
+                task: Arc::downgrade(&task),
+                finished,
+            }),
+        ))
     }
     pub fn spawn_blocking<F, T>(&self, f: F) -> Result<oneshot::Receiver<Result<T>>>
     where
@@ -443,7 +379,7 @@ impl WorkerPool {
         self.core.available.notify_one();
         Ok(receiver)
     }
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Vec<VertxError> {
         self.core.state.lock().unwrap().closing = true;
         self.core.available.notify_all();
         loop {
@@ -462,9 +398,13 @@ impl WorkerPool {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
             }
         }
-        for handle in self.handles.lock().unwrap().drain(..) {
-            let _ = handle.join(); // is_finished above guarantees this cannot block.
-        }
+        // All handles finished above; join cannot block and failures remain visible.
+        self.handles
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|handle| handle.join().err().map(panic_error))
+            .collect()
     }
 }
 impl Drop for WorkerPool {
@@ -480,6 +420,16 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::task::Waker;
 
+    #[tokio::test]
+    async fn shutdown_retains_thread_join_failures() {
+        let pool = WorkerPool::new(1, 1004).unwrap();
+        pool.handles
+            .lock()
+            .unwrap()
+            .push(std::thread::spawn(|| panic!("worker join failure")));
+        let errors = pool.shutdown().await;
+        assert!(matches!(&errors[..], [VertxError::Panic(s)] if s == "worker join failure"));
+    }
     #[tokio::test]
     async fn wakes_during_poll_are_coalesced_and_late_wakes_are_ignored() {
         let pool = WorkerPool::new(2, 1001).unwrap();

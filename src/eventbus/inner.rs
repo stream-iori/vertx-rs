@@ -1,5 +1,5 @@
 use super::consumer::Consumer;
-use super::envelope::ErasedEnvelope;
+use super::envelope::{ErasedEnvelope, MessageTrace};
 use super::Headers;
 use crate::{Context, Result, VertxError};
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -10,6 +10,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_CAPACITY: usize = 256;
+// Stamp immediately before send; subscriber callbacks run only after the
+// envelope is actually queued, so a slow subscriber cannot inflate queue age.
+fn enqueue(permit: mpsc::Permit<'_, ErasedEnvelope>, mut envelope: ErasedEnvelope) {
+    let trace = envelope.trace.mark_enqueued();
+    permit.send(envelope);
+    if let Some(trace) = trace {
+        trace.log_enqueued();
+    }
+}
 pub(crate) type SubscriberId = u64;
 struct Subscriber {
     id: SubscriberId,
@@ -21,14 +30,19 @@ struct Route {
     cursor: usize,
 }
 pub(crate) struct EventBusInner {
+    pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
     routes: DashMap<String, Route>,
     admission: RwLock<()>,
     next_id: AtomicU64,
     pub closed: CancellationToken,
 }
 impl EventBusInner {
-    pub fn new(closed: CancellationToken) -> Self {
+    pub fn new(
+        closed: CancellationToken,
+        diagnostics: Arc<crate::diagnostics::Diagnostics>,
+    ) -> Self {
         Self {
+            diagnostics,
             routes: DashMap::new(),
             admission: RwLock::new(()),
             next_id: AtomicU64::new(1),
@@ -61,6 +75,7 @@ impl EventBusInner {
                 return Err(VertxError::TypeMismatch(address.into()));
             }
             route.subscribers.push(Subscriber { id, tx });
+            self.diagnostics.consumer(1);
         }
         if self.closed.is_cancelled() {
             self.unregister(address, id);
@@ -81,7 +96,10 @@ impl EventBusInner {
     }
     pub fn unregister(&self, address: &str, id: SubscriberId) {
         if let Entry::Occupied(mut entry) = self.routes.entry(address.into()) {
+            let before = entry.get().subscribers.len();
             entry.get_mut().subscribers.retain(|s| s.id != id);
+            self.diagnostics
+                .consumer(-((before - entry.get().subscribers.len()) as isize));
             if entry.get().subscribers.is_empty() {
                 entry.remove();
             }
@@ -90,7 +108,9 @@ impl EventBusInner {
     pub fn close(&self) {
         self.closed.cancel();
         let _admission = self.admission.write().unwrap();
+        let count: usize = self.routes.iter().map(|r| r.subscribers.len()).sum();
         self.routes.clear();
+        self.diagnostics.consumer(-(count as isize));
     }
     pub fn publish<T: Clone + Send + 'static>(
         &self,
@@ -110,19 +130,32 @@ impl EventBusInner {
         };
         let mut dropped = 0usize;
         for tx in senders {
-            if tx
-                .try_send(ErasedEnvelope {
-                    body: Box::new(body.clone()),
-                    headers: headers.clone(),
-                    reply_to: None,
-                })
-                .is_err()
-            {
-                dropped += 1;
+            // Clone outside router locks: Clone is user code and may re-enter the bus.
+            let body = Box::new(body.clone());
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    let trace = MessageTrace::new(&self.diagnostics, address, None);
+                    enqueue(
+                        permit,
+                        ErasedEnvelope {
+                            trace,
+                            body,
+                            headers: headers.clone(),
+                            reply_to: None,
+                        },
+                    );
+                }
+                Err(_) => dropped += 1,
             }
         }
-        if dropped > 0 {
-            tracing::warn!(address, dropped, "broadcast delivery dropped");
+        self.diagnostics.dropped(dropped);
+        if dropped > 0 && self.diagnostics.options.enabled {
+            tracing::warn!(
+                instance_id = self.diagnostics.instance,
+                address,
+                dropped,
+                "broadcast delivery dropped"
+            );
         }
         Ok(())
     }
@@ -132,6 +165,7 @@ impl EventBusInner {
         body: T,
         headers: Headers,
         reply_to: Option<oneshot::Sender<Result<ErasedEnvelope>>>,
+        request_id: Option<u64>,
     ) -> Result<(mpsc::Sender<ErasedEnvelope>, ErasedEnvelope)> {
         self.ensure_open()?;
         let mut route = self
@@ -144,9 +178,11 @@ impl EventBusInner {
         let index = route.cursor % route.subscribers.len();
         route.cursor = route.cursor.wrapping_add(1);
         let tx = route.subscribers[index].tx.clone();
+        drop(route); // Subscriber callbacks must run outside the route lock.
         Ok((
             tx,
             ErasedEnvelope {
+                trace: MessageTrace::new(&self.diagnostics, address, request_id),
                 body: Box::new(body),
                 headers,
                 reply_to,
@@ -161,7 +197,11 @@ impl EventBusInner {
     ) -> Result<()> {
         tokio::select! { biased;
             _ = self.closed.cancelled() => Err(VertxError::VertxClosed),
-            r = tx.send(envelope) => r.map_err(|_| VertxError::ChannelClosed(address.into())),
+            r = tx.reserve() => {
+                let permit = r.map_err(|_| VertxError::ChannelClosed(address.into()))?;
+                enqueue(permit, envelope);
+                Ok(())
+            },
         }
     }
     pub async fn send<T: Send + 'static>(
@@ -170,7 +210,7 @@ impl EventBusInner {
         body: T,
         headers: Headers,
     ) -> Result<()> {
-        let (tx, env) = self.prepare(address, body, headers, None)?;
+        let (tx, env) = self.prepare(address, body, headers, None, None)?;
         self.deliver(address, tx, env).await
     }
     pub fn try_send<T: Send + 'static>(
@@ -179,20 +219,23 @@ impl EventBusInner {
         body: T,
         headers: Headers,
     ) -> Result<()> {
-        let (tx, env) = self.prepare(address, body, headers, None)?;
-        tx.try_send(env).map_err(|e| match e {
+        let (tx, env) = self.prepare(address, body, headers, None, None)?;
+        let permit = tx.try_reserve().map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => VertxError::QueueFull(address.into()),
             mpsc::error::TrySendError::Closed(_) => VertxError::ChannelClosed(address.into()),
-        })
+        })?;
+        enqueue(permit, env);
+        Ok(())
     }
     pub async fn send_with_reply<T: Send + 'static>(
         &self,
+        request_id: u64,
         address: &str,
         body: T,
         headers: Headers,
     ) -> Result<oneshot::Receiver<Result<ErasedEnvelope>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let (tx, env) = self.prepare(address, body, headers, Some(reply_tx))?;
+        let (tx, env) = self.prepare(address, body, headers, Some(reply_tx), Some(request_id))?;
         self.deliver(address, tx, env).await?;
         Ok(reply_rx)
     }
@@ -203,7 +246,10 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn concurrent_last_unregister_and_new_register_preserve_new_route() {
-        let bus = Arc::new(EventBusInner::new(CancellationToken::new()));
+        let bus = Arc::new(EventBusInner::new(
+            CancellationToken::new(),
+            crate::diagnostics::Diagnostics::new(0, Default::default()),
+        ));
         for _ in 0..100 {
             let old = bus.register::<u32>("race", None).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));

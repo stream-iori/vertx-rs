@@ -60,6 +60,14 @@ impl LocalTaskControl {
         }
     }
 }
+impl crate::task::TaskControl for LocalTaskControl {
+    fn abort(&self) {
+        self.abort();
+    }
+    fn is_finished(&self) -> bool {
+        self.is_finished()
+    }
+}
 struct Completion<T> {
     sender: Option<oneshot::Sender<Result<T>>>,
     control: Arc<LocalTaskControl>,
@@ -324,6 +332,14 @@ impl EventLoopPool {
         Fut: Future<Output = Result<T>> + 'static,
         T: Send + 'static,
     {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let parent = tracing::Span::current();
+        let factory = move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _span = parent.enter();
+                crate::task::TracedFuture::new(factory(), dispatch.clone(), parent.clone())
+            })
+        };
         let admission = self.loops[id.0].admission.lock().unwrap();
         let sender = admission.as_ref().ok_or(VertxError::VertxClosed)?;
         if self.check_thread(id) {
@@ -345,7 +361,7 @@ impl EventLoopPool {
         let sent = sender.send(Box::new(command));
         drop(admission);
         sent.map_err(|_| VertxError::VertxClosed)?;
-        Ok(TaskHandle::from_event_loop(receiver, control))
+        Ok(TaskHandle::from_channel(receiver, control))
     }
     fn request_stop(&self) {
         for event_loop in &self.loops {

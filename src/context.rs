@@ -1,4 +1,5 @@
 use crate::deployment::{DeploymentScope, Phase};
+use crate::diagnostics::{Diagnostics, TaskRecord, TaskStage};
 use crate::error::panic_error;
 use crate::eventloop::{EventLoopId, EventLoopPool};
 use crate::vertx::{Vertx, VertxInner};
@@ -35,6 +36,7 @@ pub(crate) fn thread_identity() -> Option<ThreadIdentity> {
 }
 pub(crate) type ExceptionHandler = Arc<dyn Fn(&VertxError) + Send + Sync>;
 pub(crate) struct ContextShared {
+    pub diagnostics: Arc<Diagnostics>,
     pub event_bus: EventBus,
     pub event_loops: Arc<EventLoopPool>,
     pub workers: Arc<WorkerPool>,
@@ -66,8 +68,19 @@ pub struct Context {
     data: Arc<ContextData>,
     stopping: bool,
 }
+/// Stable process-unique logical execution identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextId(pub(crate) u64);
+impl std::fmt::Display for ContextId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "context#{}", self.0)
+    }
+}
 static NEXT_CONTEXT: AtomicU64 = AtomicU64::new(1);
 impl Context {
+    pub fn id(&self) -> ContextId {
+        ContextId(self.data.id)
+    }
     fn new(kind: Kind, inner: Arc<ContextShared>, scope: Arc<DeploymentScope>) -> Self {
         let driver = inner.event_loops.driver(match kind {
             Kind::EventLoop(id) => id,
@@ -186,12 +199,13 @@ impl Context {
             .unwrap()
             .clone()
             .or_else(|| self.inner.exception_handler.read().unwrap().clone());
+        if self.inner.diagnostics.options.enabled {
+            tracing::error!(instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), error_kind = err.kind(), error = %err, "framework operation failed");
+        }
         if let Some(h) = handler {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(err))).is_err() {
-                tracing::error!("exception handler panicked");
+                tracing::error!(instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), error_kind = "panic", "exception handler panicked");
             }
-        } else {
-            tracing::error!(deployment = %self.scope.deployment, context = self.data.id, error = %err, "unhandled error");
         }
     }
     fn enter(&self) -> ContextGuard {
@@ -202,9 +216,26 @@ impl Context {
         }
     }
     pub(crate) fn wrap<F: Future>(&self, future: F) -> ContextFuture<F> {
+        let record =
+            self.inner
+                .diagnostics
+                .task(self.id(), self.scope.deployment, TaskStage::Ready);
+        let span = if self.inner.diagnostics.options.enabled {
+            tracing::info_span!("context_task", instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), task_id = %record.id)
+        } else {
+            tracing::Span::none()
+        };
+        span.in_scope(|| {
+            if self.inner.diagnostics.options.enabled {
+                tracing::debug!(task_id = %record.id, "task submitted");
+            }
+        });
         ContextFuture {
             ctx: self.clone(),
             future: Some(Box::pin(future)),
+            record,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            span,
         }
     }
     pub(crate) fn scope_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
@@ -242,8 +273,10 @@ impl Context {
     {
         self.check_local()?;
         let mut state = self.scope.admit()?;
-        let future = Tracked::new(self.wrap(self.managed(future)), self.scope.task_token());
-        let handle = TaskHandle::from_tokio(tokio::task::spawn_local(future));
+        let future = self.wrap(self.managed(future));
+        let id = future.record.id;
+        let future = Tracked::new(future, self.scope.task_token());
+        let handle = TaskHandle::from_tokio(tokio::task::spawn_local(future)).with_id(id);
         state.tasks.retain(|h| !h.is_finished());
         state.tasks.push(handle.abort_handle());
         Ok(handle)
@@ -255,7 +288,9 @@ impl Context {
     {
         self.ensure_alive()?;
         let mut state = self.scope.admit()?;
-        let task = Tracked::new(self.wrap(self.managed(future)), self.scope.task_token());
+        let task = self.wrap(self.managed(future));
+        let id = task.record.id;
+        let task = Tracked::new(task, self.scope.task_token());
         let handle = match self.kind {
             Kind::EventLoop(id) => self.inner.event_loops.spawn_pinned(id, move || task)?,
             Kind::Worker => {
@@ -264,6 +299,7 @@ impl Context {
                     .spawn(self.data.id, self.data.driver.clone(), task)?
             }
         };
+        let handle = handle.with_id(id);
         state.tasks.retain(|h| !h.is_finished());
         state.tasks.push(handle.abort_handle());
         Ok(handle)
@@ -312,6 +348,18 @@ impl Context {
             self.scope.blocking.token()
         };
         let global_token = self.inner.blocking.token();
+        let mut record = self.inner.diagnostics.task(
+            self.id(),
+            self.scope.deployment,
+            TaskStage::BlockingOrderedWait,
+        );
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let span = if self.inner.diagnostics.options.enabled {
+            tracing::info_span!("blocking_task", instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), task_id = %record.id)
+        } else {
+            tracing::Span::none()
+        };
+        let ordered_started = std::time::Instant::now();
         let ordered_lock = if ordered {
             Some(tokio::select! { biased;
                 _ = self.scope.cancel.cancelled(), if !self.stopping => return Err(VertxError::DeploymentTerminated(self.scope.deployment)),
@@ -320,18 +368,35 @@ impl Context {
         } else {
             None
         };
+        if self.inner.diagnostics.options.enabled {
+            tracing::debug!(task_id = %record.id, ordered, ordered_wait = ?ordered_started.elapsed(), "blocking order admitted");
+        }
+        record.stage(TaskStage::BlockingQueued);
+        let queued_at = std::time::Instant::now();
         let ctx = self.clone();
         let handle = self.inner.workers.spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
+            let _span = span.enter();
+            if ctx.inner.diagnostics.options.enabled { tracing::debug!(task_id = %record.id, worker_queue_wait = ?queued_at.elapsed(), "blocking dequeued"); }
+            record.stage(TaskStage::BlockingRunning);
+            let _operation = ctx.inner.diagnostics.operation(&record, None, "blocking", ctx.inner.diagnostics.options.blocking_threshold);
             let (_token, _global, _ordered) = (token, global_token, ordered_lock);
             let _context = ctx.enter();
             // Move captures into a local so cancellation drops them before the
             // Context guard and tracking tokens, rather than with the FnOnce environment.
             let operation = f;
-            if !ctx.stopping && ctx.scope.cancel.is_cancelled() {
-                drop(operation);
-                return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
-            }
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(panic_error)
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !ctx.stopping && ctx.scope.cancel.is_cancelled() {
+                    drop(operation);
+                    Err(VertxError::DeploymentTerminated(ctx.scope.deployment))
+                } else {
+                    Ok(operation())
+                }
+            })).unwrap_or_else(|error| Err(panic_error(error)));
+            record.result(&result);
+            drop(_operation);
+            drop(record);
+            result
         })?;
         handle
             .await
@@ -364,9 +429,12 @@ impl Drop for ContextGuard {
 pub(crate) struct ContextFuture<F> {
     ctx: Context,
     future: Option<Pin<Box<F>>>,
+    record: TaskRecord,
+    dispatch: tracing::Dispatch,
+    span: tracing::Span,
 }
-impl<F: Future> Future for ContextFuture<F> {
-    type Output = F::Output;
+impl<F: Future<Output = Result<T>>, T> Future for ContextFuture<F> {
+    type Output = Result<T>;
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.ctx.is_event_loop() {
@@ -385,13 +453,45 @@ impl<F: Future> Future for ContextFuture<F> {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let _context = this.ctx.enter();
-        tracing::trace!(deployment = %this.ctx.scope.deployment, context = this.ctx.data.id,
-            thread = ?std::thread::current().id(), event_loop = ?this.ctx.event_loop_id(), "context poll");
-        this.future
-            .as_mut()
-            .expect("future already dropped")
-            .as_mut()
-            .poll(cx)
+        let _dispatch = tracing::dispatcher::set_default(&this.dispatch);
+        let _span = this.span.enter();
+        this.record.stage(TaskStage::Polling);
+        if this.ctx.inner.diagnostics.options.enabled {
+            tracing::trace!(thread_id = ?std::thread::current().id(), event_loop_id = ?this.ctx.event_loop_id(), "task poll");
+        }
+        let diagnostics = &this.ctx.inner.diagnostics;
+        let threshold = if this.ctx.is_event_loop() {
+            diagnostics.options.event_loop_poll_threshold
+        } else {
+            diagnostics.options.worker_poll_threshold
+        };
+        let _operation = diagnostics.operation(
+            &this.record,
+            this.ctx.event_loop_id(),
+            "future_poll",
+            threshold,
+        );
+        let waker = this.record.waker(cx.waker());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future
+                .as_mut()
+                .expect("poll after future drop")
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(&waker))
+        }))
+        .unwrap_or_else(|payload| {
+            // Includes a destructor panic while an awaited future completes,
+            // which a catch_unwind around only that future's poll cannot cover.
+            let error = panic_error(payload);
+            this.ctx.report_error(&error);
+            Poll::Ready(Err(error))
+        });
+        match &result {
+            Poll::Ready(result) => this.record.result(result),
+            Poll::Pending => this.record.pending(),
+        }
+        result
     }
 }
 impl<F> Drop for ContextFuture<F> {
@@ -403,8 +503,31 @@ impl<F> Drop for ContextFuture<F> {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let _context = self.ctx.enter();
+        let _dispatch = tracing::dispatcher::set_default(&self.dispatch);
+        let _span = self.span.enter();
+        let diagnostics = &self.ctx.inner.diagnostics;
+        let threshold = if self.ctx.is_event_loop() {
+            diagnostics.options.event_loop_poll_threshold
+        } else {
+            diagnostics.options.worker_poll_threshold
+        };
+        let _operation = diagnostics.operation(
+            &self.record,
+            self.ctx.event_loop_id(),
+            "future_drop",
+            threshold,
+        );
         // Drop non-Send user state on its owning executor with its Context.
-        drop(self.future.take());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.future.take())));
+        if let Err(error) = result {
+            self.ctx
+                .report_error(&crate::error::panic_error_ref(error.as_ref()));
+            self.record.failed();
+            self.record.finish();
+            std::panic::resume_unwind(error);
+        }
+        self.record.finish();
     }
 }
 
@@ -455,7 +578,7 @@ mod tests {
             assert_eq!(Context::current().unwrap().deployment_id(), id);
             polls += 1;
             if polls == 2 {
-                Poll::Ready(())
+                Poll::Ready(Ok::<(), VertxError>(()))
             } else {
                 Poll::Pending
             }

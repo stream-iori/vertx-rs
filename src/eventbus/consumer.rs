@@ -42,6 +42,7 @@ impl<T: Send + 'static> Consumer<T> {
             _ = self.cancel.cancelled() => return None,
             r = self.rx.recv() => r?,
         };
+        env.trace.dequeue();
         env.typed(&self.address).ok()
     }
     pub fn address(&self) -> &str {
@@ -84,14 +85,21 @@ impl<T: Send + 'static> Consumer<T> {
         ctx.spawn_local(async move {
             while let Some(env) = self.recv().await {
                 // Catch each message separately so one panic does not kill the consumer.
-                let result =
-                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-                        handler(env).await
-                    }))
-                    .await
-                    .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
+                let trace = env.trace.clone();
+                let handler_span = trace.handler_span(&err_ctx);
+                let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    crate::task::TracedFuture::new(
+                        async { handler(env).await },
+                        trace.dispatch.clone(),
+                        handler_span.clone(),
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
                 if let Err(e) = result {
-                    err_ctx.report_error(&e);
+                    tracing::dispatcher::with_default(&trace.dispatch, || {
+                        handler_span.in_scope(|| err_ctx.report_error(&e))
+                    });
                 }
             }
             Ok(())
@@ -126,14 +134,21 @@ impl<T: Send + 'static> Consumer<T> {
         let err_ctx = ctx.clone();
         ctx.spawn(async move {
             while let Some(env) = self.recv().await {
-                let result =
-                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-                        handler(env).await
-                    }))
-                    .await
-                    .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
+                let trace = env.trace.clone();
+                let handler_span = trace.handler_span(&err_ctx);
+                let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    crate::task::TracedFuture::new(
+                        async { handler(env).await },
+                        trace.dispatch.clone(),
+                        handler_span.clone(),
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
                 if let Err(e) = result {
-                    err_ctx.report_error(&e);
+                    tracing::dispatcher::with_default(&trace.dispatch, || {
+                        handler_span.in_scope(|| err_ctx.report_error(&e))
+                    });
                 }
             }
             Ok(())

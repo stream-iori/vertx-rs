@@ -8,6 +8,10 @@ use std::time::Duration;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
+const PENDING: u8 = 0;
+const COMPLETED: u8 = 1;
+const CANCELLED: u8 = 2;
+
 /// One-shot future whose deadline is fixed at construction, even if first
 /// polled later. Cancellation wins when both branches are ready.
 pub struct Timer {
@@ -20,7 +24,7 @@ impl Timer {
     pub(crate) fn new(delay: Duration, scope: CancellationToken) -> Self {
         let deadline = Instant::now() + delay;
         let own = CancellationToken::new();
-        let state = Arc::new(AtomicU8::new(0));
+        let state = Arc::new(AtomicU8::new(PENDING));
         let (own_c, scope_c, state_c) = (own.clone(), scope.clone(), state.clone());
         let future = Box::pin(async move {
             let result = tokio::select! { biased;
@@ -28,7 +32,10 @@ impl Timer {
                 _ = scope_c.cancelled() => Err(VertxError::TimerCancelled),
                 _ = tokio::time::sleep_until(deadline) => Ok(()),
             };
-            state_c.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+            state_c.store(
+                if result.is_ok() { COMPLETED } else { CANCELLED },
+                Ordering::Release,
+            );
             result
         });
         Self {
@@ -41,15 +48,15 @@ impl Timer {
     pub fn cancel(&self) {
         if self
             .state
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             self.own.cancel();
         }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == 2
-            || self.state.load(Ordering::Acquire) == 0 && self.scope.is_cancelled()
+        self.state.load(Ordering::Acquire) == CANCELLED
+            || self.state.load(Ordering::Acquire) == PENDING && self.scope.is_cancelled()
     }
 }
 impl Future for Timer {
