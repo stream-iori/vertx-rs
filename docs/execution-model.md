@@ -39,7 +39,8 @@ poll(B): CURRENT=B → poll user B → restore
 poll(A): CURRENT=A → poll user A → restore
 ```
 
-Context 与物理线程身份分开记录。调用 execute_blocking 时：
+Context 与物理线程身份分开记录。`Context::threading_model()` 只返回 `EventLoop` 或 `Worker`；
+框架外代码的 `Context::current()` 为 None，不自动创建外部 Context。调用 execute_blocking 时：
 
 | 查询 | EventLoop 内 | 其 blocking 闭包内 | await 返回后 |
 |---|---|---|---|
