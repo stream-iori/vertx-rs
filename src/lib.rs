@@ -1,6 +1,6 @@
 //! vertx-rs 0.3: thread-affine deployments with asynchronous start/stop.
 //!
-//! See `DESIGN.md` for the design rationale.
+//! See `docs/index.md` in the repository for the design rationale.
 
 mod context;
 mod deployment;
