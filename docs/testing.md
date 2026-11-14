@@ -36,20 +36,26 @@
 | 多维组合 | 独立维度使用 `#[values(...)]`；有关联的输入和预期使用显式 case，避免无效组合 |
 | 每例初始化 | `#[fixture]` 提供独立 Vertx；有特殊线程数、诊断或关闭配置时在测试里显式 builder |
 | 每例清理 | 成功路径显式 `close().await` / 池 shutdown；Drop 只能尽力清理，不能替代异步等待 |
-| 嵌套测试组 | 文件内 `mod` 分组，保留现有源文件和 integration target |
+| 职责分组 | 通过外部 `mod` 按文件拆分，保留单一 integration target 和测试名称 |
 | 动态测试工厂 | 暂无运行时扫描文件或协议数据生成用例的需求；未来需要时单独评估自定义 harness |
 
 ```text
-tests/integration.rs
- ├─ support：独立实例 fixture、Verticle 适配、日志缓冲及可控 Sink
- ├─ configuration / lifecycle / shutdown
- ├─ context / worker / blocking
- ├─ eventbus / shared_state / timers
- └─ errors / diagnostics / tracing_propagation / streams
+tests/
+ ├─ integration.rs：仅声明职责模块，保留 integration target
+ └─ integration/
+      ├─ support.rs：独立 fixture、Verticle 适配、日志缓冲及可控 Sink
+      ├─ configuration.rs / lifecycle.rs / shutdown.rs
+      ├─ context.rs / worker.rs / blocking.rs
+      ├─ eventbus.rs / shared_state.rs / timers.rs
+      └─ errors.rs / diagnostics.rs / tracing_propagation.rs / streams.rs
 
 src/* 的 #[cfg(test)]：内部不变量，保留在实现所在模块
  └─ EventLoop / Worker 内再按调度、取消、关闭及 panic 恢复分组
 ```
+
+职责文件通过入口的 `#[path = "integration/…"] mod …;` 加载，不放在 tests 根目录作为独立 target。
+各模块显式导入所需类型和 support 帮助，不依赖入口的通配导入；测试名称仍是 `streams::…` 等原路径，
+现有 `cargo test --test integration streams::` 过滤命令不变。保留同一测试进程，避免重复编译辅助代码及改变 tracing 测试的进程隔离方式。
 
 fixture 不使用 `#[once]` 共享 Vertx、Context、runtime 或当前 Dispatch；每例持有独立资源。
 fixture 只消除重复创建，时序、消息、断言和清理保留在测试主体，公共帮助放 support；不增加统一动态类型场景执行器。
