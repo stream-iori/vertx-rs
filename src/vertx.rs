@@ -105,71 +105,122 @@ fn notify_started(ctx: &Context, ready: &mut Option<oneshot::Sender<Result<()>>>
     }
 }
 
-// Separate drivers retain the Worker Send bound and EventLoop !Send support.
-// Only lifecycle calls vary; synchronous outcome/notification work stays in functions.
-macro_rules! lifecycle_driver {
-    ($name:ident, $trait:ident) => {
-        async fn $name<V, F>(ctx: Context, factory: F, ready: oneshot::Sender<Result<()>>)
-        where
-            V: $trait,
-            F: FnOnce(Context) -> V,
-        {
-            ctx.inner
-                .diagnostics
-                .deployment(ctx.scope.deployment, DeploymentStage::Starting);
-            let mut ready = Some(ready);
-            let scope = ctx.scope.clone();
-            let created =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(ctx.clone())));
-            let mut outcome = Ok(());
-            let mut startup_failure = None;
-            match created {
-                Err(error) => outcome = Err(panic_error(error)),
-                Ok(mut verticle) => {
-                    let (start, panicked) = tokio::select! { biased;
-                        _ = scope.cancel.cancelled() => (
-                            Err(VertxError::DeploymentTerminated(scope.deployment)), false,
-                        ),
-                        result = std::panic::AssertUnwindSafe(verticle.start(ctx.clone()))
-                            .catch_unwind() => normalize_start(result),
-                    };
-                    if start.is_ok() && scope.running() {
-                        notify_started(&ctx, &mut ready);
-                        scope.cancel.cancelled().await;
-                    } else {
-                        startup_failure = Some(record_start_failure(start, &ctx, &mut outcome));
-                    }
-                    quiesce_deployment(&ctx).await;
-                    if !panicked {
-                        ctx.inner
-                            .diagnostics
-                            .deployment(scope.deployment, DeploymentStage::Stopping);
-                        let stop_ctx = ctx.for_stop();
-                        let stopped = std::panic::AssertUnwindSafe(
-                            stop_ctx.scope_future(verticle.stop(stop_ctx.clone())),
-                        )
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|error| Err(panic_error(error)));
-                        if let Err(error) = stopped {
-                            retain_failure(&mut outcome, error);
-                        }
-                    }
-                    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        drop(verticle);
-                    }));
-                    if let Err(error) = dropped {
-                        retain_failure(&mut outcome, panic_error(error));
-                    }
-                }
+// EventLoop lifecycle: the verticle and lifecycle futures may be !Send.
+async fn drive_local<V, F>(ctx: Context, factory: F, ready: oneshot::Sender<Result<()>>)
+where
+    V: Verticle,
+    F: FnOnce(Context) -> V,
+{
+    ctx.inner
+        .diagnostics
+        .deployment(ctx.scope.deployment, DeploymentStage::Starting);
+    let mut ready = Some(ready);
+    let scope = ctx.scope.clone();
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(ctx.clone())));
+    let mut outcome = Ok(());
+    let mut startup_failure = None;
+    match created {
+        Err(error) => outcome = Err(panic_error(error)),
+        Ok(mut verticle) => {
+            let (start, panicked) = tokio::select! { biased;
+                _ = scope.cancel.cancelled() => (
+                    Err(VertxError::DeploymentTerminated(scope.deployment)), false,
+                ),
+                result = std::panic::AssertUnwindSafe(verticle.start(ctx.clone()))
+                    .catch_unwind() => normalize_start(result),
+            };
+            if start.is_ok() && scope.running() {
+                notify_started(&ctx, &mut ready);
+                scope.cancel.cancelled().await;
+            } else {
+                startup_failure = Some(record_start_failure(start, &ctx, &mut outcome));
             }
             quiesce_deployment(&ctx).await;
-            finish_deployment(&ctx, outcome, startup_failure, ready);
+            if !panicked {
+                ctx.inner
+                    .diagnostics
+                    .deployment(scope.deployment, DeploymentStage::Stopping);
+                let stop_ctx = ctx.for_stop();
+                let stopped = std::panic::AssertUnwindSafe(
+                    stop_ctx.scope_future(verticle.stop(stop_ctx.clone())),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|error| Err(panic_error(error)));
+                if let Err(error) = stopped {
+                    retain_failure(&mut outcome, error);
+                }
+            }
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(verticle);
+            }));
+            if let Err(error) = dropped {
+                retain_failure(&mut outcome, panic_error(error));
+            }
         }
-    };
+    }
+    quiesce_deployment(&ctx).await;
+    finish_deployment(&ctx, outcome, startup_failure, ready);
 }
-lifecycle_driver!(drive_local, Verticle);
-lifecycle_driver!(drive_worker, WorkerVerticle);
+
+// Worker lifecycle: Send verticles/futures are scheduled by the fixed Worker pool.
+// Keep this explicit flow aligned with drive_local; helpers own shared bookkeeping.
+async fn drive_worker<V, F>(ctx: Context, factory: F, ready: oneshot::Sender<Result<()>>)
+where
+    V: WorkerVerticle,
+    F: FnOnce(Context) -> V,
+{
+    ctx.inner
+        .diagnostics
+        .deployment(ctx.scope.deployment, DeploymentStage::Starting);
+    let mut ready = Some(ready);
+    let scope = ctx.scope.clone();
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(ctx.clone())));
+    let mut outcome = Ok(());
+    let mut startup_failure = None;
+    match created {
+        Err(error) => outcome = Err(panic_error(error)),
+        Ok(mut verticle) => {
+            let (start, panicked) = tokio::select! { biased;
+                _ = scope.cancel.cancelled() => (
+                    Err(VertxError::DeploymentTerminated(scope.deployment)), false,
+                ),
+                result = std::panic::AssertUnwindSafe(verticle.start(ctx.clone()))
+                    .catch_unwind() => normalize_start(result),
+            };
+            if start.is_ok() && scope.running() {
+                notify_started(&ctx, &mut ready);
+                scope.cancel.cancelled().await;
+            } else {
+                startup_failure = Some(record_start_failure(start, &ctx, &mut outcome));
+            }
+            quiesce_deployment(&ctx).await;
+            if !panicked {
+                ctx.inner
+                    .diagnostics
+                    .deployment(scope.deployment, DeploymentStage::Stopping);
+                let stop_ctx = ctx.for_stop();
+                let stopped = std::panic::AssertUnwindSafe(
+                    stop_ctx.scope_future(verticle.stop(stop_ctx.clone())),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|error| Err(panic_error(error)));
+                if let Err(error) = stopped {
+                    retain_failure(&mut outcome, error);
+                }
+            }
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(verticle);
+            }));
+            if let Err(error) = dropped {
+                retain_failure(&mut outcome, panic_error(error));
+            }
+        }
+    }
+    quiesce_deployment(&ctx).await;
+    finish_deployment(&ctx, outcome, startup_failure, ready);
+}
 
 impl Vertx {
     pub(crate) fn from_inner(inner: Arc<VertxInner>) -> Self {

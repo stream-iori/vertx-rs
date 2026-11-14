@@ -18,6 +18,7 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 
 - deploy 的 Send factory 在目标 EventLoop 上创建实例；实例本身不必 Send。
 - deploy_worker 同样接收 factory，worker 实例和异步生命周期要求 Send。
+- 两种生命周期分别由普通异步函数 drive_local / drive_worker 编排，保留各自 Send/!Send 约束；清理、通知和错误处理复用辅助函数。
 - **deploy 返回成功表示异步 start 已完成**。start 返回后，部署继续存活，等待撤销。
 - 主消息循环通过 Context 启动受管任务。一个任务自然结束不会自动撤销整个部署。
 - 部署记录在启动之前登记；取消 deploy Future 会触发撤销，后台继续清理。
