@@ -24,7 +24,7 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 - start 返回 Err 时仍尝试 stop；factory/start panic 时跳过用户 stop，执行框架清理。
 - stop 错误及 panic 会被返回/报告，资源清理仍继续。每个实例最多执行一次 stop。
 - deploy_with 保留 Vec<DeploymentId> 返回形态；中途失败或调用被取消，撤销本批先前实例。
-- typed config 使用 Arc<C> 传给各实例 factory；instances(0) 沿用归一化为 1 的行为。
+- typed config 使用 Arc<C> 传给各实例 factory；instances(0) 会归一化为 1。
 
 ## 受管任务
 
@@ -35,7 +35,7 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 | run_on_context(future) → Result<TaskHandle<()>> | Send Future，异步入队；外部线程也能调用 |
 | execute_blocking(f) | 默认 ordered=true |
 | execute_blocking_with(f, ordered) | false 允许同 Context 多个阻塞操作并行 |
-| execute_blocking_unordered(f) | 等价于 execute_blocking_with(f, false)，保留原接口 |
+| execute_blocking_unordered(f) | 等价于 execute_blocking_with(f, false) |
 | request_undeploy() | 不等待自身结束，适合在本部署任务内发起撤销 |
 
 TaskHandle<T> 的 await 输出为 Result<T>，无需嵌套 await??。

@@ -37,10 +37,6 @@ Future wake → 合并重复通知 → 所属 Context 就绪队列
 已 spawn 的任务独立运行，丢弃其 TaskHandle 仅分离等待者；需要取消时显式 abort，或撤销所属部署。
 select_ok 返回的剩余 Future 由调用方决定继续等待或丢弃。空集合及 Unpin 等约束遵循 futures 原始 API。
 
-本轮不提供旧 API 兼容层：删除 blocking_threads / blocking_thread_count，统一由 worker_threads 配置线程数；
-spawn/spawn_local 返回 TaskHandle<()>，原 handle.await?? 改为 handle.await?；
-run_on_context 接收 Future，原同步闭包改成 async { ...; Ok(()) }。
-
 ## 相关主题
 
 [执行模型与 Context](execution-model.md)、[Timer 与配置](timers-and-config.md)。

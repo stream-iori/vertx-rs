@@ -24,7 +24,7 @@
 | 清理进度 | 部署 queued/starting/running/quiescing/stopping；close 的 deployments/blocking/worker_join/event_loop_join/closed/failed |
 
 部署与关闭的诊断阶段在内部使用私有枚举；只在快照与日志输出时转换为既有字符串。
-Stopped 阶段按枚举移除部署记录；公开快照字段、阶段取值和日志字段保持兼容。
+Stopped 阶段按枚举移除部署记录。
 
 诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
 任务销毁时删除详情；晚到的 wake 不复活记录。未采集的任务不会为了补齐列表而被保留。

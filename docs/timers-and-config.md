@@ -25,11 +25,8 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 
 ## 工具链与依赖
 
-
-最低 Rust 1.96、Edition 2024、Cargo resolver 3；库版本保持 0.3.0。
+最低 Rust 1.96、Edition 2024、Cargo resolver 3；库版本为 0.3.0。
 VertxBuilder、DeploymentOptions、DeliveryOptions、ConsumerOptions 标记 must_use，避免丢弃配置结果。
-本轮只新增 try_build 与 execute_blocking_unordered；不为已有枚举/公开字段结构体添加 non_exhaustive，
-保留旧签名、结构体构造和穷尽匹配的兼容性。
 直接依赖最低版本为 Tokio 1.54.0、tokio-util 0.7.20、async-trait 0.1.92、thiserror 2.0.21、
 futures 0.3.34、dashmap 6.2.1、tracing 0.1.44；示例/测试使用 tracing-subscriber 0.3.23 的 env-filter/json。
 普通依赖仍只启用 Tokio rt/sync/macros/time；开发依赖启用 full/test-util。保留 async-trait。

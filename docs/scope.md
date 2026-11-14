@@ -30,4 +30,4 @@ Java 虚拟线程、动态部署、旧式按 ID 取消 Timer 和 metrics 服务�
 
 ## 相关主题
 
-[执行模型与 Context](execution-model.md)、[从 0.2 迁移](migration.md)。
+[执行模型与 Context](execution-model.md)、[示例与共享状态](examples.md)。

@@ -13,14 +13,14 @@
 | [Stream、Sink 与背压传输](streams.md) | Consumer Stream、MessageSink、pipe 与背压 |
 | [Timer 与配置](timers-and-config.md) | Timer、默认配置、blocking 顺序及工具链依赖 |
 | [错误与可观测性](diagnostics.md) | 错误聚合、诊断快照、日志、耗时及 panic 边界 |
-| [从 0.2 迁移](migration.md) | API 迁移、共享状态建议及示例介绍 |
+| [示例与共享状态](examples.md) | 示例介绍及共享状态建议 |
 | [与 Vert.x 5 的对照与范围](scope.md) | 能力对照、范围边界及官方语义依据 |
 | [原生 Worker 调度与 Future 组合](worker-and-futures.md) | Worker 调度、wake 合并及 Future 组合语义 |
 | [验收与测试组织](testing.md) | 验收要求、测试分组、fixture 及常用命令 |
 
 ## 建议阅读顺序
 
-- **初次了解**：[范围与对照](scope.md) → [执行模型](execution-model.md) → [生命周期](lifecycle.md) → [消息通信](eventbus.md) → [示例与迁移](migration.md)。
+- **初次了解**：[范围与对照](scope.md) → [执行模型](execution-model.md) → [生命周期](lifecycle.md) → [消息通信](eventbus.md) → [示例与共享状态](examples.md)。
 - **开发维护**：按下表进入对应主题，再核对[验收与测试要求](testing.md)。
 
 | 修改内容 | 优先阅读 |
@@ -35,6 +35,7 @@
 ## 维护约定
 
 - 设计正文按主题维护，公共 API 或执行语义变化时同步更新对应主题。
+- 项目当前没有使用者，不承担历史版本兼容和迁移要求；文档只描述当前设计与用法。
 - 版本、Edition、MSRV 与依赖特性以 [Cargo.toml](../Cargo.toml) 为准。
 - 修改实现前先阅读[开发约定](../AGENTS.md)和相关主题，测试安排见[验收与测试组织](testing.md)。
-- 根目录 [DESIGN.md](../DESIGN.md) 保留为旧入口。
+- 根目录 [DESIGN.md](../DESIGN.md) 提供文档导航入口。

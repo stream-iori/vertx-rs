@@ -74,7 +74,7 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - `VertxBuilder::try_build() -> Result<Vertx>` 在创建线程前校验线程数与 shutdown_grace，零值返回 InvalidOptions。
   线程/runtime 创建失败以 Other 保留阶段与底层错误文本；后续回收失败使用 LifecycleFailed 保留首错与 cleanup。
   EventLoop 部分启动失败、或 Worker 初始化失败，均在返回错误前停止并 join 已创建线程。
-  `build()` 委托 try_build，仍在失败时 panic；new/Default 保留原使用方式。
+  `build()` 委托 try_build，失败时 panic；new/Default 使用默认配置构建实例。
 - 普通依赖不启用 Tokio rt-multi-thread；tokio-util 继续用于 CancellationToken、TaskTracker 等工具。
 - 本轮只验证派发结构与执行语义，不提供未经测量的性能提升数字。
 
