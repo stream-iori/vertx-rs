@@ -32,3 +32,27 @@ path = "examples/pipeline.rs"
 [[example]]
 name = "verticle_to_verticle"
 path = "examples/verticle_to_verticle.rs"
+
+[[example]]
+name = "bounded_mailbox"
+path = "examples/bounded_mailbox.rs"
+
+[[example]]
+name = "deployment_rollback"
+path = "examples/deployment_rollback.rs"
+
+[[example]]
+name = "external_dispatch"
+path = "examples/external_dispatch.rs"
+
+[[example]]
+name = "graceful_shutdown"
+path = "examples/graceful_shutdown.rs"
+
+[[example]]
+name = "deferred_reply"
+path = "examples/deferred_reply.rs"
+
+[[example]]
+name = "error_handling"
+path = "examples/error_handling.rs"
