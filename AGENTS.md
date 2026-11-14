@@ -30,7 +30,7 @@ Rust Future + 固定 OS Worker 线程池 + Tokio IO 驱动实现 Vert.x 5 的单
 | `src/timer.rs` | 单次和周期定时、deadline、取消 |
 | `src/error.rs`、`src/lib.rs` | 结构化错误和公共导出 |
 | `tests/integration.rs` | 按职责分组的对外行为与并发回归，support 提供独立 fixture；源码模块内单测覆盖内部不变量 |
-| `examples/` | `ping_pong`、`pipeline`、`verticle_to_verticle`，均显式关闭实例 |
+| `examples/` | 请求与心跳、配置化流水线、服务组合与任务管理；运行说明见 [示例指南](docs/examples.md)，均显式关闭实例 |
 
 ## 必须保持的执行语义
 

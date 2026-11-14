@@ -5,7 +5,9 @@
 //! 运行：RUST_LOG=vertx_rs=debug cargo run --example ping_pong
 //! LOG_FORMAT=json 可输出 JSON 日志；预期：pong#1、recipient_failure、timeout、stop。
 //! 超时不会撤回已入队消息；同步慢操作必须放进 execute_blocking。
+//! 三次周期心跳广播给两个订阅者；定时器取消不会撤销 Pinger 部署。
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,6 +21,18 @@ impl Verticle for Pinger {
         let count = self.count.clone();
         let thread = std::thread::current().id();
         println!("start {} on {thread:?}", ctx.id());
+        let heartbeat_ctx = ctx.clone();
+        ctx.spawn_local(async move {
+            let mut timer = heartbeat_ctx.periodic(Duration::ZERO, Duration::from_millis(10))?;
+            for tick in 1..=3u32 {
+                timer.tick().await?;
+                heartbeat_ctx.event_bus().publish("heartbeat", tick)?;
+            }
+            timer.cancel();
+            assert!(timer.is_cancelled());
+            println!("heartbeat timer cancelled after 3 ticks");
+            Ok(())
+        })?;
         ctx.event_bus()
             .consumer::<String>("ping")?
             .handler(move |env| {
@@ -61,11 +75,22 @@ impl Verticle for Pinger {
     }
 }
 async fn run(vx: &Vertx) -> Result<()> {
+    // 先订阅再启动生产者。publish 不等待空位；此处容量足以容纳全部三条。
+    let bus = vx.event_bus();
+    let monitor = bus.consumer::<u32>("heartbeat")?;
+    let audit = bus.consumer::<u32>("heartbeat")?;
     vx.deploy(|_| Pinger {
         count: Rc::new(Cell::new(0)),
     })
     .await?;
-    let bus = vx.event_bus();
+    let (monitor_ticks, audit_ticks): (Vec<u32>, Vec<u32>) = futures::try_join!(
+        monitor.take(3).map_ok(|env| env.into_body()).try_collect(),
+        audit.take(3).map_ok(|env| env.into_body()).try_collect(),
+    )?;
+    assert_eq!(monitor_ticks, [1, 2, 3]);
+    assert_eq!(monitor_ticks, audit_ticks);
+    println!("heartbeat broadcast: monitor={monitor_ticks:?}, audit={audit_ticks:?}");
+    // 心跳任务已结束，但 start 返回后的部署仍然可以处理请求。
     let reply = bus
         .request_message_with::<_, String>(
             "ping",
@@ -133,7 +158,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(2)
-        .build();
+        .try_build()?;
     let outcome = tokio::time::timeout(Duration::from_secs(5), run(&vx))
         .await
         .unwrap_or_else(|_| Err(VertxError::Timeout(Duration::from_secs(5))));

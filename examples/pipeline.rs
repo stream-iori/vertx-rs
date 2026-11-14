@@ -5,13 +5,14 @@
 //! Source 使用 pipe_to，Sink 使用 Stream::take 定义有限传输；小容量队列向上游传递背压。
 //! ordered 只保证同来源 Context 的 blocking FIFO，不保证全流水线输出顺序。
 //! handler 等待上一条处理结束后才消费下一条；增加消费者才会增加消息并行度。
+//! deploy_with 用同一份强类型配置部署两个 Hasher；结果按 seed 排序后展示。
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    ConsumerOptions, Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError,
-    WorkerVerticle, pipe_to,
+    ConsumerOptions, Context, DeploymentOptions, DiagnosticsOptions, Result, Verticle, Vertx,
+    VertxError, WorkerVerticle, pipe_to,
 };
 struct Source;
 #[async_trait(?Send)]
@@ -31,10 +32,16 @@ fn checksum(seed: u64) -> u64 {
         hash.rotate_left(5).wrapping_add(value ^ seed)
     })
 }
-struct Hasher;
+struct HashConfig {
+    salt: u64,
+}
+struct Hasher {
+    salt: u64,
+}
 #[async_trait(?Send)]
 impl Verticle for Hasher {
     async fn start(&mut self, ctx: Context) -> Result<()> {
+        let salt = self.salt;
         ctx.event_bus()
             .consumer_with::<u64>("hash", ConsumerOptions::new().with_capacity(1))?
             .handler(move |env| {
@@ -43,8 +50,8 @@ impl Verticle for Hasher {
                     let seed = env.into_body();
                     // 两个 Future 同时等待：有序与无序 blocking 都进同一个固定 Worker 池。
                     let (ordered, unordered) = futures::try_join!(
-                        ctx.execute_blocking(move || checksum(seed)),
-                        ctx.execute_blocking_with(move || checksum(seed), false),
+                        ctx.execute_blocking(move || checksum(seed ^ salt)),
+                        ctx.execute_blocking_unordered(move || checksum(seed ^ salt)),
                     )?;
                     assert_eq!(ordered, unordered);
                     ctx.event_bus().send("sink", (seed, ordered)).await
@@ -79,8 +86,19 @@ impl WorkerVerticle for Sink {
 async fn run(vx: &Vertx) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     vx.deploy_worker(|_| Sink { done: Some(tx) }).await?;
-    vx.deploy(|_| Hasher).await?;
-    vx.deploy(|_| Hasher).await?;
+    let config = HashConfig { salt: 0x5a5a };
+    let salt = config.salt;
+    let hashers = vx
+        .deploy_with(
+            |_, config| Hasher { salt: config.salt },
+            DeploymentOptions::new().instances(2).config(config),
+        )
+        .await?;
+    assert_eq!(hashers.len(), 2);
+    println!(
+        "deployed {} hashers with shared salt={salt:#x}",
+        hashers.len()
+    );
     vx.deploy(|_| Source).await?;
     print_snapshot("running", vx);
     let mut results = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -89,7 +107,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         .map_err(|_| VertxError::ReplyClosed)?;
     results.sort();
     for &(seed, hash) in &results {
-        assert_eq!(checksum(seed), hash);
+        assert_eq!(checksum(seed ^ salt), hash);
     }
     println!("sink got: {results:?}");
     Ok(())
@@ -172,11 +190,17 @@ async fn main() -> Result<()> {
             max_task_details: 32,
             ..Default::default()
         })
-        .build();
+        .try_build()?;
     let outcome = tokio::time::timeout(Duration::from_secs(5), run(&vx))
         .await
         .unwrap_or_else(|_| Err(VertxError::Timeout(Duration::from_secs(5))));
     let result = finish(&vx, outcome).await;
     print_snapshot("closed", &vx);
+    if result.is_ok() {
+        let snapshot = vx.diagnostics();
+        assert_eq!(snapshot.active_deployments, 0);
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.active_consumers, 0);
+    }
     result
 }
