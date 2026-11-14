@@ -4,6 +4,8 @@
 
 ## 验收
 
+以下是整体行为要求，每次修改按涉及的风险选择回归场景；必跑检查见 [AGENTS.md](../AGENTS.md)。
+
 - 同一个 EventLoop 上多 Context 交替 await 不串线；跨 OS 线程 poll 后 TLS 不残留。
 - 普通 Verticle 的 factory/start/handler/受管任务/stop/析构始终位于所属 OS 线程与 Context。
 - Worker 同 Context 最大普通并行 poll 数为 1，不同 Context 可以并行。
@@ -50,12 +52,27 @@ src/* 的 #[cfg(test)]：内部不变量，保留在实现所在模块
 ```
 
 fixture 不使用 `#[once]` 共享 Vertx、Context、runtime 或当前 Dispatch；每例持有独立资源。
-fixture 只消除重复创建，时序、消息、断言和清理保留在测试主体；不增加统一动态类型场景执行器。
+fixture 只消除重复创建，时序、消息、断言和清理保留在测试主体，公共帮助放 support；不增加统一动态类型场景执行器。
 `#[rstest]` 放在 `#[tokio::test]` 之前，`start_paused` 等属性继续显式写在 Tokio 入口上。
 保留 barrier/channel 握手、重复 wake 和注册竞争压力循环：它们构成同一个并发场景，不能拆成彼此独立的 case。
-不为压缩行数把 !Send 测试改成 Send，不用自动重试或放宽断言掩盖时序问题。
+不为压缩行数把 !Send 测试改成 Send。
 
-常用命令（名称过滤为子串匹配）：
+## 测试编写与验证
+
+- 并发时序使用 channel、barrier 或明确的就绪信号，不仅靠 sleep 碰竞态。
+- 线程亲和性同时检查实际 `ThreadId` 和 Context；Worker 迁移使用可控的跨线程 poll 验证，不假定执行器必定迁移。
+- Timer 优先用暂停时间测试；与独立 runtime 配合时明确控制虚拟时间推进，或在关闭前恢复时间。
+- 测试使用小线程池，同时覆盖同 Context 串行与不同 Context 并行。
+- 简单无参数用例可用原生 test，不必强制添加 rstest。
+- 按修改风险补充失败、panic、取消、析构、满队列、超时及注册/清扫或关闭竞争的回归。
+- 文档示例必须实际编译，不用 ignore、放宽断言、关闭 lint 或自动重试掩盖问题。
+- `cargo test --all-targets` 可验证全部 Cargo target；示例零测试 harness 通过不能替代实际运行示例。
+- 区分断言失败、超时与环境拦截，准确报告实际执行的命令和结果，不绕过验证。当前工具链通过不代表 MSRV 已验证。
+- 已通过的检查只在新增改动、失败或未解决疑点需要时补验。
+
+## 常用命令
+
+名称过滤为子串匹配：
 
 ```sh
 cargo test --test integration -- --list
