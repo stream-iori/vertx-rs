@@ -6,6 +6,55 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeploymentStage {
+    Queued,
+    Starting,
+    Running,
+    Quiescing,
+    Stopping,
+    Stopped,
+}
+impl DeploymentStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Quiescing => "quiescing",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CloseStage {
+    #[default]
+    Running,
+    Disabled,
+    Deployments,
+    Blocking,
+    WorkerJoin,
+    EventLoopJoin,
+    Closed,
+    Failed,
+}
+impl CloseStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Disabled => "disabled",
+            Self::Deployments => "deployments",
+            Self::Blocking => "blocking",
+            Self::WorkerJoin => "worker_join",
+            Self::EventLoopJoin => "event_loop_join",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Lightweight counters and current synchronous operations are enabled by default.
 /// Task and queue details are opt-in with bounded snapshot output; no history
 /// is retained. Queue summary metadata scales with registered consumers.
@@ -140,7 +189,8 @@ struct State {
     details: HashMap<TaskId, (TaskSnapshot, Instant)>,
     queues: HashMap<u64, Weak<QueueStats>>,
     threads: HashMap<std::thread::ThreadId, ThreadSnapshot>,
-    deployments: HashMap<DeploymentId, &'static str>,
+    deployments: HashMap<DeploymentId, DeploymentStage>,
+    close_stage: CloseStage,
 }
 pub(crate) struct Diagnostics {
     pub instance: u64,
@@ -152,13 +202,7 @@ impl Diagnostics {
         Arc::new(Self {
             instance,
             options,
-            state: Mutex::new(State {
-                summary: DiagnosticsSnapshot {
-                    close_stage: "running",
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
+            state: Mutex::new(State::default()),
         })
     }
     pub fn register_queue(
@@ -215,9 +259,12 @@ impl Diagnostics {
         let mut out = state.summary.clone();
         out.enabled = self.options.enabled;
         out.instance_id = self.instance;
-        if !out.enabled {
-            out.close_stage = "disabled";
+        out.close_stage = if out.enabled {
+            state.close_stage
+        } else {
+            CloseStage::Disabled
         }
+        .as_str();
         out.tasks = state
             .details
             .values()
@@ -236,7 +283,7 @@ impl Diagnostics {
             .iter()
             .map(|(&deployment_id, &stage)| DeploymentSnapshot {
                 deployment_id,
-                stage,
+                stage: stage.as_str(),
             })
             .collect();
         for stats in state.queues.values().filter_map(Weak::upgrade) {
@@ -253,25 +300,29 @@ impl Diagnostics {
         out.active_deployments = out.deployments.len();
         out
     }
-    pub fn deployment(&self, id: DeploymentId, stage: &'static str) {
+    pub fn deployment(&self, id: DeploymentId, stage: DeploymentStage) {
         if !self.options.enabled {
             return;
         }
         let mut state = self.state.lock().unwrap();
-        if stage == "stopped" {
+        if stage == DeploymentStage::Stopped {
             state.deployments.remove(&id);
         } else {
             state.deployments.insert(id, stage);
         }
         drop(state);
-        tracing::debug!(instance_id = self.instance, deployment_id = %id, stage, "deployment stage");
+        tracing::debug!(instance_id = self.instance, deployment_id = %id, stage = stage.as_str(), "deployment stage");
     }
-    pub fn close_stage(&self, stage: &'static str) {
+    pub fn close_stage(&self, stage: CloseStage) {
         if !self.options.enabled {
             return;
         }
-        self.state.lock().unwrap().summary.close_stage = stage;
-        tracing::debug!(instance_id = self.instance, stage, "close stage");
+        self.state.lock().unwrap().close_stage = stage;
+        tracing::debug!(
+            instance_id = self.instance,
+            stage = stage.as_str(),
+            "close stage"
+        );
     }
     pub fn consumer(&self, delta: isize) {
         if self.options.enabled {

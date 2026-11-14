@@ -7,10 +7,8 @@
 //! 已 spawn 的任务独立运行，丢弃 TaskHandle 不会取消，需 abort 或 undeploy。
 //! 未获选服务的迟到回复可能返回 ReplyClosed；服务显式处理这个预期结果。
 use async_trait::async_trait;
-use futures::{
-    future::{join_all, select_ok, try_join_all},
-    FutureExt,
-};
+use futures::FutureExt;
+use futures::future::{join_all, select_ok, try_join_all};
 use std::time::Duration;
 use vertx_rs::{Context, DeliveryOptions, Result, Verticle, Vertx, VertxError};
 fn allow_late_reply(result: Result<()>) -> Result<()> {

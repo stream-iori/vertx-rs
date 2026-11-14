@@ -30,7 +30,7 @@ pub use eventbus::{
     ReplyHandle,
 };
 pub use eventloop::EventLoopId;
-pub use streams::{pipe_to, pipe_to_with, PipeOptions};
+pub use streams::{PipeOptions, pipe_to, pipe_to_with};
 pub use task::{TaskAbortHandle, TaskHandle, TaskId};
 pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};

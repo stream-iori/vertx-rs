@@ -1,8 +1,8 @@
-use crate::context::{set_thread, ThreadIdentity};
-use crate::error::panic_error;
 use crate::TaskHandle;
+use crate::context::{ThreadIdentity, set_thread};
+use crate::error::{panic_error, retain_failure};
 use crate::{Result, VertxError};
-use futures::task::{waker_ref, ArcWake};
+use futures::task::{ArcWake, waker_ref};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use tokio::runtime::Handle;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{Notify, oneshot};
 
 struct WorkerControl {
     task: Weak<Task>,
@@ -114,10 +114,8 @@ impl Task {
                 true
             }
         };
-        if enqueue {
-            if let Some(pool) = self.pool.upgrade() {
-                pool.enqueue(self.clone());
-            }
+        if enqueue && let Some(pool) = self.pool.upgrade() {
+            pool.enqueue(self.clone());
         }
     }
     fn run(self: &Arc<Self>, pool: &Core) {
@@ -275,7 +273,7 @@ pub(crate) struct WorkerPool {
     exited: Arc<Notify>,
 }
 impl WorkerPool {
-    pub fn new(threads: usize, instance: u64) -> std::io::Result<Self> {
+    pub fn new(threads: usize, instance: u64) -> Result<Self> {
         assert!(threads > 0, "worker thread count must be > 0");
         let core = Arc::new(Core {
             state: Mutex::new(PoolState {
@@ -301,10 +299,15 @@ impl WorkerPool {
                 Err(error) => {
                     core.state.lock().unwrap().closing = true;
                     core.available.notify_all();
+                    let mut outcome = Err(VertxError::Other(format!(
+                        "failed to initialize worker pool: {error}"
+                    )));
                     for handle in handles {
-                        let _ = handle.join();
+                        if let Err(error) = handle.join() {
+                            retain_failure(&mut outcome, panic_error(error));
+                        }
                     }
-                    return Err(error);
+                    return Err(outcome.expect_err("initialization failure retains its cause"));
                 }
             }
         }

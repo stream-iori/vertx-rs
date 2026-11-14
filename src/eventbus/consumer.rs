@@ -1,7 +1,8 @@
 use super::envelope::ErasedEnvelope;
 use super::inner::{EventBusInner, QueueState, SubscriberId};
 use crate::{Context, Envelope, Result, VertxError};
-use futures::{stream::FusedStream, Stream, StreamExt};
+use futures::stream::FusedStream;
+use futures::{Stream, StreamExt};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -88,36 +89,14 @@ impl<T: Send + 'static> Consumer<T> {
     /// })?;
     /// # Ok(()) } }
     /// ```
-    pub fn handler<F, Fut>(mut self, mut handler: F) -> Result<()>
+    pub fn handler<F, Fut>(self, handler: F) -> Result<()>
     where
         F: FnMut(Envelope<T>) -> Fut + 'static,
         Fut: Future<Output = Result<()>> + 'static,
     {
         let ctx = self.handler_context()?;
         ctx.check_local()?;
-        let err_ctx = ctx.clone();
-        ctx.spawn_local(async move {
-            while let Some(env) = self.next_for_handler(&err_ctx).await {
-                // Catch each message separately so one panic does not kill the consumer.
-                let trace = env.trace.clone();
-                let handler_span = trace.handler_span(&err_ctx);
-                let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                    crate::task::TracedFuture::new(
-                        async { handler(env).await },
-                        trace.dispatch.clone(),
-                        handler_span.clone(),
-                    ),
-                ))
-                .await
-                .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
-                if let Err(e) = result {
-                    tracing::dispatcher::with_default(&trace.dispatch, || {
-                        handler_span.in_scope(|| err_ctx.report_error(&e))
-                    });
-                }
-            }
-            Ok(())
-        })?;
+        ctx.spawn_local(self.dispatch_messages(ctx.clone(), handler))?;
         Ok(())
     }
     /// Worker counterpart; the closure and its future must be Send.
@@ -136,7 +115,7 @@ impl<T: Send + 'static> Consumer<T> {
     ///     }
     /// }
     /// ```
-    pub fn handler_worker<F, Fut>(mut self, mut handler: F) -> Result<()>
+    pub fn handler_worker<F, Fut>(self, handler: F) -> Result<()>
     where
         F: FnMut(Envelope<T>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -145,28 +124,35 @@ impl<T: Send + 'static> Consumer<T> {
         if !ctx.is_worker() {
             return Err(VertxError::ContextMismatch);
         }
-        let err_ctx = ctx.clone();
-        ctx.spawn(async move {
-            while let Some(env) = self.next_for_handler(&err_ctx).await {
-                let trace = env.trace.clone();
-                let handler_span = trace.handler_span(&err_ctx);
-                let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                    crate::task::TracedFuture::new(
-                        async { handler(env).await },
-                        trace.dispatch.clone(),
-                        handler_span.clone(),
-                    ),
-                ))
-                .await
-                .unwrap_or_else(|e| Err(crate::error::panic_error(e)));
-                if let Err(e) = result {
-                    tracing::dispatcher::with_default(&trace.dispatch, || {
-                        handler_span.in_scope(|| err_ctx.report_error(&e))
-                    });
-                }
+        ctx.spawn(self.dispatch_messages(ctx.clone(), handler))?;
+        Ok(())
+    }
+    // Concrete captures determine Send: local handlers remain free to use !Send
+    // state while Worker handlers are checked by Context::spawn.
+    async fn dispatch_messages<F, Fut>(mut self, ctx: Context, mut handler: F) -> Result<()>
+    where
+        F: FnMut(Envelope<T>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        while let Some(env) = self.next_for_handler(&ctx).await {
+            let trace = env.trace.clone();
+            let handler_span = trace.handler_span(&ctx);
+            // Catch each message separately so one panic does not kill the consumer.
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                crate::task::TracedFuture::new(
+                    async { handler(env).await },
+                    trace.dispatch.clone(),
+                    handler_span.clone(),
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| Err(crate::error::panic_error(error)));
+            if let Err(error) = result {
+                tracing::dispatcher::with_default(&trace.dispatch, || {
+                    handler_span.in_scope(|| ctx.report_error(&error))
+                });
             }
-            Ok(())
-        })?;
+        }
         Ok(())
     }
 }

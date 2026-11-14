@@ -10,8 +10,8 @@ use futures::{StreamExt, TryStreamExt};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    pipe_to, ConsumerOptions, Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError,
-    WorkerVerticle,
+    ConsumerOptions, Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError,
+    WorkerVerticle, pipe_to,
 };
 struct Source;
 #[async_trait(?Send)]

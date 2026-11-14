@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+#[must_use = "options take effect only when passed to an operation"]
 pub struct DeploymentOptions<C = ()> {
     instances: usize,
     config: Arc<C>,
@@ -39,6 +40,7 @@ impl DeploymentOptions<()> {
 impl<C> DeploymentOptions<C> {
     /// Deploy this many instances of the verticle. Each instance gets its
     /// own `Context` (picked round-robin across EventLoops). Default is 1.
+    /// Zero is normalized to one for compatibility.
     pub fn instances(mut self, n: usize) -> Self {
         self.instances = n.max(1);
         self

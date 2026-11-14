@@ -51,6 +51,10 @@ Context 与物理线程身份分开记录。调用 execute_blocking 时：
 | is_on_event_loop_thread() | true | false | true |
 | is_on_worker_thread() | false | true | false |
 
+用户 Future 析构仍在 Context 执行门内完成；若析构 panic，先完成诊断并正常释放 Context、
+Dispatch、Span 和执行门，再向外层执行器恢复展开，避免用户 panic 使执行门中毒。
+执行门中毒视为框架内部故障，不取出中毒锁继续执行。
+
 EventLoop 初始化记录实例 ID、EventLoop ID 和实际 ThreadId，受管 poll 校验物理位置。
 Worker 原生线程启动/退出时设置和清除物理线程类型。
 
@@ -70,6 +74,10 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - 早到的 abort 不会丢失；取消、未首次 poll 的 Future 析构和 panic 清理都在目标线程完成。
 - 命令每处理最多 64 条主动让出执行权。命令队列沿用无界方式，不增加背压 API。
 - 创建实例等待全部 EventLoop 就绪，记录实际 ThreadId 和 runtime Handle；部分启动失败时回收已创建线程。
+- `VertxBuilder::try_build() -> Result<Vertx>` 在创建线程前校验线程数与 shutdown_grace，零值返回 InvalidOptions。
+  线程/runtime 创建失败以 Other 保留阶段与底层错误文本；后续回收失败使用 LifecycleFailed 保留首错与 cleanup。
+  EventLoop 部分启动失败、或 Worker 初始化失败，均在返回错误前停止并 join 已创建线程。
+  `build()` 委托 try_build，仍在失败时 panic；new/Default 保留原使用方式。
 - 普通依赖不启用 Tokio rt-multi-thread；tokio-util 继续用于 CancellationToken、TaskTracker 等工具。
 - 本轮只验证派发结构与执行语义，不提供未经测量的性能提升数字。
 
@@ -97,7 +105,7 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 - start 返回 Err 时仍尝试 stop；factory/start panic 时跳过用户 stop，执行框架清理。
 - stop 错误及 panic 会被返回/报告，资源清理仍继续。每个实例最多执行一次 stop。
 - deploy_with 保留 Vec<DeploymentId> 返回形态；中途失败或调用被取消，撤销本批先前实例。
-- typed config 使用 Arc<C> 传给各实例 factory。
+- typed config 使用 Arc<C> 传给各实例 factory；instances(0) 沿用归一化为 1 的行为。
 
 ### 2.1 受管任务
 
@@ -108,6 +116,7 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 | run_on_context(future) → Result<TaskHandle<()>> | Send Future，异步入队；外部线程也能调用 |
 | execute_blocking(f) | 默认 ordered=true |
 | execute_blocking_with(f, ordered) | false 允许同 Context 多个阻塞操作并行 |
+| execute_blocking_unordered(f) | 等价于 execute_blocking_with(f, false)，保留原接口 |
 | request_undeploy() | 不等待自身结束，适合在本部署任务内发起撤销 |
 
 TaskHandle<T> 的 await 输出为 Result<T>，无需嵌套 await??。
@@ -261,6 +270,9 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 | 线程当前操作 | OS ThreadId、ContextId、TaskId、物理 EventLoopId、操作及开始时间；只列正在执行的受管 poll/drop/blocking |
 | 清理进度 | 部署 queued/starting/running/quiescing/stopping；close 的 deployments/blocking/worker_join/event_loop_join/closed/failed |
 
+部署与关闭的诊断阶段在内部使用私有枚举；只在快照与日志输出时转换为既有字符串。
+Stopped 阶段按枚举移除部署记录；公开快照字段、阶段取值和日志字段保持兼容。
+
 诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
 任务销毁时删除详情；晚到的 wake 不复活记录。未采集的任务不会为了补齐列表而被保留。
 消费者数量指有效路由订阅；scope 清扫、close 与 Consumer Drop 不重复扣减。
@@ -292,6 +304,13 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 容量按消息数量计算，待发送 Future、单条消息大小及任务数量均没有全局上限，不能据此宣称整个进程内存有界。
 日志细节主要在 debug/trace；开启这些级别会增加开销，不承诺未经测量的性能提升。
 
+本项目对通用风格中限制 catch_unwind 的规则保留明确的框架边界例外：factory、生命周期、
+用户 Future 的 poll/drop、消息 handler、blocking 闭包及异常 hook 需要在 panic=unwind 下隔离用户 panic，
+恢复 Context 并完成资源跟踪，避免一次用户失败破坏执行器。不是用 panic 代替普通 Result 错误，
+也不以捕获 panic 掩盖内部不变量损坏；panic=abort 或进程终止时不保证捕获或清理。
+普通与 Worker 生命周期保留两个静态驱动，以保留 Send/!Send 差异；消息处理复用泛型循环，
+不额外装箱 Future，不改变逐消息串行、Span/Dispatch 恢复或异常报告次数。
+
 异常仍按 Context exception handler → 全局 exception handler 调用；调用前释放配置锁，handler 可重设自身。
 框架错误事件独立于用户 hook，安装 hook 也不会吞掉框架诊断；每个报告入口只输出一次框架错误事件。
 异常 handler panic 被捕获后单独记录，避免递归。生命周期结束和全局关闭清除 handler 引用。
@@ -309,7 +328,10 @@ Context Timer 随 scope 取消；全局 Timer 随 close 取消。
 
 ### 5.1 工具链与依赖
 
-最低 Rust 1.96、Edition 2021、Cargo resolver 3；库版本保持 0.3.0。
+最低 Rust 1.96、Edition 2024、Cargo resolver 3；库版本保持 0.3.0。
+VertxBuilder、DeploymentOptions、DeliveryOptions、ConsumerOptions 标记 must_use，避免丢弃配置结果。
+本轮只新增 try_build 与 execute_blocking_unordered；不为已有枚举/公开字段结构体添加 non_exhaustive，
+保留旧签名、结构体构造和穷尽匹配的兼容性。
 直接依赖最低版本为 Tokio 1.54.0、tokio-util 0.7.20、async-trait 0.1.92、thiserror 2.0.21、
 futures 0.3.34、dashmap 6.2.1、tracing 0.1.44；示例/测试使用 tracing-subscriber 0.3.23 的 env-filter/json。
 普通依赖仍只启用 Tokio rt/sync/macros/time；开发依赖启用 full/test-util。保留 async-trait。

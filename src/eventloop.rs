@@ -1,5 +1,5 @@
-use crate::context::{set_thread, ThreadIdentity};
-use crate::error::panic_error;
+use crate::context::{ThreadIdentity, set_thread};
+use crate::error::{panic_error, retain_failure};
 use crate::{Result, TaskHandle, VertxError};
 use std::future::Future;
 use std::pin::Pin;
@@ -211,16 +211,16 @@ pub(crate) struct EventLoopPool {
     rr: AtomicUsize,
 }
 impl EventLoopPool {
-    pub fn new(size: usize, instance: u64) -> std::io::Result<Self> {
+    pub fn new(size: usize, instance: u64) -> Result<Self> {
         Self::with_runtime_factory(size, instance, |_| {
             Builder::new_current_thread().enable_all().build()
         })
     }
-    fn with_runtime_factory<F>(
+    pub(crate) fn with_runtime_factory<F>(
         size: usize,
         instance: u64,
         runtime_factory: F,
-    ) -> std::io::Result<Self>
+    ) -> Result<Self>
     where
         F: Fn(usize) -> std::io::Result<Runtime> + Send + Sync + 'static,
     {
@@ -297,14 +297,32 @@ impl EventLoopPool {
             Ok::<_, std::io::Error>(())
         })();
         if let Err(error) = started {
-            pool.request_stop();
-            for handle in pool.handles.get_mut().unwrap().drain(..) {
-                let _ = handle.join();
-            }
-            return Err(error);
+            return Err(pool.rollback_initialization(VertxError::Other(format!(
+                "failed to initialize event loops: {error}"
+            ))));
         }
         Ok(pool)
     }
+    pub(crate) fn rollback_initialization(&self, cause: VertxError) -> VertxError {
+        let mut outcome = Err(cause);
+        for error in self.shutdown_initialization() {
+            retain_failure(&mut outcome, error);
+        }
+        outcome.expect_err("initialization rollback always retains the original error")
+    }
+
+    // Only for construction rollback: no business tasks have been admitted.
+    // Join synchronously so a failed try_build never leaves startup threads behind.
+    pub(crate) fn shutdown_initialization(&self) -> Vec<VertxError> {
+        self.request_stop();
+        self.handles
+            .lock()
+            .expect("event loop handles poisoned during initialization")
+            .drain(..)
+            .filter_map(|handle| handle.join().err().map(panic_error))
+            .collect()
+    }
+
     pub fn driver(&self, id: EventLoopId) -> Handle {
         self.loops[id.0].driver.clone()
     }
@@ -660,8 +678,31 @@ mod tests {
                     Builder::new_current_thread().enable_all().build()
                 }
             });
-            assert!(result.is_err());
+            assert!(matches!(result, Err(VertxError::Other(message))
+                if message.contains("event loops") && message.contains("injected startup failure")));
             assert_eq!(exited.load(Ordering::SeqCst), fail_at + 1);
+        }
+
+        #[test]
+        fn initialization_rollback_retains_cause_and_join_panic() {
+            let pool = EventLoopPool {
+                loops: Vec::new(),
+                handles: Mutex::new(vec![std::thread::spawn(|| panic!("injected join failure"))]),
+                instance: 2010,
+                rr: AtomicUsize::new(0),
+            };
+            let error = pool.rollback_initialization(VertxError::Other("startup failure".into()));
+            let VertxError::LifecycleFailed { cause, cleanup } = &error else {
+                panic!("expected startup cause and rollback failure: {error}");
+            };
+            assert!(
+                matches!(cause.as_ref(), VertxError::Other(message) if message == "startup failure")
+            );
+            assert!(
+                matches!(cleanup.as_slice(), [VertxError::Panic(message)] if message.contains("injected join failure"))
+            );
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(pool.handles.lock().unwrap().is_empty());
         }
 
         #[tokio::test]
@@ -672,9 +713,11 @@ mod tests {
             for n in 0..4 {
                 let (target, start) = (pool.clone(), barrier.clone());
                 submitters.push(std::thread::spawn(move || {
-                    let mut tasks = vec![target
-                        .spawn_pinned(EventLoopId(n % 2), || async { Ok(()) })
-                        .unwrap()];
+                    let mut tasks = vec![
+                        target
+                            .spawn_pinned(EventLoopId(n % 2), || async { Ok(()) })
+                            .unwrap(),
+                    ];
                     start.wait();
                     for _ in 0..64 {
                         match target.spawn_pinned(EventLoopId(n % 2), || async { Ok(()) }) {

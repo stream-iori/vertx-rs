@@ -1,8 +1,9 @@
+use super::Headers;
 use super::consumer::Consumer;
 use super::envelope::{ErasedEnvelope, MessageTrace};
-use super::Headers;
 use crate::{Context, Result, VertxError};
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use std::any::TypeId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -190,10 +191,10 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.end_wait();
-        if self.permit.is_some() {
-            if let Some(stats) = &self.target.state.stats {
-                stats.reserved.fetch_sub(1, Ordering::Relaxed);
-            }
+        if self.permit.is_some()
+            && let Some(stats) = &self.target.state.stats
+        {
+            stats.reserved.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

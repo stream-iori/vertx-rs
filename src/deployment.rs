@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeploymentId(pub(crate) u64);

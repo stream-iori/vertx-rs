@@ -276,6 +276,50 @@ mod configuration {
     //! Builder defaults and explicit overrides.
     use super::*;
 
+    #[rstest]
+    #[case::default(Vertx::builder())]
+    #[case::explicit(Vertx::builder().event_loop_threads(1).worker_threads(2))]
+    #[tokio::test]
+    async fn fallible_builder_creates_a_closable_instance(#[case] builder: vertx_rs::VertxBuilder) {
+        let vx = builder.try_build().unwrap();
+        assert!(vx.event_loop_count() > 0);
+        assert!(vx.worker_thread_count() > 0);
+        vx.close().await.unwrap();
+        assert_eq!(vx.diagnostics().close_stage, "closed");
+    }
+
+    #[rstest]
+    #[case::event_loop(0, 1, Duration::from_secs(1))]
+    #[case::worker(1, 0, Duration::from_secs(1))]
+    #[case::grace(1, 1, Duration::ZERO)]
+    #[test]
+    #[should_panic(expected = "failed to initialize Vertx")]
+    fn infallible_builder_keeps_panic_behavior(
+        #[case] event_loops: usize,
+        #[case] workers: usize,
+        #[case] grace: Duration,
+    ) {
+        let _ = Vertx::builder()
+            .event_loop_threads(event_loops)
+            .worker_threads(workers)
+            .shutdown_grace(grace)
+            .build();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn zero_instances_keeps_one_instance_compatibility(vx: Vertx) {
+        let ids = vx
+            .deploy_with(
+                |_, _| local(|_| async { Ok(()) }),
+                DeploymentOptions::new().instances(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        vx.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn default_worker_pool_size_is_20() {
         let vx = Vertx::builder().event_loop_threads(1).build();
@@ -1771,7 +1815,7 @@ mod worker {
 
     #[tokio::test]
     async fn future_combinations_preserve_worker_context_and_keep_spawned_tasks_independent() {
-        use futures::{future, FutureExt};
+        use futures::{FutureExt, future};
         let vx = Vertx::builder()
             .event_loop_threads(1)
             .worker_threads(1)
@@ -1984,8 +2028,13 @@ mod blocking {
     }
 
     #[rstest]
+    #[case::boolean_api(false)]
+    #[case::named_api(true)]
     #[tokio::test]
-    async fn unordered_blocking_obeys_configured_limit_and_can_overlap(vx: Vertx) {
+    async fn unordered_blocking_obeys_configured_limit_and_can_overlap(
+        vx: Vertx,
+        #[case] named: bool,
+    ) {
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let m = maximum.clone();
@@ -1994,15 +2043,23 @@ mod blocking {
                 let barrier = Arc::new(std::sync::Barrier::new(2));
                 let jobs = (0..8).map(|_| {
                     let (a, m, b) = (active.clone(), m.clone(), barrier.clone());
-                    ctx.execute_blocking_with(
-                        move || {
+                    let ctx = &ctx;
+                    async move {
+                        let id = ctx.id();
+                        let operation = move || {
+                            assert_eq!(Context::current().unwrap().id(), id);
+                            assert!(Context::is_on_worker_thread());
                             let n = a.fetch_add(1, Ordering::SeqCst) + 1;
                             m.fetch_max(n, Ordering::SeqCst);
                             b.wait();
                             a.fetch_sub(1, Ordering::SeqCst);
-                        },
-                        false,
-                    )
+                        };
+                        if named {
+                            ctx.execute_blocking_unordered(operation).await
+                        } else {
+                            ctx.execute_blocking_with(operation, false).await
+                        }
+                    }
                 });
                 for r in futures::future::join_all(jobs).await {
                     r?;
@@ -2822,41 +2879,84 @@ mod errors {
     }
 
     #[rstest]
+    #[case::event_loop_error(false, false)]
+    #[case::event_loop_panic(false, true)]
+    #[case::worker_error(true, false)]
+    #[case::worker_panic(true, true)]
     #[tokio::test]
-    async fn task_error_and_handler_panic_preserve_context_and_subscription(vx: Vertx) {
+    async fn task_error_and_handler_panic_preserve_context_and_subscription(
+        vx: Vertx,
+        #[case] worker_context: bool,
+        #[case] panic: bool,
+    ) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        vx.set_exception_handler(move |e| {
-            tx.send((Context::current().unwrap().deployment_id(), e.to_string()))
-                .ok();
+        vx.set_exception_handler(move |error| {
+            tx.send((
+                Context::current().unwrap().deployment_id(),
+                error.to_string(),
+            ))
+            .ok();
         });
-        let id = vx
-            .deploy(|_| {
-                local(|ctx| async move {
+        let handler = move |env: vertx_rs::Envelope<bool>| async move {
+            if *env.body() {
+                assert!(!panic, "test panic");
+                return Err(VertxError::Other("expected handler failure".into()));
+            }
+            env.reply(42u32)
+        };
+        let id = if worker_context {
+            vx.deploy_worker(move |_| {
+                worker(move |ctx| async move {
                     ctx.event_bus()
                         .consumer::<bool>("panic")?
-                        .handler(|env| async move {
-                            if *env.body() {
-                                panic!("test panic");
-                            }
-                            env.reply(42u32)
-                        })
+                        .handler_worker(handler)
                 })
             })
             .await
-            .unwrap();
+            .unwrap()
+        } else {
+            vx.deploy(move |_| {
+                local(move |ctx| async move {
+                    ctx.event_bus().consumer::<bool>("panic")?.handler(handler)
+                })
+            })
+            .await
+            .unwrap()
+        };
         assert!(matches!(
             vx.event_bus().request::<_, u32>("panic", true).await,
             Err(VertxError::ReplyClosed)
         ));
         let (owner, message) = rx.recv().await.unwrap();
         assert_eq!(owner, Some(id));
-        assert!(message.contains("test panic"));
+        assert!(message.contains(if panic {
+            "test panic"
+        } else {
+            "expected handler failure"
+        }));
         assert_eq!(
             vx.event_bus()
                 .request::<_, u32>("panic", false)
                 .await
                 .unwrap(),
             42
+        );
+        // A successful subsequent response follows error reporting in this serial loop.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "each failed message must report exactly once"
+        );
+        vx.undeploy(id).await.unwrap();
+        let snapshot = vx.diagnostics();
+        assert_eq!(snapshot.active_deployments, 0);
+        assert!(
+            snapshot
+                .deployments
+                .iter()
+                .all(|deployment| deployment.deployment_id != id)
         );
         vx.close().await.unwrap();
     }
@@ -2915,10 +3015,12 @@ mod errors {
             }
         }
         let error = vx.deploy(|_| Broken).await.unwrap_err();
-        assert!(std::error::Error::source(&error)
-            .unwrap()
-            .to_string()
-            .contains("start failure"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .to_string()
+                .contains("start failure")
+        );
         let VertxError::LifecycleFailed { cause, cleanup } = error else {
             panic!("missing lifecycle errors")
         };
@@ -3182,10 +3284,12 @@ mod diagnostics {
         release.send(()).unwrap();
         close.await.unwrap().unwrap();
         assert_eq!(snapshot.close_stage, "deployments");
-        assert!(snapshot
-            .deployments
-            .iter()
-            .any(|d| d.deployment_id == id && d.stage == "stopping"));
+        assert!(
+            snapshot
+                .deployments
+                .iter()
+                .any(|d| d.deployment_id == id && d.stage == "stopping")
+        );
         assert!(vx.diagnostics().deployments.is_empty());
     }
 
@@ -3290,7 +3394,8 @@ mod tracing_propagation {
 
     #[tokio::test]
     async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
-        use tracing::{instrument::WithSubscriber, Instrument};
+        use tracing::Instrument;
+        use tracing::instrument::WithSubscriber;
         let output = TraceOutput::default();
         let dispatch = output.dispatch();
         let vx = Vertx::builder()
@@ -3389,11 +3494,12 @@ mod tracing_propagation {
             ctx.set_exception_handler(move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
             });
-            assert!(ctx
-                .spawn(async { Err(VertxError::Other("diagnostic-hook-error".into())) })
-                .unwrap()
-                .await
-                .is_err());
+            assert!(
+                ctx.spawn(async { Err(VertxError::Other("diagnostic-hook-error".into())) })
+                    .unwrap()
+                    .await
+                    .is_err()
+            );
             assert_eq!(hook.load(Ordering::SeqCst), 1);
             vx.close().await.unwrap();
         }
@@ -3404,9 +3510,10 @@ mod tracing_propagation {
             text.contains("admission_wait=") && text.contains("queue_residence="),
             "{text}"
         );
-        assert!(text
-            .lines()
-            .any(|line| line.contains("request timed out") && line.contains("request_id=")));
+        assert!(
+            text.lines()
+                .any(|line| line.contains("request timed out") && line.contains("request_id="))
+        );
         assert_eq!(
             text.lines()
                 .filter(|line| line.contains("framework operation failed")
@@ -3420,7 +3527,8 @@ mod tracing_propagation {
     #[rstest]
     #[tokio::test]
     async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx) {
-        use tracing::{instrument::WithSubscriber, Instrument};
+        use tracing::Instrument;
+        use tracing::instrument::WithSubscriber;
         let output = TraceOutput::default();
         let dispatch = output.dispatch();
         let (send, receive) = oneshot::channel();
@@ -3679,25 +3787,31 @@ mod streams {
         bus.try_send("sticky", 2u32).unwrap();
         let mut sink = bus.sink::<u32>("sticky").unwrap();
         for _ in 0..2 {
-            assert!(futures::poll!(futures::future::poll_fn(
-                |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
-            ))
-            .is_pending());
+            assert!(
+                futures::poll!(futures::future::poll_fn(
+                    |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
+                ))
+                .is_pending()
+            );
         }
         let _available = bus.consumer_with::<u32>("sticky", options).unwrap();
-        assert!(futures::poll!(futures::future::poll_fn(
-            |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
-        ))
-        .is_pending());
+        assert!(
+            futures::poll!(futures::future::poll_fn(
+                |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
+            ))
+            .is_pending()
+        );
         assert_eq!(vx.diagnostics().waiting_senders, 1);
         a.recv().await.unwrap().unwrap();
         sink.send(3).await.unwrap();
         // Adding a consumer changes subsequent round-robin indices. A is still
         // full here, so dropping the next pending send must release its waiter.
-        assert!(futures::poll!(futures::future::poll_fn(
-            |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
-        ))
-        .is_pending());
+        assert!(
+            futures::poll!(futures::future::poll_fn(
+                |cx| std::pin::Pin::new(&mut sink).poll_ready(cx)
+            ))
+            .is_pending()
+        );
         drop(sink);
         assert_eq!(a.recv().await.unwrap().unwrap().into_body(), 3);
         assert_eq!(vx.diagnostics().waiting_senders, 0);
@@ -3916,7 +4030,8 @@ mod streams {
     #[tokio::test]
     async fn pipe_local_futures_keep_context_and_spans_across_interleaved_awaits() {
         use futures::{SinkExt, StreamExt};
-        use tracing::{instrument::WithSubscriber, Instrument};
+        use tracing::Instrument;
+        use tracing::instrument::WithSubscriber;
         let output = TraceOutput::default();
         let dispatch = output.dispatch();
         let vx = Vertx::builder()

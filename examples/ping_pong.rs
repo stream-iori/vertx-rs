@@ -6,7 +6,9 @@
 //! LOG_FORMAT=json 可输出 JSON 日志；预期：pong#1、recipient_failure、timeout、stop。
 //! 超时不会撤回已入队消息；同步慢操作必须放进 execute_blocking。
 use async_trait::async_trait;
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
 use vertx_rs::{Context, DeliveryOptions, Result, Verticle, Vertx, VertxError};
 struct Pinger {
     count: Rc<Cell<u64>>,

@@ -1,8 +1,8 @@
 use crate::{Result, VertxError};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
@@ -34,7 +34,9 @@ impl TaskControl for tokio::task::AbortHandle {
         self.is_finished()
     }
 }
+/// Awaiting yields one `Result<T>` after user state destruction.
 /// Dropping the handle detaches the waiter; it does not cancel the task.
+/// Use [`Self::abort`] or undeploy the owning deployment to request cancellation.
 pub struct TaskHandle<T> {
     id: TaskId,
     backend: TaskBackend<T>,
@@ -50,9 +52,12 @@ pub struct TaskAbortHandle {
     control: Arc<dyn TaskControl>,
 }
 impl TaskAbortHandle {
+    /// Requests cancellation on the owning executor without preempting an active poll.
+    /// User state destruction precedes the finished state.
     pub fn abort(&self) {
         self.control.abort();
     }
+    /// Returns true after the executor has destroyed the user Future.
     pub fn is_finished(&self) -> bool {
         self.control.is_finished()
     }
@@ -80,15 +85,19 @@ impl<T> TaskHandle<T> {
         self.id = id;
         self
     }
+    /// Returns the process-unique ID shared with diagnostics and logs.
     pub fn id(&self) -> TaskId {
         self.id
     }
+    /// Requests executor-side cancellation after any active poll returns.
     pub fn abort(&self) {
         self.abort.abort();
     }
+    /// Returns a cloneable cancellation handle that does not keep pool threads alive.
     pub fn abort_handle(&self) -> TaskAbortHandle {
         self.abort.clone()
     }
+    /// Returns true after user Future destruction, including cancellation.
     pub fn is_finished(&self) -> bool {
         self.abort.is_finished()
     }

@@ -47,6 +47,7 @@ impl FromIterator<(String, String)> for Headers {
     }
 }
 #[derive(Debug, Clone, Default)]
+#[must_use = "options take effect only when passed to an operation"]
 pub struct DeliveryOptions {
     timeout: Option<Duration>,
     headers: Headers,
@@ -80,6 +81,7 @@ impl DeliveryOptions {
 
 /// Per-consumer hard queue capacity, measured in messages, not bytes.
 #[derive(Debug, Clone)]
+#[must_use = "options take effect only when passed to an operation"]
 pub struct ConsumerOptions {
     capacity: usize,
 }
