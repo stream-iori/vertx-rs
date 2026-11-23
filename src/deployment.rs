@@ -1,7 +1,7 @@
 use crate::TaskAbortHandle;
 use crate::{Result, VertxError};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ pub(crate) struct DeploymentScope {
     pub deployment: DeploymentId,
     pub cancel: CancellationToken,
     pub state: Mutex<ScopeState>,
-    pub tracker: TaskTracker,
+    tracker: TaskTracker,
     pub blocking: TaskTracker,
     done: watch::Sender<Option<Result<()>>>,
 }
@@ -66,35 +66,40 @@ impl DeploymentScope {
         self.admit().is_ok()
     }
     pub fn running(&self) -> bool {
-        let mut s = self.state.lock().unwrap();
-        if s.phase == Phase::Starting && !self.cancel.is_cancelled() {
-            s.phase = Phase::Running;
+        let mut state = self.state.lock().unwrap();
+        if state.phase == Phase::Starting && !self.cancel.is_cancelled() {
+            state.phase = Phase::Running;
             true
         } else {
             false
         }
     }
     pub fn request_stop(&self) {
-        let mut s = self.state.lock().unwrap();
-        if s.phase != Phase::Stopped {
-            s.phase = Phase::Stopping;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.phase != Phase::Stopped {
+                state.phase = Phase::Stopping;
+            }
         }
+        // Closing trackers and cancelling the token can wake other tasks.
         self.tracker.close();
         self.blocking.close();
         self.cancel.cancel();
     }
-    pub async fn quiesce(&self, grace: Duration) {
-        if tokio::time::timeout(grace / 2, self.tracker.wait())
+    pub async fn drain_tasks(&self, grace: Duration) {
+        let timed_out = tokio::time::timeout(grace / 2, self.tracker.wait())
             .await
-            .is_err()
-        {
-            for h in &self.state.lock().unwrap().tasks {
-                h.abort();
+            .is_err();
+        let tasks = std::mem::take(&mut self.state.lock().unwrap().tasks);
+        if timed_out {
+            for task in &tasks {
+                task.abort();
             }
             self.tracker.wait().await;
         }
+    }
+    pub async fn wait_blocking(&self) {
         self.blocking.wait().await;
-        self.state.lock().unwrap().tasks.clear();
     }
     pub fn finish(&self, outcome: Result<()>) {
         self.state.lock().unwrap().phase = Phase::Stopped;
@@ -111,15 +116,12 @@ impl DeploymentScope {
             }
         }
     }
+    pub async fn wait_with_grace(&self, grace: Duration) -> Result<()> {
+        tokio::time::timeout(grace, self.wait())
+            .await
+            .map_err(|_| VertxError::ShutdownTimeout(grace))?
+    }
     pub fn task_token(&self) -> TaskTrackerToken {
         self.tracker.token()
-    }
-}
-pub(crate) struct CancelOnDrop(pub Option<Arc<DeploymentScope>>);
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if let Some(s) = &self.0 {
-            s.request_stop();
-        }
     }
 }

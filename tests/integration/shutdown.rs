@@ -66,6 +66,70 @@ async fn stop_can_execute_blocking_cleanup_during_global_close(vx: Vertx) {
 
 #[rstest]
 #[tokio::test]
+async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
+    struct Cleanup {
+        release: Option<std::sync::mpsc::Receiver<()>>,
+        destroyed: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Verticle for Cleanup {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self, ctx: Context) -> Result<()> {
+            let (started, running) = oneshot::channel();
+            let release = self.release.take().unwrap();
+            tokio::select! {
+                result = ctx.execute_blocking(move || {
+                    started.send(()).unwrap();
+                    let _ = release.recv();
+                }) => {
+                    result?;
+                    panic!("blocking cleanup must wait for release");
+                }
+                result = running => result.unwrap(),
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.destroyed.take().unwrap().send(());
+        }
+    }
+
+    let (release, wait) = std::sync::mpsc::channel();
+    let (destroyed, destruction) = oneshot::channel();
+    let (thread, thread_info) = oneshot::channel();
+    let id = vx
+        .deploy(move |ctx| {
+            let _ = thread.send((ctx, tokio::runtime::Handle::current()));
+            Cleanup {
+                release: Some(wait),
+                destroyed: Some(destroyed),
+            }
+        })
+        .await
+        .unwrap();
+    let (ctx, driver) = thread_info.await.unwrap();
+    ctx.request_undeploy().unwrap();
+    destruction.await.unwrap();
+    // Let the owning EventLoop finish the poll that destroyed the verticle.
+    driver.spawn(async {}).await.unwrap();
+
+    let undeploy = vx.undeploy(id);
+    tokio::pin!(undeploy);
+    assert!(futures::poll!(&mut undeploy).is_pending());
+    release.send(()).unwrap();
+    undeploy.await.unwrap();
+    vx.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn close_is_idempotent_cancels_global_resources_and_rejects_work(vx: Vertx) {
     echo(&vx, "echo").await;
     let bus = vx.event_bus();
