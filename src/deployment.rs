@@ -22,22 +22,28 @@ impl std::fmt::Display for DeploymentId {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Phase {
+enum Phase {
     Starting,
     Running,
     Stopping,
     Stopped,
 }
 pub(crate) struct ScopeState {
-    pub phase: Phase,
-    pub tasks: Vec<TaskAbortHandle>,
+    phase: Phase,
+    tasks: Vec<TaskAbortHandle>,
+}
+impl ScopeState {
+    pub fn track_task(&mut self, handle: TaskAbortHandle) {
+        self.tasks.retain(|task| !task.is_finished());
+        self.tasks.push(handle);
+    }
 }
 pub(crate) struct DeploymentScope {
     pub deployment: DeploymentId,
     pub cancel: CancellationToken,
-    pub state: Mutex<ScopeState>,
+    state: Mutex<ScopeState>,
     tracker: TaskTracker,
-    pub blocking: TaskTracker,
+    blocking: TaskTracker,
     done: watch::Sender<Option<Result<()>>>,
 }
 impl DeploymentScope {
@@ -62,8 +68,20 @@ impl DeploymentScope {
             Ok(state)
         }
     }
-    pub fn is_alive(&self) -> bool {
-        self.admit().is_ok()
+    pub fn admit_blocking(
+        &self,
+        instance_cancel: &CancellationToken,
+        in_stop_callback: bool,
+    ) -> Result<TaskTrackerToken> {
+        let state = self.state.lock().unwrap();
+        let running = matches!(state.phase, Phase::Starting | Phase::Running)
+            && !instance_cancel.is_cancelled();
+        let cleanup = in_stop_callback && state.phase == Phase::Stopping;
+        if running || cleanup {
+            Ok(self.blocking.token())
+        } else {
+            Err(VertxError::DeploymentTerminated(self.deployment))
+        }
     }
     pub fn running(&self) -> bool {
         let mut state = self.state.lock().unwrap();

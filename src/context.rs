@@ -1,20 +1,19 @@
+mod blocking;
+mod future;
+
 use crate::TaskHandle;
-use crate::deployment::{DeploymentScope, Phase};
-use crate::diagnostics::{Diagnostics, TaskRecord, TaskStage};
-use crate::error::panic_error;
+use crate::deployment::DeploymentScope;
+use crate::diagnostics::Diagnostics;
 use crate::eventloop::{EventLoopId, EventLoopPool};
 use crate::vertx::{Vertx, VertxInner};
 use crate::worker_pool::WorkerPool;
 use crate::{DeploymentId, EventBus, Result, ThreadingModel, VertxError};
-use futures::FutureExt;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
-use std::task::{Context as TaskContext, Poll};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -160,7 +159,7 @@ impl Context {
         thread_identity().is_some()
     }
     pub fn is_alive(&self) -> bool {
-        !self.inner.cancel.is_cancelled() && self.scope.is_alive()
+        self.ensure_alive().is_ok()
     }
     /// Returns the deployment cancellation token. Cancelling it requests shutdown;
     /// it cannot interrupt a running synchronous poll or blocking closure.
@@ -201,20 +200,24 @@ impl Context {
         self.data.exception_handler.write().unwrap().take();
     }
     pub(crate) fn report_error(&self, err: &VertxError) {
-        let handler = self
-            .data
-            .exception_handler
-            .read()
-            .unwrap()
-            .clone()
-            .or_else(|| self.inner.exception_handler.read().unwrap().clone());
+        let local = self.data.exception_handler.read().unwrap().clone();
+        let handler = local.or_else(|| self.inner.exception_handler.read().unwrap().clone());
+        let instance_id = self.inner.diagnostics.instance;
+        let deployment_id = self.scope.deployment;
+        let context_id = self.id();
         if self.inner.diagnostics.options.enabled {
-            tracing::error!(instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), error_kind = err.kind(), error = %err, "framework operation failed");
+            tracing::error!(
+                instance_id, deployment_id = %deployment_id, context_id = %context_id,
+                error_kind = err.kind(), error = %err, "framework operation failed"
+            );
         }
         if let Some(h) = handler
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(err))).is_err()
         {
-            tracing::error!(instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), error_kind = "panic", "exception handler panicked");
+            tracing::error!(
+                instance_id, deployment_id = %deployment_id, context_id = %context_id,
+                error_kind = "panic", "exception handler panicked"
+            );
         }
     }
     fn enter(&self) -> ContextGuard {
@@ -224,65 +227,10 @@ impl Context {
             _not_send: PhantomData,
         }
     }
-    pub(crate) fn wrap<F: Future>(&self, future: F) -> ContextFuture<F> {
-        let record =
-            self.inner
-                .diagnostics
-                .task(self.id(), self.scope.deployment, TaskStage::Ready);
-        let span = if self.inner.diagnostics.options.enabled {
-            tracing::info_span!("context_task", instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), task_id = %record.id)
-        } else {
-            tracing::Span::none()
-        };
-        span.in_scope(|| {
-            if self.inner.diagnostics.options.enabled {
-                tracing::debug!(task_id = %record.id, "task submitted");
-            }
-        });
-        ContextFuture {
-            ctx: self.clone(),
-            future: Some(Box::pin(future)),
-            record,
-            dispatch: tracing::dispatcher::get_default(Clone::clone),
-            span,
-        }
-    }
-    pub(crate) fn scope_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
-        let ctx = self.clone();
-        let mut future = Box::pin(future);
-        futures::future::poll_fn(move |cx| {
-            let _context = ctx.enter();
-            future.as_mut().poll(cx)
-        })
-    }
     pub(crate) fn is_expected_cancellation(&self, error: &VertxError) -> bool {
         matches!(error, VertxError::TaskCancelled)
             || matches!(error, VertxError::DeploymentTerminated(id) if *id == self.scope.deployment && self.scope.cancel.is_cancelled())
             || matches!(error, VertxError::VertxClosed if self.inner.cancel.is_cancelled())
-    }
-    // Own the cloned Context; do not capture the &self lifetime in Edition 2024.
-    fn managed<F>(&self, future: F) -> impl Future<Output = Result<()>> + use<F>
-    where
-        F: Future<Output = Result<()>>,
-    {
-        let ctx = self.clone();
-        async move {
-            if ctx.scope.cancel.is_cancelled() {
-                return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
-            }
-            let mut r = std::panic::AssertUnwindSafe(future)
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|e| Err(panic_error(e)));
-            if let Err(e) = &r {
-                if !ctx.is_expected_cancellation(e) {
-                    ctx.report_error(e);
-                } else if matches!(e, VertxError::VertxClosed) {
-                    r = Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
-                }
-            }
-            r
-        }
     }
     /// Spawn a managed non-Send task. Must be called in this exact Context.
     /// Dropping the returned TaskHandle detaches the caller, not the scope.
@@ -295,13 +243,10 @@ impl Context {
         F: Future<Output = Result<()>> + 'static,
     {
         self.check_local()?;
-        let mut state = self.scope.admit()?;
-        let future = self.wrap(self.managed(future));
-        let id = future.record.id;
-        let future = Tracked::new(future, self.scope.task_token());
+        let mut admission = self.scope.admit()?;
+        let (future, id) = self.track_future(future);
         let handle = TaskHandle::from_tokio(tokio::task::spawn_local(future)).with_id(id);
-        state.tasks.retain(|h| !h.is_finished());
-        state.tasks.push(handle.abort_handle());
+        admission.track_task(handle.abort_handle());
         Ok(handle)
     }
     /// Dispatch a Send future to this Context. EventLoop targets remain pinned.
@@ -314,21 +259,18 @@ impl Context {
         F: Future<Output = Result<()>> + Send + 'static,
     {
         self.ensure_alive()?;
-        let mut state = self.scope.admit()?;
-        let task = self.wrap(self.managed(future));
-        let id = task.record.id;
-        let task = Tracked::new(task, self.scope.task_token());
+        let mut admission = self.scope.admit()?;
+        let (task, id) = self.track_future(future);
         let handle = match self.kind {
             Kind::EventLoop(id) => self.inner.event_loops.spawn_pinned(id, move || task)?,
             Kind::Worker => {
                 self.inner
                     .workers
-                    .spawn(self.data.id, self.data.driver.clone(), task)?
+                    .spawn(self.worker_lane(), self.worker_driver(), task)?
             }
-        };
-        let handle = handle.with_id(id);
-        state.tasks.retain(|h| !h.is_finished());
-        state.tasks.push(handle.abort_handle());
+        }
+        .with_id(id);
+        admission.track_task(handle.abort_handle());
         Ok(handle)
     }
     /// Queue a Future on this Context. Execution never starts inline.
@@ -353,106 +295,6 @@ impl Context {
         self.ensure_alive()?;
         self.scope.request_stop();
         Ok(())
-    }
-    /// Runs a Send closure on the shared Worker pool, FIFO per source Context.
-    /// The logical Context is retained. Queued work is skipped after cancellation;
-    /// started work finishes even if the waiter is dropped. Cleanup blocking is
-    /// admitted only during the actual stop callback.
-    pub async fn execute_blocking<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.execute_blocking_with(f, true).await
-    }
-    /// Executes blocking work without the per-Context FIFO lock.
-    ///
-    /// Operations may overlap up to the shared Worker pool limit. The source
-    /// logical Context is retained, but execution takes place on a Worker.
-    /// Queued work is skipped on scope cancellation; started work cannot be
-    /// interrupted. Dropping the waiter does not retract submitted work.
-    pub async fn execute_blocking_unordered<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.execute_blocking_with(f, false).await
-    }
-
-    /// Executes blocking work; `ordered=true` uses a per-Context FIFO lock.
-    /// See [`Self::execute_blocking_unordered`] for the unordered policy.
-    pub async fn execute_blocking_with<F, R>(&self, f: F, ordered: bool) -> Result<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        // Reserve tracking before the first await, including queued work.
-        let token = {
-            let state = self.scope.state.lock().unwrap();
-            let allowed = matches!(state.phase, Phase::Starting | Phase::Running)
-                && !self.inner.cancel.is_cancelled()
-                || self.stopping
-                    && state.phase == Phase::Stopping
-                    && Self::current().is_some_and(|c| c.stopping && c.same(self));
-            if !allowed {
-                return Err(VertxError::DeploymentTerminated(self.scope.deployment));
-            }
-            self.scope.blocking.token()
-        };
-        let global_token = self.inner.blocking.token();
-        let mut record = self.inner.diagnostics.task(
-            self.id(),
-            self.scope.deployment,
-            TaskStage::BlockingOrderedWait,
-        );
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let span = if self.inner.diagnostics.options.enabled {
-            tracing::info_span!("blocking_task", instance_id = self.inner.diagnostics.instance, deployment_id = %self.scope.deployment, context_id = %self.id(), task_id = %record.id)
-        } else {
-            tracing::Span::none()
-        };
-        let ordered_started = std::time::Instant::now();
-        let ordered_lock = if ordered {
-            Some(tokio::select! { biased;
-                _ = self.scope.cancel.cancelled(), if !self.stopping => return Err(VertxError::DeploymentTerminated(self.scope.deployment)),
-                g = self.data.ordered.clone().lock_owned() => g,
-            })
-        } else {
-            None
-        };
-        if self.inner.diagnostics.options.enabled {
-            tracing::debug!(task_id = %record.id, ordered, ordered_wait = ?ordered_started.elapsed(), "blocking order admitted");
-        }
-        record.stage(TaskStage::BlockingQueued);
-        let queued_at = std::time::Instant::now();
-        let ctx = self.clone();
-        let handle = self.inner.workers.spawn_blocking(move || {
-            let _dispatch = tracing::dispatcher::set_default(&dispatch);
-            let _span = span.enter();
-            if ctx.inner.diagnostics.options.enabled { tracing::debug!(task_id = %record.id, worker_queue_wait = ?queued_at.elapsed(), "blocking dequeued"); }
-            record.stage(TaskStage::BlockingRunning);
-            let _operation = ctx.inner.diagnostics.operation(&record, None, "blocking", ctx.inner.diagnostics.options.blocking_threshold);
-            let (_token, _global, _ordered) = (token, global_token, ordered_lock);
-            let _context = ctx.enter();
-            // Move captures into a local so cancellation drops them before the
-            // Context guard and tracking tokens, rather than with the FnOnce environment.
-            let operation = f;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if !ctx.stopping && ctx.scope.cancel.is_cancelled() {
-                    drop(operation);
-                    Err(VertxError::DeploymentTerminated(ctx.scope.deployment))
-                } else {
-                    Ok(operation())
-                }
-            })).unwrap_or_else(|error| Err(panic_error(error)));
-            record.result(&result);
-            drop(_operation);
-            drop(record);
-            result
-        })?;
-        handle
-            .await
-            .map_err(|_| VertxError::Join("blocking result channel closed".into()))?
     }
     /// Creates a timer starting now, cancelled with this deployment.
     /// Rejects stopped scopes or closed instances. Polling needs a Tokio time driver;
@@ -484,330 +326,6 @@ impl Drop for ContextGuard {
         CURRENT.with(|c| *c.borrow_mut() = self.prev.take());
     }
 }
-pub(crate) struct ContextFuture<F> {
-    ctx: Context,
-    future: Option<Pin<Box<F>>>,
-    record: TaskRecord,
-    dispatch: tracing::Dispatch,
-    span: tracing::Span,
-}
-impl<F: Future<Output = Result<T>>, T> Future for ContextFuture<F> {
-    type Output = Result<T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.ctx.is_event_loop() {
-            assert!(
-                this.ctx
-                    .inner
-                    .event_loops
-                    .check_thread(this.ctx.event_loop_id().unwrap()),
-                "EventLoop affinity violated"
-            );
-        }
-        let _execution = this
-            .ctx
-            .data
-            .execution
-            .lock()
-            .expect("Context execution gate poisoned by an internal failure");
-        let _context = this.ctx.enter();
-        let _dispatch = tracing::dispatcher::set_default(&this.dispatch);
-        let _span = this.span.enter();
-        this.record.stage(TaskStage::Polling);
-        if this.ctx.inner.diagnostics.options.enabled {
-            tracing::trace!(thread_id = ?std::thread::current().id(), event_loop_id = ?this.ctx.event_loop_id(), "task poll");
-        }
-        let diagnostics = &this.ctx.inner.diagnostics;
-        let threshold = if this.ctx.is_event_loop() {
-            diagnostics.options.event_loop_poll_threshold
-        } else {
-            diagnostics.options.worker_poll_threshold
-        };
-        let _operation = diagnostics.operation(
-            &this.record,
-            this.ctx.event_loop_id(),
-            "future_poll",
-            threshold,
-        );
-        let waker = this.record.waker(cx.waker());
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            this.future
-                .as_mut()
-                .expect("poll after future drop")
-                .as_mut()
-                .poll(&mut TaskContext::from_waker(&waker))
-        }))
-        .unwrap_or_else(|payload| {
-            // Includes a destructor panic while an awaited future completes,
-            // which a catch_unwind around only that future's poll cannot cover.
-            let error = panic_error(payload);
-            this.ctx.report_error(&error);
-            Poll::Ready(Err(error))
-        });
-        match &result {
-            Poll::Ready(result) => this.record.result(result),
-            Poll::Pending => this.record.pending(),
-        }
-        result
-    }
-}
-impl<F> Drop for ContextFuture<F> {
-    fn drop(&mut self) {
-        let result = {
-            let _execution = self
-                .ctx
-                .data
-                .execution
-                .lock()
-                .expect("Context execution gate poisoned by an internal failure");
-            let _context = self.ctx.enter();
-            let _dispatch = tracing::dispatcher::set_default(&self.dispatch);
-            let _span = self.span.enter();
-            let diagnostics = &self.ctx.inner.diagnostics;
-            let threshold = if self.ctx.is_event_loop() {
-                diagnostics.options.event_loop_poll_threshold
-            } else {
-                diagnostics.options.worker_poll_threshold
-            };
-            let _operation = diagnostics.operation(
-                &self.record,
-                self.ctx.event_loop_id(),
-                "future_drop",
-                threshold,
-            );
-            // User destruction stays serialized and retains Context/tracing.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop(self.future.take());
-            }));
-            if let Err(error) = &result {
-                self.ctx
-                    .report_error(&crate::error::panic_error_ref(error.as_ref()));
-                self.record.failed();
-            }
-            self.record.finish();
-            result
-        };
-        // Release the execution gate normally before resuming user unwinding.
-        // A user destructor panic must not poison the gate for later tasks.
-        if let Err(error) = result {
-            std::panic::resume_unwind(error);
-        }
-    }
-}
-
-// Tracking ends only after user future destructors finish, including aborts
-// before the first poll. The completion token must be dropped last.
-struct Tracked<F> {
-    future: Option<Pin<Box<F>>>,
-    token: Option<tokio_util::task::task_tracker::TaskTrackerToken>,
-}
-impl<F> Tracked<F> {
-    fn new(future: F, token: tokio_util::task::task_tracker::TaskTrackerToken) -> Self {
-        Self {
-            future: Some(Box::pin(future)),
-            token: Some(token),
-        }
-    }
-}
-impl<F: Future> Future for Tracked<F> {
-    type Output = F::Output;
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        self.get_mut().future.as_mut().unwrap().as_mut().poll(cx)
-    }
-}
-impl<F> Drop for Tracked<F> {
-    fn drop(&mut self) {
-        drop(self.future.take());
-        drop(self.token.take());
-    }
-}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn context_restored_when_send_future_moves_between_os_threads() {
-        let vx = Vertx::builder()
-            .event_loop_threads(1)
-            .worker_threads(2)
-            .build();
-        let scope = Arc::new(DeploymentScope::new(
-            DeploymentId::next(),
-            vx.inner.shared.cancel.child_token(),
-        ));
-        let ctx = Context::new_worker(vx.inner.shared.clone(), scope);
-        let id = ctx.deployment_id();
-        let mut polls = 0;
-        let mut future = Box::pin(ctx.wrap(futures::future::poll_fn(move |_| {
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
-            polls += 1;
-            if polls == 2 {
-                Poll::Ready(Ok::<(), VertxError>(()))
-            } else {
-                Poll::Pending
-            }
-        })));
-        let mut threads = Vec::new();
-        for n in 0..2 {
-            future = std::thread::spawn(move || {
-                assert!(Context::current().is_none());
-                let waker = futures::task::noop_waker();
-                let mut cx = TaskContext::from_waker(&waker);
-                assert_eq!(future.as_mut().poll(&mut cx).is_ready(), n == 1);
-                assert!(Context::current().is_none());
-                (future, std::thread::current().id())
-            })
-            .join()
-            .map(|(f, t)| {
-                threads.push(t);
-                f
-            })
-            .unwrap();
-        }
-        assert_ne!(threads[0], threads[1]);
-        drop(future);
-        assert!(Context::current().is_none());
-        vx.close().await.unwrap();
-    }
-    #[rstest::rstest]
-    #[case::normal_return(false)]
-    #[case::unwind(true)]
-    #[tokio::test]
-    async fn guard_restores_nested_context_and_panic(#[case] panic: bool) {
-        let vx = Vertx::builder()
-            .event_loop_threads(1)
-            .worker_threads(2)
-            .build();
-        let make = || {
-            Context::new_worker(
-                vx.inner.shared.clone(),
-                Arc::new(DeploymentScope::new(
-                    DeploymentId::next(),
-                    CancellationToken::new(),
-                )),
-            )
-        };
-        let (a, b) = (make(), make());
-        {
-            let _a = a.enter();
-            assert!(Context::current().unwrap().same(&a));
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _b = b.enter();
-                assert!(Context::current().unwrap().same(&b));
-                if panic {
-                    panic!("guard test");
-                }
-            }));
-            assert_eq!(r.is_err(), panic);
-            assert!(Context::current().unwrap().same(&a));
-        }
-        assert!(Context::current().is_none());
-        vx.close().await.unwrap();
-    }
-    #[rstest::rstest]
-    #[case::event_loop(false)]
-    #[case::worker(true)]
-    #[tokio::test]
-    async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] worker: bool) {
-        struct PanicDrop {
-            context: ContextId,
-            worker: bool,
-        }
-        impl Drop for PanicDrop {
-            fn drop(&mut self) {
-                assert_eq!(Context::current().unwrap().id(), self.context);
-                assert_eq!(Context::is_on_worker_thread(), self.worker);
-                panic!("injected user destructor panic");
-            }
-        }
-        let vx = Vertx::builder()
-            .event_loop_threads(1)
-            .worker_threads(1)
-            .build();
-        let scope = Arc::new(DeploymentScope::new(
-            DeploymentId::next(),
-            vx.inner.shared.cancel.child_token(),
-        ));
-        let ctx = if worker {
-            Context::new_worker(vx.inner.shared.clone(), scope)
-        } else {
-            Context::new_event_loop(EventLoopId(0), vx.inner.shared.clone(), scope)
-        };
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let probe = PanicDrop {
-            context: ctx.id(),
-            worker,
-        };
-        let task = ctx
-            .spawn(async move {
-                let _probe = probe;
-                ready.send(()).unwrap();
-                std::future::pending::<Result<()>>().await
-            })
-            .unwrap();
-        started.await.unwrap();
-        task.abort();
-        assert!(matches!(task.await, Err(VertxError::Panic(_))));
-        assert!(
-            !ctx.data.execution.is_poisoned(),
-            "user panic must not poison the execution gate"
-        );
-        let id = ctx.id();
-        ctx.spawn(async move {
-            assert_eq!(Context::current().unwrap().id(), id);
-            Ok(())
-        })
-        .unwrap()
-        .await
-        .unwrap();
-        assert!(Context::current().is_none());
-        vx.close().await.unwrap();
-        assert_eq!(vx.diagnostics().active_tasks, 0);
-    }
-
-    #[tokio::test]
-    async fn registration_and_stop_share_one_admission_transaction() {
-        let vx = Vertx::builder()
-            .event_loop_threads(1)
-            .worker_threads(2)
-            .build();
-        for _ in 0..50 {
-            let scope = Arc::new(DeploymentScope::new(
-                DeploymentId::next(),
-                vx.inner.shared.cancel.child_token(),
-            ));
-            let ctx = Context::new_worker(vx.inner.shared.clone(), scope.clone());
-            let barrier = Arc::new(std::sync::Barrier::new(2));
-            let c = ctx.clone();
-            let b = barrier.clone();
-            let register = std::thread::spawn(move || {
-                b.wait();
-                c.event_bus().consumer::<()>("race")
-            });
-            let c = ctx.clone();
-            let b = barrier.clone();
-            let stop = std::thread::spawn(move || {
-                b.wait();
-                c.scope.request_stop();
-                c.inner.event_bus.unregister_deployment(c.scope.deployment);
-            });
-            let result = register.join().unwrap();
-            stop.join().unwrap();
-            // Check the route while a successful registration still owns its receiver.
-            assert!(matches!(
-                vx.event_bus().try_send("race", ()),
-                Err(crate::VertxError::NoConsumer(_))
-            ));
-            match result {
-                Ok(mut consumer) => assert!(matches!(
-                    consumer.recv().await,
-                    Err(VertxError::DeploymentTerminated(_))
-                )),
-                Err(crate::VertxError::DeploymentTerminated(_)) => {}
-                _ => panic!("unexpected registration outcome"),
-            }
-        }
-        vx.close().await.unwrap();
-    }
-}
+mod tests;
