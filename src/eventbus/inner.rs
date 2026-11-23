@@ -1,7 +1,7 @@
 use super::Headers;
 use super::consumer::Consumer;
 use super::envelope::{ErasedEnvelope, MessageTrace};
-use crate::{Context, Result, VertxError};
+use crate::{Context, DeploymentId, Result, VertxError};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::any::TypeId;
@@ -11,8 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) type SubscriberId = u64;
-/// Shared liveness and counters; the consumer deliberately does not own a sender.
+/// Shared subscription state; the consumer deliberately does not own a sender.
 pub(crate) struct QueueState {
+    deployment: Option<DeploymentId>,
     pub cancel: CancellationToken,
     active: std::sync::atomic::AtomicBool,
     pub stats: Option<Arc<crate::diagnostics::QueueStats>>,
@@ -236,10 +237,16 @@ impl EventBusInner {
         owner: Option<Context>,
         capacity: usize,
     ) -> Result<Consumer<T>> {
-        let _admission = self.admission.read().unwrap();
+        // A deployment cannot start stopping until its route has been installed.
+        let scope_admission = match &owner {
+            Some(ctx) => Some(ctx.scope.admit()?),
+            None => None,
+        };
+        let bus_admission = self.admission.read().unwrap();
         self.ensure_open()?;
         let (tx, rx) = mpsc::channel(capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let deployment = owner.as_ref().and_then(Context::deployment_id);
         let cancel = owner
             .as_ref()
             .map(|c| c.cancellation_token())
@@ -250,9 +257,10 @@ impl EventBusInner {
             address,
             capacity,
             owner.as_ref().map(Context::id),
-            owner.as_ref().and_then(Context::deployment_id),
+            deployment,
         );
         let state = Arc::new(QueueState {
+            deployment,
             cancel: cancel.clone(),
             active: std::sync::atomic::AtomicBool::new(true),
             stats,
@@ -276,6 +284,9 @@ impl EventBusInner {
             });
             self.diagnostics.consumer(1);
         }
+        // Rollback can cancel the target or drop a receiver that wakes senders.
+        drop(bus_admission);
+        drop(scope_admission);
         if self.closed.is_cancelled() {
             self.unregister(address, id);
             return Err(VertxError::VertxClosed);
@@ -293,8 +304,7 @@ impl EventBusInner {
         let removed = if let Entry::Occupied(mut entry) = self.routes.entry(address.into()) {
             if let Some(index) = entry.get().subscribers.iter().position(|t| t.id == id) {
                 let target = entry.get_mut().subscribers.remove(index);
-                target.state.mark_inactive();
-                self.diagnostics.unregister_queue(id);
+                self.mark_removed(&target);
                 self.diagnostics.consumer(-1);
                 if entry.get().subscribers.is_empty() {
                     entry.remove();
@@ -314,22 +324,37 @@ impl EventBusInner {
     }
     pub fn close(&self) {
         self.closed.cancel();
-        let _admission = self.admission.write().unwrap();
-        let mut removed = Vec::new();
-        self.routes.retain(|_, route| {
-            for target in &route.subscribers {
-                target.state.mark_inactive();
-                self.diagnostics.unregister_queue(target.id);
-            }
-            self.diagnostics
-                .consumer(-(route.subscribers.len() as isize));
-            removed.append(&mut route.subscribers);
-            false
-        });
-        drop(_admission);
+        let admission = self.admission.write().unwrap();
+        let removed = self.remove_matching(|_| true);
+        drop(admission);
         for target in removed {
             target.state.cancel.cancel();
         }
+    }
+    pub fn unregister_deployment(&self, deployment: DeploymentId) {
+        for target in self.remove_matching(|target| target.state.deployment == Some(deployment)) {
+            target.state.cancel.cancel();
+        }
+    }
+    fn remove_matching(&self, mut matches: impl FnMut(&Target) -> bool) -> Vec<Target> {
+        let mut removed = Vec::new();
+        self.routes.retain(|_, route| {
+            let count = route.subscribers.len();
+            for target in route.subscribers.extract_if(.., |target| matches(target)) {
+                self.mark_removed(&target);
+                removed.push(target);
+            }
+            let removed_count = count - route.subscribers.len();
+            if removed_count > 0 {
+                self.diagnostics.consumer(-(removed_count as isize));
+            }
+            !route.subscribers.is_empty()
+        });
+        removed
+    }
+    fn mark_removed(&self, target: &Target) {
+        target.state.mark_inactive();
+        self.diagnostics.unregister_queue(target.id);
     }
     pub fn publish<T: Clone + Send + 'static>(
         &self,
@@ -533,7 +558,7 @@ mod tests {
         let waker = std::task::Waker::from(reenter.clone());
         let mut cx = std::task::Context::from_waker(&waker);
         assert!(reservation.poll_ready(&mut cx).is_pending());
-        bus.unregister("wake", consumer.subscriber_id());
+        drop(consumer);
         assert!(reenter.wakes.load(Ordering::SeqCst) > 0);
         assert!(matches!(
             reservation.poll_ready(&mut cx),

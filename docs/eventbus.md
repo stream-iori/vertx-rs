@@ -36,11 +36,11 @@ Headers 按插入顺序保存、键大小写敏感、支持重复值；header �
 - Vertx::event_bus 在框架外注册为 unbound；在本实例的 Context 中注册时自动绑定当前 Context。
 - 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
 - handler 接受本地 !Send 闭包；handler_worker 要求 Send 闭包及 Future。都校验调用 Context。
-- scope 存活检查、路由注册、作用域登记持有同一个准入锁；Stopping 不能插入新的登记。
-- 路由注销使用 DashMap entry 原子更新，删除最后一个订阅时同时删除轮询状态。
-- Consumer Drop 同时撤销路由和 scope 登记，避免长生命周期部署积累已销毁记录。
-- 所有同步锁在 await 或用户回调前释放。
-- 注销先在路由锁内标记失活、移除目标并更新计数，再于锁外取消和释放 sender；Waker 可重入路由。
+- 所有消费者都只登记在 EventBus 路由表。每条订阅记录可选的 DeploymentId，部署作用域不另存订阅清单。
+- 绑定部署时，存活检查到路由插入全程持有部署准入锁。进入 Stopping 后拒绝新订阅。
+- 撤销部署时扫描路由表，按 DeploymentId 删除该部署的订阅。关闭 EventBus 时清除全部路由。发送仍按地址查表。
+- Consumer Drop 按地址和订阅 ID 注销单条记录。每次移除都和路由更新原子进行，移除地址下最后一个订阅时同时清除轮询状态。
+- 注销先在路由锁内标记失活、移除目标并更新计数，再释放相关注册表锁，取消并释放 sender；Waker 可重入路由。
 
 ## 相关主题
 

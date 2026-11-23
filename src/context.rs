@@ -790,10 +790,15 @@ mod tests {
             let stop = std::thread::spawn(move || {
                 b.wait();
                 c.scope.request_stop();
-                c.inner.event_bus.cleanup_scope(&c.scope);
+                c.inner.event_bus.unregister_deployment(c.scope.deployment);
             });
             let result = register.join().unwrap();
             stop.join().unwrap();
+            // Check the route while a successful registration still owns its receiver.
+            assert!(matches!(
+                vx.event_bus().try_send("race", ()),
+                Err(crate::VertxError::NoConsumer(_))
+            ));
             match result {
                 Ok(mut consumer) => assert!(matches!(
                     consumer.recv().await,
@@ -802,11 +807,6 @@ mod tests {
                 Err(crate::VertxError::DeploymentTerminated(_)) => {}
                 _ => panic!("unexpected registration outcome"),
             }
-            assert!(matches!(
-                vx.event_bus().try_send("race", ()),
-                Err(crate::VertxError::NoConsumer(_))
-            ));
-            assert!(scope.state.lock().unwrap().subscribers.is_empty());
         }
         vx.close().await.unwrap();
     }

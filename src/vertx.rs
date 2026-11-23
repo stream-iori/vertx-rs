@@ -39,7 +39,9 @@ async fn quiesce_deployment(ctx: &Context) {
         .diagnostics
         .deployment(ctx.scope.deployment, DeploymentStage::Quiescing);
     ctx.scope.request_stop();
-    ctx.inner.event_bus.cleanup_scope(&ctx.scope);
+    ctx.inner
+        .event_bus
+        .unregister_deployment(ctx.scope.deployment);
     ctx.scope.quiesce(ctx.inner.shutdown_grace).await;
 }
 fn finish_deployment(

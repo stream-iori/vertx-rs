@@ -2,8 +2,7 @@ mod consumer;
 mod envelope;
 mod inner;
 mod options;
-use crate::deployment::DeploymentScope;
-use crate::{Context, Result, VertxError};
+use crate::{Context, DeploymentId, Result, VertxError};
 pub use consumer::Consumer;
 pub use envelope::{Envelope, ReplyHandle};
 use inner::EventBusInner;
@@ -41,11 +40,8 @@ impl EventBus {
     pub(crate) fn close(&self) {
         self.inner.close();
     }
-    pub(crate) fn cleanup_scope(&self, scope: &DeploymentScope) {
-        let subscribers = std::mem::take(&mut scope.state.lock().unwrap().subscribers);
-        for (address, id) in subscribers {
-            self.inner.unregister(&address, id);
-        }
+    pub(crate) fn unregister_deployment(&self, deployment: DeploymentId) {
+        self.inner.unregister_deployment(deployment);
     }
     /// Attempts delivery to all subscribers; full-queue deliveries are dropped.
     /// Success does not confirm business processing. Each message is cloned only
@@ -205,21 +201,18 @@ impl EventBus {
     ) -> Result<Consumer<T>> {
         options.validate()?;
         self.ensure_open()?;
-        let owner = self.owner.clone().or_else(|| {
-            Context::current().filter(|c| Arc::ptr_eq(&c.inner.event_bus.inner, &self.inner))
-        });
-        if let Some(ctx) = &owner {
-            let mut state = ctx.scope.admit()?;
-            let consumer = self
-                .inner
-                .register(address, Some(ctx.clone()), options.capacity())?;
-            state
-                .subscribers
-                .push((address.into(), consumer.subscriber_id()));
-            Ok(consumer)
-        } else {
-            self.inner.register(address, None, options.capacity())
-        }
+        // Equivalent combinator form:
+        // let owner = self.owner.clone().or_else(|| {
+        //     Context::current().filter(|c| Arc::ptr_eq(&c.inner.event_bus.inner, &self.inner))
+        // });
+        let owner = match self.owner.clone() {
+            Some(ctx) => Some(ctx),
+            None => match Context::current() {
+                Some(ctx) if Arc::ptr_eq(&ctx.inner.event_bus.inner, &self.inner) => Some(ctx),
+                _ => None,
+            },
+        };
+        self.inner.register(address, owner, options.capacity())
     }
 }
 

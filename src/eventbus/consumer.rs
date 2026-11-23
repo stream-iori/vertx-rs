@@ -63,9 +63,6 @@ impl<T: Send + 'static> Consumer<T> {
     pub fn address(&self) -> &str {
         &self.address
     }
-    pub(crate) fn subscriber_id(&self) -> SubscriberId {
-        self.id
-    }
     fn handler_context(&self) -> Result<Context> {
         let ctx = self.owner.clone().ok_or(VertxError::ContextMismatch)?;
         if !Context::current().is_some_and(|c| ctx.same(&c)) {
@@ -162,14 +159,6 @@ impl<T> Unpin for Consumer<T> {}
 impl<T> Consumer<T> {
     fn unregister(&self) {
         self.bus.unregister(&self.address, self.id);
-        if let Some(ctx) = &self.owner {
-            ctx.scope
-                .state
-                .lock()
-                .unwrap()
-                .subscribers
-                .retain(|(_, id)| *id != self.id);
-        }
     }
     fn terminate(&mut self) {
         self.terminal = true;

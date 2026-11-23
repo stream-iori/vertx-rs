@@ -30,7 +30,6 @@ pub(crate) enum Phase {
 }
 pub(crate) struct ScopeState {
     pub phase: Phase,
-    pub subscribers: Vec<(String, u64)>,
     pub tasks: Vec<TaskAbortHandle>,
 }
 pub(crate) struct DeploymentScope {
@@ -48,7 +47,6 @@ impl DeploymentScope {
             cancel,
             state: Mutex::new(ScopeState {
                 phase: Phase::Starting,
-                subscribers: Vec::new(),
                 tasks: Vec::new(),
             }),
             tracker: TaskTracker::new(),

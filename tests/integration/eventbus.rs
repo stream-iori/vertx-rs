@@ -50,6 +50,30 @@ async fn bound_consumer_after_undeploy_returns_terminated(vx: Vertx) {
 
 #[rstest]
 #[tokio::test]
+async fn undeploy_removes_only_its_own_subscribers(vx: Vertx) {
+    let (first_id, first) = capture(&vx).await;
+    let (_, second) = capture(&vx).await;
+    let bus = vx.event_bus();
+    let mut removed = first.event_bus().consumer::<u32>("shared").unwrap();
+    let mut retained = second.event_bus().consumer::<u32>("shared").unwrap();
+    let mut unbound = bus.consumer::<u32>("shared").unwrap();
+
+    vx.undeploy(first_id).await.unwrap();
+
+    // Check the registry before polling or dropping the removed receiver.
+    assert_eq!(vx.diagnostics().active_consumers, 2);
+    bus.publish("shared", 42u32).unwrap();
+    assert_eq!(retained.recv().await.unwrap().unwrap().into_body(), 42);
+    assert_eq!(unbound.recv().await.unwrap().unwrap().into_body(), 42);
+    assert!(matches!(
+        removed.recv().await,
+        Err(VertxError::DeploymentTerminated(id)) if id == first_id
+    ));
+    vx.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn publish_delivers_to_all_subscribers(vx: Vertx) {
     let bus = vx.event_bus();
     let mut a = bus.consumer::<u32>("pub").unwrap();
