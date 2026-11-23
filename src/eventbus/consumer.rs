@@ -1,5 +1,6 @@
 use super::envelope::ErasedEnvelope;
-use super::inner::{EventBusInner, QueueState, SubscriberId};
+use super::queue::QueueState;
+use super::route::{Router, SubscriberId};
 use crate::{Context, Envelope, Result, VertxError};
 use futures::stream::FusedStream;
 use futures::{Stream, StreamExt};
@@ -16,7 +17,7 @@ pub struct Consumer<T> {
     rx: mpsc::Receiver<ErasedEnvelope>,
     address: String,
     id: SubscriberId,
-    bus: Arc<EventBusInner>,
+    router: Arc<Router>,
     owner: Option<Context>,
     queue: Arc<QueueState>,
     cancellation: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
@@ -24,11 +25,11 @@ pub struct Consumer<T> {
     _marker: PhantomData<T>,
 }
 impl<T: Send + 'static> Consumer<T> {
-    pub(crate) fn new(
+    pub(super) fn new(
         rx: mpsc::Receiver<ErasedEnvelope>,
         address: String,
         id: SubscriberId,
-        bus: Arc<EventBusInner>,
+        router: Arc<Router>,
         owner: Option<Context>,
         queue: Arc<QueueState>,
     ) -> Self {
@@ -36,9 +37,9 @@ impl<T: Send + 'static> Consumer<T> {
             rx,
             address,
             id,
-            bus,
+            router,
             owner,
-            cancellation: Box::pin(queue.cancel.clone().cancelled_owned()),
+            cancellation: queue.cancellation(),
             terminal: false,
             queue,
             _marker: PhantomData,
@@ -158,7 +159,7 @@ impl<T: Send + 'static> Consumer<T> {
 impl<T> Unpin for Consumer<T> {}
 impl<T> Consumer<T> {
     fn unregister(&self) {
-        self.bus.unregister(&self.address, self.id);
+        self.router.unregister(&self.address, self.id);
     }
     fn terminate(&mut self) {
         self.terminal = true;
