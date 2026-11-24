@@ -2,7 +2,7 @@
 name = "vertx-rs"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.100.0"
 resolver = "3"
 description = "Rust + Tokio port of Vert.x core: EventLoop-affine Verticle + WorkerVerticle + EventBus"
 license = "Apache-2.0"
