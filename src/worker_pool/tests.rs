@@ -49,6 +49,59 @@ mod scheduling {
         assert!(pool.scheduler.ready_is_empty());
     }
 
+    #[rstest::rstest]
+    #[case::pending(false)]
+    #[case::ready(true)]
+    #[tokio::test]
+    async fn abort_during_poll_wins_over_wakes(#[case] returns_ready: bool) {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let pool = WorkerPool::new(1, 1005).unwrap();
+        let (entered, first_poll) = oneshot::channel::<Waker>();
+        let (release, wait) = std::sync::mpsc::channel();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = polls.clone();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let probe = DropProbe(dropped.clone());
+        let task = pool
+            .spawn(1, Handle::current(), async move {
+                let _probe = probe;
+                let mut entered = Some(entered);
+                futures::future::poll_fn(move |cx| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let Some(entered) = entered.take() else {
+                        return Poll::Ready(Ok(()));
+                    };
+                    entered.send(cx.waker().clone()).unwrap();
+                    wait.recv().unwrap();
+                    if returns_ready {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await
+            })
+            .unwrap();
+        let wake = first_poll.await.unwrap();
+        wake.wake_by_ref();
+        task.abort();
+        wake.wake_by_ref();
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        assert!(matches!(result.unwrap(), Err(VertxError::TaskCancelled)));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(pool.shutdown().await.is_empty());
+    }
+
     #[tokio::test]
     async fn a_pending_future_can_resume_on_a_different_os_thread() {
         let pool = WorkerPool::new(2, 1002).unwrap();

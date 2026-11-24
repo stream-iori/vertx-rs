@@ -73,10 +73,14 @@ impl QueueSender {
     }
 
     pub(super) fn reserve(self) -> Reservation {
-        let acquire = Box::pin(self.tx.clone().reserve_owned());
-        let mut reservation = Reservation::new(self);
-        reservation.acquire = Some(acquire);
-        reservation
+        let future = Box::pin(self.tx.clone().reserve_owned());
+        Reservation::new(
+            self,
+            ReservationState::Acquiring {
+                future,
+                waiting: false,
+            },
+        )
     }
 
     pub(super) fn try_reserve(self) -> Result<Reservation> {
@@ -94,9 +98,8 @@ impl QueueSender {
                 }
                 mpsc::error::TrySendError::Closed(_) => self.closed_error(),
             })?;
-        let mut reservation = Reservation::new(self);
-        reservation.set_permit(permit);
-        Ok(reservation)
+        let state = ReservationState::reserved(permit, self.state.stats.as_deref());
+        Ok(Reservation::new(self, state))
     }
 
     fn check_open(&self) -> Result<()> {
@@ -121,25 +124,36 @@ type Permit = mpsc::OwnedPermit<ErasedEnvelope>;
 type AcquireResult = std::result::Result<Permit, mpsc::error::SendError<()>>;
 type Acquire = Pin<Box<dyn Future<Output = AcquireResult> + Send>>;
 
+enum ReservationState {
+    Acquiring { future: Acquire, waiting: bool },
+    Reserved(Permit),
+    Released,
+}
+
+impl ReservationState {
+    fn reserved(permit: Permit, stats: Option<&QueueStats>) -> Self {
+        if let Some(stats) = stats {
+            stats.reserved.fetch_add(1, Ordering::Relaxed);
+        }
+        Self::Reserved(permit)
+    }
+}
+
 /// One queue position and, once ready, one slot. Drop releases both accounting
 /// and Tokio's reservation even if a waiting sender is aborted before wakeup.
 pub(super) struct Reservation {
     sender: QueueSender,
-    acquire: Option<Acquire>,
     cancel: Pin<Box<WaitForCancellationFutureOwned>>,
-    permit: Option<Permit>,
-    waiting: bool,
+    state: ReservationState,
 }
 
 impl Reservation {
-    fn new(sender: QueueSender) -> Self {
+    fn new(sender: QueueSender, state: ReservationState) -> Self {
         let cancel = sender.state.cancellation();
         Self {
             sender,
-            acquire: None,
             cancel,
-            permit: None,
-            waiting: false,
+            state,
         }
     }
 
@@ -150,16 +164,22 @@ impl Reservation {
         if self.cancel.as_mut().poll(cx).is_ready() {
             return Poll::Ready(self.sender.check_open());
         }
-        if self.permit.is_some() {
-            return Poll::Ready(Ok(()));
-        }
-        let acquire = self
-            .acquire
-            .as_mut()
-            .expect("unreserved sender owns an acquire future");
-        match acquire.as_mut().poll(cx) {
+        let (future, waiting) = match &mut self.state {
+            ReservationState::Acquiring { future, waiting } => (future, waiting),
+            ReservationState::Reserved(_) => return Poll::Ready(Ok(())),
+            ReservationState::Released => return Poll::Ready(Err(self.sender.closed_error())),
+        };
+        match future.as_mut().poll(cx) {
             Poll::Pending => {
-                self.begin_wait();
+                if !std::mem::replace(waiting, true)
+                    && let Some(stats) = &self.sender.state.stats
+                {
+                    stats.waiting.fetch_add(1, Ordering::Relaxed);
+                    // Tokio can also yield for its cooperative budget.
+                    if self.sender.tx.capacity() == 0 {
+                        stats.full();
+                    }
+                }
                 Poll::Pending
             }
             Poll::Ready(result) => Poll::Ready(self.finish_acquire(result)),
@@ -167,53 +187,37 @@ impl Reservation {
     }
 
     fn finish_acquire(&mut self, result: AcquireResult) -> Result<()> {
-        self.end_wait();
-        self.acquire = None;
+        drop(self.release());
         let permit = result.map_err(|_| self.sender.closed_error())?;
-        self.set_permit(permit);
+        self.state = ReservationState::reserved(permit, self.sender.state.stats.as_deref());
         self.sender.check_open()
     }
 
-    fn set_permit(&mut self, permit: Permit) {
-        self.permit = Some(permit);
+    fn release(&mut self) -> ReservationState {
+        let state = std::mem::replace(&mut self.state, ReservationState::Released);
         if let Some(stats) = &self.sender.state.stats {
-            stats.reserved.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn begin_wait(&mut self) {
-        if self.waiting {
-            return;
-        }
-        self.waiting = true;
-        if let Some(stats) = &self.sender.state.stats {
-            stats.waiting.fetch_add(1, Ordering::Relaxed);
-            // Tokio can also yield for its cooperative budget.
-            if self.sender.tx.capacity() == 0 {
-                stats.full();
+            match &state {
+                ReservationState::Acquiring { waiting: true, .. } => {
+                    stats.waiting.fetch_sub(1, Ordering::Relaxed);
+                }
+                ReservationState::Reserved(_) => {
+                    stats.reserved.fetch_sub(1, Ordering::Relaxed);
+                }
+                ReservationState::Acquiring { waiting: false, .. } | ReservationState::Released => {
+                }
             }
         }
-    }
-
-    fn end_wait(&mut self) {
-        if self.waiting {
-            self.waiting = false;
-            if let Some(stats) = &self.sender.state.stats {
-                stats.waiting.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        state
     }
 
     pub(super) fn send(mut self, mut envelope: ErasedEnvelope) -> Result<()> {
         // Tracing callbacks can reenter the bus before the final liveness check.
         let trace = envelope.trace.mark_enqueued();
         self.sender.check_open()?;
-        let permit = self
-            .permit
-            .take()
-            .ok_or_else(|| VertxError::Other("sink is not ready".into()))?;
+        let ReservationState::Reserved(permit) = self.release() else {
+            return Err(VertxError::Other("sink is not ready".into()));
+        };
         if let Some(stats) = &self.sender.state.stats {
-            stats.reserved.fetch_sub(1, Ordering::Relaxed);
             // Update counts before waking a receiver which may immediately dequeue.
             stats.queued.fetch_add(1, Ordering::Relaxed);
         }
@@ -227,11 +231,6 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.end_wait();
-        if self.permit.is_some()
-            && let Some(stats) = &self.sender.state.stats
-        {
-            stats.reserved.fetch_sub(1, Ordering::Relaxed);
-        }
+        drop(self.release());
     }
 }

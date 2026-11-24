@@ -76,8 +76,16 @@ async fn message_sink_waits_on_its_selected_consumer_and_drop_releases_wait(vx: 
         ))
         .is_pending()
     );
-    assert_eq!(vx.diagnostics().waiting_senders, 1);
+    let waiting = vx.diagnostics();
+    assert_eq!(waiting.waiting_senders, 1);
+    assert_eq!(waiting.queue_full_events, 1);
     a.recv().await.unwrap().unwrap();
+    futures::future::poll_fn(|cx| std::pin::Pin::new(&mut sink).poll_ready(cx))
+        .await
+        .unwrap();
+    let reserved = vx.diagnostics();
+    assert_eq!(reserved.waiting_senders, 0);
+    assert_eq!(reserved.reserved_slots, 1);
     sink.send(3).await.unwrap();
     // Adding a consumer changes subsequent round-robin indices. A is still
     // full here, so dropping the next pending send must release its waiter.

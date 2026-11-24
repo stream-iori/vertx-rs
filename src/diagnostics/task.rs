@@ -30,7 +30,7 @@ impl Diagnostics {
                 phase: Some(stage),
                 since: Instant::now(),
             })),
-            result: None,
+            outcome: None,
             error_kind: None,
             started: Instant::now(),
         };
@@ -116,13 +116,31 @@ struct StageState {
     phase: Option<TaskStage>,
     since: Instant,
 }
+
+#[derive(Clone, Copy)]
+enum TaskOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 pub(crate) struct TaskRecord {
     diagnostics: Arc<Diagnostics>,
     pub id: TaskId,
     context_id: ContextId,
     deployment_id: DeploymentId,
     stage: Arc<Mutex<StageState>>,
-    result: Option<&'static str>,
+    outcome: Option<TaskOutcome>,
     error_kind: Option<&'static str>,
     started: Instant,
 }
@@ -164,15 +182,17 @@ impl TaskRecord {
     }
     pub fn result<T>(&mut self, result: &crate::Result<T>) {
         self.error_kind = result.as_ref().err().map(VertxError::kind);
-        self.result = Some(match result {
-            Ok(_) => "completed",
-            Err(VertxError::TaskCancelled) => "cancelled",
-            Err(VertxError::DeploymentTerminated(id)) if *id == self.deployment_id => "cancelled",
-            Err(_) => "failed",
+        self.outcome = Some(match result {
+            Ok(_) => TaskOutcome::Completed,
+            Err(VertxError::TaskCancelled) => TaskOutcome::Cancelled,
+            Err(VertxError::DeploymentTerminated(id)) if *id == self.deployment_id => {
+                TaskOutcome::Cancelled
+            }
+            Err(_) => TaskOutcome::Failed,
         });
     }
     pub fn failed(&mut self) {
-        self.result = Some("failed");
+        self.outcome = Some(TaskOutcome::Failed);
         self.error_kind = Some("panic");
     }
     pub fn waker(&self, original: &Waker) -> Waker {
@@ -198,21 +218,23 @@ impl TaskRecord {
         state.summary.active_tasks -= 1;
         adjust(&mut state.summary, stage, -1);
         state.tasks.remove(&self.id);
-        let outcome = self.result.unwrap_or(if std::thread::panicking() {
-            "failed"
-        } else {
-            "cancelled"
+        let outcome = self.outcome.unwrap_or_else(|| {
+            if std::thread::panicking() {
+                TaskOutcome::Failed
+            } else {
+                TaskOutcome::Cancelled
+            }
         });
         match outcome {
-            "completed" => state.summary.completed += 1,
-            "failed" => state.summary.failed += 1,
-            _ => state.summary.cancelled += 1,
+            TaskOutcome::Completed => state.summary.completed += 1,
+            TaskOutcome::Failed => state.summary.failed += 1,
+            TaskOutcome::Cancelled => state.summary.cancelled += 1,
         }
         drop(state);
         drop(current);
         tracing::debug!(
             instance_id = self.diagnostics.instance, deployment_id = %self.deployment_id,
-            context_id = %self.context_id, task_id = %self.id, outcome,
+            context_id = %self.context_id, task_id = %self.id, outcome = outcome.as_str(),
             error_kind = self.error_kind, total_elapsed = ?self.started.elapsed(),
             "task finished after user drop"
         );

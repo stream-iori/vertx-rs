@@ -48,7 +48,7 @@ impl Scheduler {
             }
             state.tasks.insert(task.id, task.clone());
         }
-        task.schedule(false);
+        task.schedule();
         Ok(())
     }
 

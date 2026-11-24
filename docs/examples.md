@@ -5,8 +5,8 @@
 九个示例可独立运行，无需外部服务，均通过 `try_build()` 创建实例，业务阶段最多等待 5 秒，
 最后显式 `close().await`；业务和关闭同时失败时，通过 `LifecycleFailed` 保留两者。
 三个综合示例使用两个 EventLoop 和两个 Worker，六个专题示例使用一个 EventLoop 和两个 Worker。
-专题示例通过 `support/mod.rs` 共用日志、超时和关闭辅助函数；该模块不是可运行示例。
-成功关闭后，专题示例还会检查部署、任务、消费者及 blocking 活跃计数归零。
+九个示例共用 `support/mod.rs` 中的日志、超时和关闭处理。
+成功关闭后，共用代码会检查部署、任务、消费者、队列及 blocking 活跃计数归零。
 
 ## 选择示例
 
@@ -96,7 +96,7 @@ main ── request ──→ Pinger（Rc<Cell> 状态）── reply ──→ 
 - 每个消息队列容量为 1，Sink 接收慢时，等待沿流水线传回数据源。
 - 同一个 seed 分别通过 `execute_blocking` 和 `execute_blocking_unordered` 计算校验和，并核对结果。
 - Sink 用 `take(5)` 定义结束条件。收集结果按 seed 排序，再在调用方复算校验。
-- 打印运行与关闭快照，成功 close 后检查部署、任务及消费者活跃计数归零。
+- 打印运行与关闭快照，展示流水线的活跃计数和队列状态。
 
 预期看到 `deployed 2 hashers with shared salt=0x5a5a`、五组校验和和 `close=closed`。
 不同消费者可以并行，因此不承诺处理完成顺序；ordered 只保证同 Context 的 blocking FIFO。

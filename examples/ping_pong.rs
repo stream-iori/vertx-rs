@@ -6,6 +6,8 @@
 //! LOG_FORMAT=json 可输出 JSON 日志；预期：pong#1、recipient_failure、timeout、stop。
 //! 超时不会撤回已入队消息；同步慢操作必须放进 execute_blocking。
 //! 三次周期心跳广播给两个订阅者；定时器取消不会撤销 Pinger 部署。
+mod support;
+
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::cell::Cell;
@@ -132,35 +134,14 @@ async fn run(vx: &Vertx) -> Result<()> {
         .await?;
     Ok(())
 }
-fn init_tracing() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
-        builder.json().init();
-    } else {
-        builder.init();
-    }
-}
-async fn finish(vx: &Vertx, outcome: Result<()>) -> Result<()> {
-    match (outcome, vx.close().await) {
-        (Ok(()), close) => close,
-        (Err(cause), Ok(())) => Err(cause),
-        (Err(cause), Err(cleanup)) => Err(VertxError::LifecycleFailed {
-            cause: Box::new(cause),
-            cleanup: vec![cleanup],
-        }),
-    }
-}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    support::init_tracing();
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(2)
         .try_build()?;
-    let outcome = tokio::time::timeout(Duration::from_secs(5), run(&vx))
-        .await
-        .unwrap_or_else(|_| Err(VertxError::Timeout(Duration::from_secs(5))));
-    finish(&vx, outcome).await
+    let outcome = support::bounded(run(&vx)).await;
+    support::finish(&vx, outcome).await
 }

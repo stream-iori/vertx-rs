@@ -6,6 +6,8 @@
 //! ordered 只保证同来源 Context 的 blocking FIFO，不保证全流水线输出顺序。
 //! handler 等待上一条处理结束后才消费下一条；增加消费者才会增加消息并行度。
 //! deploy_with 用同一份强类型配置部署两个 Hasher；结果按 seed 排序后展示。
+mod support;
+
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::time::Duration;
@@ -157,29 +159,10 @@ fn print_snapshot(label: &str, vx: &Vertx) {
         );
     }
 }
-fn init_tracing() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
-        builder.json().init();
-    } else {
-        builder.init();
-    }
-}
-async fn finish(vx: &Vertx, outcome: Result<()>) -> Result<()> {
-    match (outcome, vx.close().await) {
-        (Ok(()), close) => close,
-        (Err(cause), Ok(())) => Err(cause),
-        (Err(cause), Err(cleanup)) => Err(VertxError::LifecycleFailed {
-            cause: Box::new(cause),
-            cleanup: vec![cleanup],
-        }),
-    }
-}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    support::init_tracing();
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(2)
@@ -191,16 +174,8 @@ async fn main() -> Result<()> {
             ..Default::default()
         })
         .try_build()?;
-    let outcome = tokio::time::timeout(Duration::from_secs(5), run(&vx))
-        .await
-        .unwrap_or_else(|_| Err(VertxError::Timeout(Duration::from_secs(5))));
-    let result = finish(&vx, outcome).await;
+    let outcome = support::bounded(run(&vx)).await;
+    let result = support::finish(&vx, outcome).await;
     print_snapshot("closed", &vx);
-    if result.is_ok() {
-        let snapshot = vx.diagnostics();
-        assert_eq!(snapshot.active_deployments, 0);
-        assert_eq!(snapshot.active_tasks, 0);
-        assert_eq!(snapshot.active_consumers, 0);
-    }
     result
 }

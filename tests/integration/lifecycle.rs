@@ -1,12 +1,12 @@
 //! Deployment readiness, rollback, cancellation and resource ownership.
 
-use super::support::{Local, capture, echo, local, vx, worker};
+use super::support::{Local, capture, capture_worker, echo, local, vx, worker};
 use async_trait::async_trait;
 use rstest::rstest;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeploymentOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Context, DeploymentOptions, Result, Verticle, Vertx, VertxError, WorkerVerticle};
 
 struct Lifecycle {
     started: Arc<AtomicUsize>,
@@ -165,6 +165,74 @@ async fn start_failure_and_factory_panic_clean_resources(vx: Vertx) {
         vx.event_bus().try_send("panic", ()),
         Err(VertxError::NoConsumer(_))
     ));
+    vx.close().await.unwrap();
+}
+
+#[rstest]
+#[case::event_loop(false)]
+#[case::worker(true)]
+#[tokio::test]
+async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: bool) {
+    struct PanicStart {
+        stopped: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl Verticle for PanicStart {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            panic!("start panicked");
+        }
+
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WorkerVerticle for PanicStart {
+        async fn start(&mut self, _: Context) -> Result<()> {
+            panic!("start panicked");
+        }
+
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for PanicStart {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let verticle = PanicStart {
+        stopped: stopped.clone(),
+        dropped: dropped.clone(),
+    };
+    let result = if worker {
+        vx.deploy_worker(move |_| verticle).await
+    } else {
+        vx.deploy(move |_| verticle).await
+    };
+    assert!(matches!(result, Err(VertxError::Panic(message)) if message == "start panicked"));
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst));
+
+    // The next start on the same executor follows the failed driver's final poll.
+    if worker {
+        capture_worker(&vx).await;
+    } else {
+        capture(&vx).await;
+    }
     vx.close().await.unwrap();
 }
 

@@ -1,4 +1,4 @@
-//! Utilities shared by the focused examples; this module is not an example target.
+//! Utilities shared by the examples.
 use std::future::Future;
 use std::time::Duration;
 use vertx_rs::{Result, Vertx, VertxError};

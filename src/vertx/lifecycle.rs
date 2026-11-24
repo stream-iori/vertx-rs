@@ -15,17 +15,11 @@ pub(super) async fn drive_local<V: Verticle>(
     ready: ReadySender,
 ) -> Result<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
-    let mut verticle = lifecycle.create(factory);
-    let should_stop = if let Some(verticle) = &mut verticle {
-        lifecycle
-            .start_and_wait_for_stop(verticle.start(ctx.clone()))
-            .await
-    } else {
-        false
-    };
-    lifecycle.quiesce().await;
-    if let Some(mut verticle) = verticle {
-        if should_stop {
+    if let Some(mut verticle) = lifecycle.create(factory) {
+        let startup = lifecycle.start(verticle.start(ctx.clone())).await;
+        let run_stop = startup.runs_stop();
+        lifecycle.quiesce_after_start(startup).await;
+        if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
                 .stop(&stop_ctx, verticle.stop(stop_ctx.clone()))
@@ -33,6 +27,8 @@ pub(super) async fn drive_local<V: Verticle>(
         }
         lifecycle.destroy(verticle);
         lifecycle.wait_for_stop_work().await;
+    } else {
+        lifecycle.quiesce().await;
     }
     lifecycle.finish();
     Ok(())
@@ -44,17 +40,11 @@ pub(super) async fn drive_worker<V: WorkerVerticle>(
     ready: ReadySender,
 ) -> Result<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
-    let mut verticle = lifecycle.create(factory);
-    let should_stop = if let Some(verticle) = &mut verticle {
-        lifecycle
-            .start_and_wait_for_stop(verticle.start(ctx.clone()))
-            .await
-    } else {
-        false
-    };
-    lifecycle.quiesce().await;
-    if let Some(mut verticle) = verticle {
-        if should_stop {
+    if let Some(mut verticle) = lifecycle.create(factory) {
+        let startup = lifecycle.start(verticle.start(ctx.clone())).await;
+        let run_stop = startup.runs_stop();
+        lifecycle.quiesce_after_start(startup).await;
+        if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
                 .stop(&stop_ctx, verticle.stop(stop_ctx.clone()))
@@ -62,16 +52,34 @@ pub(super) async fn drive_worker<V: WorkerVerticle>(
         }
         lifecycle.destroy(verticle);
         lifecycle.wait_for_stop_work().await;
+    } else {
+        lifecycle.quiesce().await;
     }
     lifecycle.finish();
     Ok(())
+}
+
+enum Startup {
+    Started,
+    Cancelled(VertxError),
+    Failed(VertxError),
+    Panicked(VertxError),
+}
+
+impl Startup {
+    fn runs_stop(&self) -> bool {
+        match self {
+            Self::Started | Self::Cancelled(_) | Self::Failed(_) => true,
+            Self::Panicked(_) => false,
+        }
+    }
 }
 
 struct Lifecycle<'a> {
     ctx: &'a Context,
     ready: Option<ReadySender>,
     outcome: Result<()>,
-    startup_failure: Option<VertxError>,
+    startup_cancellation: Option<VertxError>,
 }
 
 impl<'a> Lifecycle<'a> {
@@ -80,7 +88,7 @@ impl<'a> Lifecycle<'a> {
             ctx,
             ready: Some(ready),
             outcome: Ok(()),
-            startup_failure: None,
+            startup_cancellation: None,
         };
         lifecycle.stage(DeploymentStage::Starting);
         lifecycle
@@ -96,30 +104,37 @@ impl<'a> Lifecycle<'a> {
         }
     }
 
-    async fn start_and_wait_for_stop(&mut self, start: impl Future<Output = Result<()>>) -> bool {
+    async fn start(&self, start: impl Future<Output = Result<()>>) -> Startup {
         let scope = &self.ctx.scope;
+        let cancelled = Startup::Cancelled(VertxError::DeploymentTerminated(scope.deployment));
         let result = tokio::select! { biased;
-            _ = scope.cancel.cancelled() => Ok(Err(VertxError::DeploymentTerminated(scope.deployment))),
+            _ = scope.cancel.cancelled() => return cancelled,
             result = AssertUnwindSafe(start).catch_unwind() => result,
         };
-        let (start, panicked) = match result {
-            Ok(start) => (start, false),
-            Err(error) => (Err(panic_error(error)), true),
-        };
-        if start.is_ok() && scope.running() {
-            self.notify_started();
-            scope.cancel.cancelled().await;
-        } else {
-            let error = start
-                .err()
-                .unwrap_or(VertxError::DeploymentTerminated(scope.deployment));
-            // A cancelled startup reports non-readiness and allows an orderly close.
-            if !matches!(error, VertxError::DeploymentTerminated(_)) {
-                self.outcome = Err(error.clone());
-            }
-            self.startup_failure = Some(error);
+        match result {
+            Ok(Ok(())) if scope.running() => Startup::Started,
+            Ok(Ok(())) => cancelled,
+            Ok(Err(error @ VertxError::DeploymentTerminated(_))) => Startup::Cancelled(error),
+            Ok(Err(error)) => Startup::Failed(error),
+            Err(error) => Startup::Panicked(panic_error(error)),
         }
-        !panicked
+    }
+
+    async fn quiesce_after_start(&mut self, startup: Startup) {
+        match startup {
+            Startup::Started => {
+                self.notify_started();
+                self.ctx.scope.cancel.cancelled().await;
+            }
+            Startup::Cancelled(error) => {
+                // Report non-readiness to the deploy waiter and allow orderly close.
+                self.startup_cancellation = Some(error);
+            }
+            Startup::Failed(error) | Startup::Panicked(error) => {
+                self.outcome = Err(error);
+            }
+        }
+        self.quiesce().await;
     }
 
     fn notify_started(&mut self) {
@@ -173,7 +188,7 @@ impl<'a> Lifecycle<'a> {
             ctx,
             ready,
             outcome,
-            startup_failure,
+            startup_cancellation,
         } = self;
         let id = ctx.scope.deployment;
         if let Err(error) = &outcome {
@@ -184,7 +199,7 @@ impl<'a> Lifecycle<'a> {
         if let Some(ready) = ready {
             let error = outcome
                 .err()
-                .or(startup_failure)
+                .or(startup_cancellation)
                 .unwrap_or_else(|| VertxError::StartFailed("startup cancelled".into()));
             let _ = ready.send(Err(error));
         }
