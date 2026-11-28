@@ -39,6 +39,8 @@ close_result: watch::Sender<Option<Result<()>>>
 |---|---|
 | `None` | 关闭尚无最终结果。 |
 | `Some(Ok(()))` | 关闭成功，Worker 和 EventLoop 线程已完成回收。 |
-| `Some(Err(error))` | 清理失败，保存错误供调用方读取。 |
+| `Some(Err(error))` | 发起关闭或清理失败，保存错误供调用方读取。 |
 
-`close()` 先订阅并读取当前值，看到 `None` 才等待变化。清理端通过 `send_replace()` 发布最终结果。即使当前所有调用方都已超时，之后调用 `close()` 也能继续等同一次清理，或者直接读到已保存的结果。[等待结果](../src/vertx.rs#L556) · [发布结果](../src/eventloop.rs#L401)
+`request_close()` 发起关闭。`wait_closed()` 订阅 `close_result` 后先读取当前值，看到 `None` 才等待更新。外部也可以用 `close()` 发起关闭并限时等待，超时后用 `wait_closed()` 接着等。 [等待结果](../src/vertx/shutdown.rs#L122)
+
+清理流程先 join Worker，再由回收线程 join 所有 EventLoop。回收线程用 `send_replace()` 保存最终结果，即使当时没有等待者，之后订阅也能读到同一个结果。 [发布结果](../src/eventloop.rs#L182)
