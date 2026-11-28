@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="generator" content="archify 3.2.0">
   <meta name="archify-reader-contract" content="declared-wide-v1">
-  <title>vertx-rs 结构体关系与请求流程</title>
+  <title>vertx-rs 请求与一次性回复流程</title>
   <script>
     // Resolve the theme before first paint so light-preference users don't
     // see a dark flash. The toolbar script below re-applies with UI state.
@@ -5194,17 +5194,17 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
            data-preset-badge-blueprint="蓝图 / 修订 01"
            data-preset-badge-editorial="编辑风格 / 现场笔记">
         <div class="pulse-dot"></div>
-        <h1>vertx-rs 结构体关系与请求流程</h1>
+        <h1>vertx-rs 请求与一次性回复流程</h1>
       </div>
     </div>
 
-    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/stream-iori/vertx-rs","revision":"59e029c49ae0956da3b201ff35d123c36809973f","shortRevision":"59e029c","label":"stream-iori/vertx-rs","href":"https://github.com/stream-iori/vertx-rs/tree/59e029c49ae0956da3b201ff35d123c36809973f"},"referenceCount":14,"nodes":{"call":[{"path":"examples/ping_pong.rs","line":94,"endLine":102,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/examples/ping_pong.rs#L94-L102"}],"request":[{"path":"src/eventbus/mod.rs","line":132,"endLine":152,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/mod.rs#L132-L152"},{"path":"src/eventbus/inner.rs","line":434,"endLine":444,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/inner.rs#L434-L444"}],"queue":[{"path":"src/eventbus/inner.rs","line":379,"endLine":415,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/inner.rs#L379-L415"},{"path":"src/eventbus/inner.rs","line":171,"endLine":184,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/inner.rs#L171-L184"}],"receive":[{"path":"src/eventbus/consumer.rs","line":92,"endLine":100,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/consumer.rs#L92-L100"},{"path":"src/eventbus/consumer.rs","line":195,"endLine":209,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/consumer.rs#L195-L209"},{"path":"src/eventbus/envelope.rs","line":100,"endLine":113,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/envelope.rs#L100-L113"}],"handle":[{"path":"src/eventbus/consumer.rs","line":132,"endLine":149,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/consumer.rs#L132-L149"},{"path":"examples/ping_pong.rs","line":36,"endLine":64,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/examples/ping_pong.rs#L36-L64"}],"reply":[{"path":"src/eventbus/envelope.rs","line":125,"endLine":138,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/envelope.rs#L125-L138"},{"path":"src/eventbus/envelope.rs","line":184,"endLine":189,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/envelope.rs#L184-L189"}],"resolve":[{"path":"src/eventbus/mod.rs","line":140,"endLine":152,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/src/eventbus/mod.rs#L140-L152"}],"done":[{"path":"examples/ping_pong.rs","line":94,"endLine":107,"href":"https://github.com/stream-iori/vertx-rs/blob/59e029c49ae0956da3b201ff35d123c36809973f/examples/ping_pong.rs#L94-L107"}]}}</script>
+    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/stream-iori/vertx-rs","revision":"ddc69cb8a2b7955b9b3be70dce7663e95e0259aa","shortRevision":"ddc69cb","label":"stream-iori/vertx-rs","linkMode":"local-only"},"referenceCount":10,"nodes":{"invoke":[{"path":"examples/ping_pong.rs","line":73,"endLine":96}],"finish":[{"path":"examples/ping_pong.rs","line":73,"endLine":96}],"prepare":[{"path":"src/eventbus/delivery.rs","line":120,"endLine":143},{"path":"src/eventbus/delivery.rs","line":146,"endLine":163}],"admit":[{"path":"src/eventbus/route.rs","line":185,"endLine":198},{"path":"src/eventbus/queue.rs","line":69,"endLine":76}],"receive":[{"path":"src/eventbus/delivery.rs","line":146,"endLine":163}],"take":[{"path":"src/eventbus/consumer.rs","line":122,"endLine":143}],"handle":[{"path":"src/eventbus/consumer.rs","line":122,"endLine":143}],"reply":[{"path":"src/eventbus/envelope.rs","line":120,"endLine":145}]}}</script>
     <script id="archify-i18n-data" type="application/json">{"locale":"zh-CN","messages":{"viewer.kind.frontend":"前端","viewer.kind.backend":"后端","viewer.kind.database":"数据库","viewer.kind.cloud":"云服务","viewer.kind.security":"安全","viewer.kind.messagebus":"消息总线","viewer.kind.external":"外部系统","viewer.kind.neutral":"中性","viewer.kind.node":"节点","viewer.kind.start":"开始","viewer.kind.active":"活动","viewer.kind.waiting":"等待","viewer.kind.decision":"决策","viewer.kind.success":"成功","viewer.kind.failure":"失败","viewer.toolbar.actions":"图表操作","viewer.theme.toggle.title":"切换主题（T）","viewer.theme.toggle":"切换颜色主题","viewer.theme.dark":"深色","viewer.theme.light":"浅色","viewer.preset.choose.title":"选择视觉风格（S 循环切换）","viewer.preset.choose":"选择视觉风格","viewer.preset.style":"风格","viewer.preset.menu":"视觉风格","viewer.preset.identity":"视觉表达","viewer.preset.cycles":"循环切换","viewer.preset.classic":"经典","viewer.preset.classic.short":"经典","viewer.preset.classic.hint":"稳定的技术默认风格","viewer.preset.flow":"信号流","viewer.preset.flow.short":"流动","viewer.preset.flow.hint":"突出动态流向","viewer.preset.blueprint":"蓝图","viewer.preset.blueprint.hint":"工程评审","viewer.preset.editorial":"编辑风格","viewer.preset.editorial.hint":"适合发布与上线说明","viewer.preset.badge.signalFlow":"信号流","viewer.preset.badge.blueprint":"蓝图 / 修订 01","viewer.preset.badge.editorial":"编辑风格 / 现场笔记","viewer.preset.badge.editorialPlate":"ARCHIFY / 图版 04","viewer.preset.current":"当前视觉风格：{style}。选择视觉风格","viewer.motion.live":"动态","viewer.motion.still":"静态","viewer.motion.pause":"暂停动效","viewer.motion.resume":"恢复动效","viewer.motion.reduced":"已根据减少动态效果偏好暂停动效","viewer.motion.hidden":"页面不可见时已暂停动效","viewer.motion.yielding":"暂停动效；当前让位于{owner}","viewer.motion.yielding.title":"动态预览已启用 · 正在让位于{owner}","viewer.owner.route":"路径探测","viewer.owner.lens":"语义透镜","viewer.owner.relationship":"关系预览","viewer.owner.intent":"意图追踪","viewer.owner.focus":"语义聚焦","viewer.owner.legend":"图例预览","viewer.owner.reader":"读者交互","viewer.present.enter":"进入演示模式","viewer.present.enter.title":"演示模式（F）","viewer.present.exit":"退出演示模式","viewer.present.exit.title":"退出演示模式（F 或 Escape）","viewer.present.present":"演示","viewer.present.exit.label":"退出","viewer.export.button":"导出","viewer.export.button.title":"导出图表（E）","viewer.export.diagram":"导出图表","viewer.export.menu":"导出","viewer.export.subtitle":"便携、整洁的输出","viewer.export.share":"分享","viewer.export.shareCard":"分享卡片","viewer.export.routeShareCard":"路径分享卡片","viewer.export.reachShareCard":"可达范围分享卡片","viewer.export.copyDiagram":"复制图表","viewer.export.clipboardPng":"复制 PNG 到剪贴板","viewer.export.raster":"位图","viewer.export.image":"图像","viewer.export.lossless":"无损图像","viewer.export.compact":"紧凑图像","viewer.export.modern":"现代图像格式","viewer.export.vectorMotion":"矢量与动效","viewer.export.vectorMotion.heading":"矢量与动效","viewer.export.editable":"可编辑矢量图","viewer.export.svg.auto":"SVG · 自动","viewer.export.svg.auto.hint":"匹配宿主主题","viewer.export.svg.light":"SVG · 浅色","viewer.export.svg.light.hint":"始终浅色","viewer.export.svg.dark":"SVG · 深色","viewer.export.svg.dark.hint":"始终深色","viewer.export.motion6s":"6 秒动效","viewer.export.unsupported":"当前浏览器不支持","viewer.export.clipboardUnsupported":"当前浏览器不支持写入图片剪贴板","viewer.export.clipboardUnsupported.short":"此浏览器不支持写入图片剪贴板。","viewer.export.motionUnavailable":"当前浏览器无法录制动效","viewer.export.webmUnavailable":"当前浏览器不支持 WebM","viewer.export.failed":"导出失败：{message}","viewer.export.unknownVariant":"未知的分享卡片类型：{variant}","viewer.export.routeRequired":"请先追踪路径，再导出路径分享卡片","viewer.export.reachRequired":"请先追踪编写可达范围，再导出可达范围分享卡片","viewer.export.unknown":"未知错误","viewer.export.routeFailed":"路径分享卡片导出失败：{message}","viewer.export.reachFailed":"可达范围分享卡片导出失败：{message}","viewer.export.copyFailed":"复制失败：{message}","viewer.export.copiedPng":"已将 PNG 复制到剪贴板","viewer.export.downloadedRoute":"已下载路径分享卡片","viewer.export.downloadedReach":"已下载可达范围分享卡片","viewer.export.downloadedWebm":"已下载 WebM","viewer.export.recording":"正在录制 6 秒动效…","viewer.export.card.routeSummary.one":"路径：{source} → {target} · {count} 步","viewer.export.card.routeSummary.other":"路径：{source} → {target} · {count} 步","viewer.export.card.reachSummary":"从{origin}开始的编写{direction} · {nodes} · {links} · 最深 {hops}","viewer.export.card.node.one":"{count} 个节点","viewer.export.card.node.other":"{count} 个节点","viewer.export.card.link.one":"{count} 条连接","viewer.export.card.link.other":"{count} 条连接","viewer.export.card.hop.one":"{count} 跳","viewer.export.card.hop.other":"{count} 跳","viewer.export.card.routeBadge":"ARCHIFY · 路径 · {hops}","viewer.export.card.reachBadge":"ARCHIFY · {direction}可达范围","viewer.export.direction.upstream":"上游","viewer.export.direction.downstream":"下游","viewer.export.error.canvasUnavailable":"无法为{label}使用画布","viewer.export.error.contextUnavailable":"无法为{label}创建二维画布上下文","viewer.export.error.toBlobUnavailable":"{label}无法使用 canvas.toBlob","viewer.export.error.toBlobNull":"{label}的 canvas.toBlob 未返回数据","viewer.export.error.variantsCombined":"无法同时组合多种分享卡片类型","viewer.export.error.viewerState":"分享卡片导出无法移除临时 Viewer 状态","viewer.export.error.routeState":"路径卡片导出无法安全保留已解析路径","viewer.export.error.reachState":"可达范围卡片导出无法安全保留编写的可达范围","viewer.export.error.webmRequirements":"WebM 动效导出需要追踪动画及浏览器 MediaRecorder 支持","viewer.export.error.mediaRecorder":"MediaRecorder 录制失败","viewer.export.error.emptyWebm":"MediaRecorder 生成了空的 WebM","viewer.export.error.webmBackground":"无法为 WebM 导出加载 SVG 背景","viewer.guide.title":"探索此系统","viewer.focus.selectedNodes":"已选择 {count} 个节点","viewer.guide.eyebrow":"图表指南","viewer.guide.close":"关闭图表指南","viewer.guide.inspecting":"正在检查已编译语义","viewer.guide.actions":"图表探索操作","viewer.guide.find":"查找任意节点","viewer.guide.find.hint":"搜索标签、职责、类型和稳定 ID。","viewer.guide.route":"追踪路径","viewer.guide.route.aria":"追踪有向路径","viewer.guide.route.hint":"查看两个语义节点如何按编写方向连接。","viewer.guide.map":"查看完整系统","viewer.guide.map.hint":"打开带实时视口和稳定节点的语义雷达。","viewer.guide.lens":"比较语义类型","viewer.guide.lens.hint":"统计角色、显示流量并比较直接编写的连接。","viewer.guide.present":"进入演示模式","viewer.guide.present.hint":"让实时图表占满视口，同时不改变导出。","viewer.guide.shortcuts":"其他键盘快捷键","viewer.guide.shortcut.export":"导出","viewer.guide.shortcut.theme":"主题","viewer.guide.shortcut.style":"风格","viewer.guide.shortcut.reset":"重置","viewer.guide.shortcut.zoomIn":"放大","viewer.guide.shortcut.zoomOut":"缩小","viewer.guide.shortcut.close":"关闭","viewer.guide.credit":"觉得好用？在 GitHub 给 Archify 点个 Star","viewer.guide.star":"Star","viewer.guide.facts":"{nodes} · {relationships}","viewer.guide.fact.node.one":"{count} 个语义节点","viewer.guide.fact.node.other":"{count} 个语义节点","viewer.guide.fact.relationship.one":"{count} 条关系","viewer.guide.fact.relationship.other":"{count} 条关系","viewer.guide.open":"打开图表指南","viewer.finder.title":"查找节点","viewer.finder.close":"关闭节点查找器","viewer.finder.placeholder":"搜索标签或 ID","viewer.finder.search":"搜索图表节点","viewer.finder.results":"图表节点","viewer.finder.empty":"没有匹配的节点","viewer.finder.result.focus":"聚焦{label}","viewer.finder.result.routeStart":"选择{label}作为路径起点","viewer.finder.result.routeTarget":"选择{label}作为路径终点，{links}","viewer.finder.status.empty":"没有匹配的节点","viewer.finder.status.count.one":"{count} 个匹配节点","viewer.finder.status.count.other":"{count} 个匹配节点","viewer.finder.noun.nodes":"个节点","viewer.finder.link.one":"{count} 条连接","viewer.finder.link.other":"{count} 条连接","viewer.finder.result.focus.one":"聚焦{label}，{count} 条相关连接","viewer.finder.result.focus.other":"聚焦{label}，{count} 条相关连接","viewer.finder.status.filtered":"{visible}/{available} {noun}","viewer.finder.status.all":"{available} {noun}","viewer.passport.eyebrow":"语义护照","viewer.passport.metadata":"节点元数据","viewer.passport.evidence":"已验证的源代码证据","viewer.passport.verified":"已验证来源","viewer.passport.verificationScope":"已按固定修订版本验证本地 Git 证据，未检查远程访问权限。","viewer.passport.reach":"编写可达范围","viewer.passport.reach.trace":"追踪编写的可达性","viewer.passport.upstream":"上游","viewer.passport.downstream":"下游","viewer.passport.upstream.trace":"追踪上游编写可达性","viewer.passport.downstream.trace":"追踪下游编写可达性","viewer.passport.close":"关闭语义护照","viewer.passport.move":"移动语义护照。可拖动、使用方向键移动，或按 Home 恢复自动位置。","viewer.passport.copy":"复制链接","viewer.passport.copy.focus":"复制聚焦节点的链接","viewer.passport.relations":"关系","viewer.passport.relations.show":"显示关联关系","viewer.passport.relations.hide":"隐藏关联关系","viewer.passport.relations.list":"关联关系","viewer.passport.copyRelation":"复制关系","viewer.passport.copyNode":"复制节点","viewer.passport.copyPinned":"复制固定关系的链接","viewer.passport.copySource":"复制来源节点的链接","viewer.passport.copy.focused.success":"已复制聚焦节点链接","viewer.passport.copy.pinned.success":"已复制固定关系链接","viewer.passport.copy.focused.failed":"无法复制聚焦节点链接","viewer.passport.copy.pinned.failed":"无法复制固定关系链接","viewer.passport.relationship.none":"没有关联关系","viewer.passport.relationship.count.one":"{count} 条关系","viewer.passport.relationship.count.other":"{count} 条关系","viewer.passport.relationship.show.one":"显示 {count} 条关联关系","viewer.passport.relationship.show.other":"显示 {count} 条关联关系","viewer.passport.relationship.summary":"{out} 条出向 · {in} 条入向{loops}","viewer.passport.relationship.loops":" · {count} 条自环","viewer.passport.relationship.explorer":"直接关系浏览器","viewer.passport.relationship.help":"使用方向键浏览关系。按 Enter 或空格键固定详情；按 Escape 清除。","viewer.passport.relationship.loopsBack":"回环","viewer.passport.relationship.connectsTo":"连接到","viewer.passport.relationship.connectsFrom":"连接自","viewer.passport.relationship.pinned":"已固定关系 · {from} → {to} · {label}","viewer.passport.relationship.inspect":"检查第 {index}/{total} 条关系：{from} 到 {to}，{label}。按 Enter 查看详情。","viewer.passport.relationship.group.out":"出向","viewer.passport.relationship.group.in":"入向","viewer.passport.relationship.group.loop":"自环","viewer.passport.relationship.row":"{group}：{relationship}，{neighbor}","viewer.passport.relationship.direction.out":"出 →","viewer.passport.relationship.direction.in":"← 入","viewer.passport.relationship.direction.loop":"自环","viewer.passport.sourceCount.one":"{count} 个已验证来源引用","viewer.passport.sourceCount.other":"{count} 个已验证来源引用","viewer.passport.repository.open":"打开已验证的仓库修订版本 {revision}","viewer.passport.source.open":"打开修订版本 {revision} 中已验证的来源 {path}","viewer.passport.source.openLink":"打开 ↗","viewer.passport.reach.upstream.one":"追踪 {count} 个上游编写节点","viewer.passport.reach.upstream.other":"追踪 {count} 个上游编写节点","viewer.passport.reach.downstream.one":"追踪 {count} 个下游编写节点","viewer.passport.reach.downstream.other":"追踪 {count} 个下游编写节点","viewer.passport.reach.noUpstream":"没有上游编写节点","viewer.passport.reach.noDownstream":"没有下游编写节点","viewer.passport.reach.status":"{direction} · {nodes} 个节点 · {links} 条连接 · 最深 {hops} 跳","viewer.route.eyebrow":"路径","viewer.route.start":"点击路径的起点","viewer.route.start.find":"查找起点","viewer.route.start.find.aria":"查找路径起点","viewer.route.copy":"复制链接","viewer.route.copy.aria":"复制已追踪路径的链接","viewer.route.clear":"清除","viewer.route.clear.aria":"清除路径探测","viewer.route.traced":"路径","viewer.route.pickTwo":"在图上点两个节点","viewer.route.pickOne":"在图上点一个节点","viewer.route.controls":"路径旅程控制","viewer.route.previous":"上一个路径位置","viewer.route.play":"播放路径旅程","viewer.route.pause":"暂停路径旅程","viewer.route.replay":"重播路径旅程","viewer.route.next":"下一个路径位置","viewer.route.journey":"旅程","viewer.route.pause.label":"暂停","viewer.route.replay.label":"重播","viewer.route.overview":"总览","viewer.route.overview.aria":"显示完整路径总览","viewer.route.instructions":"先点起点，再点终点，沿箭头方向找路。","viewer.route.destination":"从{label}出发，走到哪里？","viewer.route.destination.find":"查找目标","viewer.route.destination.find.aria":"查找可达的路径目标","viewer.route.differentDestination":"选择其他目标","viewer.route.distinct":"请选两个不同的节点。","viewer.route.unreachable":"走不到{label}","viewer.route.unreachable.detail":"沿箭头方向，从{source}走不到{target}。请选一个高亮节点。","viewer.route.start.instructions":"接着选终点，能走到的节点会亮起。","viewer.route.copy.success":"已复制路径链接","viewer.route.copy.failed":"无法复制路径链接","viewer.route.position":"路径位置 {index}/{total}：{label}","viewer.route.step":"第 {index}/{total} 步 · {phase} · {label}","viewer.route.motionRequired":"自动旅程需要动态模式","viewer.route.trigger.clear":"清除已追踪路径","viewer.route.overview.status":"{nodes} · {hops} · 最短路径","viewer.route.overview.node.one":"{count} 个节点","viewer.route.overview.node.other":"{count} 个节点","viewer.route.overview.hop.one":"{count} 步","viewer.route.overview.hop.other":"{count} 步","viewer.route.phase.playing":"播放中","viewer.route.phase.complete":"已完成","viewer.route.phase.inspecting":"检查中","viewer.route.destination.count.one":"有 {count} 个能走到的节点已高亮，点一下。","viewer.route.destination.count.other":"有 {count} 个能走到的节点已高亮，点一个。","viewer.route.noOutgoing":"这个节点没有向外的箭头。清除后换一个起点。","viewer.route.result.title":"{source} 到 {target}","viewer.route.finder.source.title":"选择路径起点","viewer.route.finder.source.placeholder":"搜索路径来源","viewer.route.finder.source.empty":"没有匹配的路径来源","viewer.route.finder.source.results":"可作为路径起点的节点","viewer.route.finder.source.noun":"个路径来源","viewer.route.finder.source.badge":"起点","viewer.route.finder.target.title":"从{label}出发的目标","viewer.route.finder.target.placeholder":"搜索可达目标","viewer.route.finder.target.empty":"没有匹配的可达目标","viewer.route.finder.target.results":"可达路径目标","viewer.route.finder.target.noun":"个可达目标","viewer.route.hop.one":"{count} 跳","viewer.route.hop.other":"{count} 跳","viewer.lens.eyebrow":"语义透镜","viewer.lens.title":"比较系统角色","viewer.lens.close":"关闭语义透镜","viewer.lens.instruction":"最多选择两种语义类型。选择一种可显示其真实流量；选择两种只比较直接编写的关系。","viewer.lens.kinds":"语义类型","viewer.lens.choose":"选择一种类型以检查其节点和相连关系。","viewer.lens.copy":"复制语义透镜链接","viewer.lens.clear":"清除语义透镜","viewer.lens.open":"打开语义透镜","viewer.lens.openActive":"打开当前语义透镜","viewer.lens.legend":"语义图例","viewer.lens.legend.inspect.one":"检查{label}，{count} 个节点","viewer.lens.legend.inspect.other":"检查{label}，{count} 个节点","viewer.lens.kind.count.one":"{label}，{count} 个节点","viewer.lens.kind.count.other":"{label}，{count} 个节点","viewer.lens.compare.one":"{first} → {second}：{forward} · {second} → {first}：{reverse} · 共 {count} 条直接关系","viewer.lens.compare.other":"{first} → {second}：{forward} · {second} → {first}：{reverse} · 共 {count} 条直接关系","viewer.lens.single":"{nodes} · {relationships} · 已连接节点保持可见","viewer.lens.node.one":"{count} 个{label}节点","viewer.lens.node.other":"{count} 个{label}节点","viewer.lens.relationship.one":"{count} 条相连关系","viewer.lens.relationship.other":"{count} 条相连关系","viewer.radar.title":"语义雷达","viewer.radar.building":"正在构建总览","viewer.radar.openFull":"打开完整语义雷达","viewer.radar.open":"打开雷达","viewer.radar.close":"关闭语义雷达","viewer.radar.surface":"图表总览。点击节点进行聚焦，或使用方向键平移。","viewer.radar.click":"点击节点","viewer.radar.drag":"拖动平移","viewer.radar.space":"语义雷达需要更多地图可见空间。","viewer.radar.nodes":"语义图表雷达节点","viewer.radar.focus":"从语义雷达聚焦{label}","viewer.radar.status":"{count} 个节点 · {viewport}","viewer.radar.fullMap":"{count} 个节点 · 完整地图","viewer.radar.compacted":"已收紧雷达，避免遮挡语义护照或地图控件。","viewer.radar.cancelWaiting":"取消等待更多地图空间的语义雷达","viewer.radar.needsSpace":"语义雷达需要更多可见地图空间","viewer.radar.viewport.full":"完整地图","viewer.radar.viewport.width":"宽度 {percent}%","viewer.radar.viewport.scale":"视口 {percent}%","viewer.nav.controls":"图表视图控制","viewer.nav.route":"追踪有向路径","viewer.nav.route.title":"追踪路径（R）","viewer.nav.route.short":"路径","viewer.nav.radar":"打开语义雷达","viewer.nav.radar.title":"语义雷达（M）","viewer.nav.radar.short":"地图","viewer.nav.lens":"打开语义透镜","viewer.nav.lens.title":"语义透镜（L）","viewer.nav.lens.short":"透镜","viewer.nav.find":"查找节点","viewer.nav.find.title":"查找节点（/）","viewer.outline.title":"节点索引","viewer.rail.show":"要点与索引","viewer.rail.controls":"侧栏","viewer.rail.collapse":"收起侧栏","viewer.rail.bottom":"移到图下方","viewer.rail.right":"移到图右侧","viewer.nav.guide":"打开图表指南","viewer.nav.guide.title":"图表指南（?）","viewer.nav.zoomOut":"缩小","viewer.nav.zoomOut.title":"缩小（-）","viewer.nav.reset":"重置图表视图","viewer.nav.reset.title":"重置视图（0）","viewer.nav.read":"阅读","viewer.nav.zoomIn":"放大","viewer.nav.zoomIn.title":"放大（+）","viewer.nav.camera":"{hint}。重置图表视图","viewer.nav.camera.title":"{semantic}{hint} · 重置视图（0）","viewer.nav.camera.semantic":"语义相机已启用 · ","viewer.nav.level.map":"概览","viewer.nav.level.read":"阅读","viewer.nav.level.full":"完整","viewer.nav.level.auto":"自动","viewer.nav.detail.map":"放大以显示关系标签和节点上下文","viewer.nav.detail.read":"再次放大以显示标签和注释","viewer.nav.detail.full":"完整图表详情","viewer.intent.summary":"{label}。{out} 条出向，{in} 条入向{loops}。共 {total} 条连接。按 Enter 查看详情。","viewer.intent.loops":"，{count} 条自环","viewer.common.copied":"已复制","viewer.common.copyFailed":"复制失败","viewer.common.copyLink":"复制链接","viewer.common.clear":"清除","viewer.common.close":"关闭"}}</script>
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read"
          data-preset-badge-editorial-plate="ARCHIFY / 图版 04">
-      <svg viewBox="0 0 784 528" data-reader-fit="width-first" data-layout-contract="readable-v2" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-animation="trace" data-preset="classic" data-quality-profile="showcase" data-node-ui="">
-        <title id="archify-diagram-title">vertx-rs 结构体关系与请求流程</title>
+      <svg viewBox="0 0 854 528" data-layout-contract="readable-v2" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-animation="trace" data-preset="classic" data-quality-profile="showcase" data-node-ui="">
+        <title id="archify-diagram-title">vertx-rs 请求与一次性回复流程</title>
         <desc id="archify-diagram-description">由 Archify 生成的工作流图。</desc>
         <!-- Definitions -->
         <defs>
@@ -5250,14 +5250,14 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <rect width="100%" height="100%" fill="url(#grid)" />
 
         <!-- Swimlanes -->
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-0" x="40" y="52" width="728" height="104" rx="10" class="c-lane" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-0" x="40" y="52" width="798" height="104" rx="10" class="c-lane" stroke-width="1"/>
         <text x="54" y="74" class="t-muted" font-size="10" font-weight="600">01 / 宿主应用</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-1" x="40" y="176" width="728" height="104" rx="10" class="c-lane" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-1" x="40" y="176" width="798" height="104" rx="10" class="c-lane" stroke-width="1"/>
         <text x="54" y="198" class="t-muted" font-size="10" font-weight="600">02 / EventBus 请求端</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-2" x="40" y="300" width="728" height="104" rx="10" class="c-lane" stroke-width="1"/>
-        <text x="54" y="322" class="t-muted" font-size="10" font-weight="600">03 / 消费方 Context</text>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-2" x="40" y="300" width="798" height="104" rx="10" class="c-lane" stroke-width="1"/>
+        <text x="54" y="322" class="t-muted" font-size="10" font-weight="600">03 / 消费者 Context</text>
 
         <!-- Phase headers -->
 
@@ -5266,41 +5266,41 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 
 
         <!-- Edge paths -->
-        <path data-edge-from="call" data-edge-to="request" data-edge-key="0" data-edge-id="call-to-request" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="140,119;214,119;214,217" d="M 140 119 L 206 119 Q 214 119 214 127 L 214 217" class="a-emphasis" data-animate="edge" style="--step:0" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="handle" data-edge-to="reply" data-edge-key="1" data-edge-id="handle-to-reply" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="512,367;544,367" d="M 512 367 L 544 367" class="a-emphasis" data-animate="edge" style="--step:4" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="queue" data-edge-to="receive" data-edge-key="2" data-edge-id="queue-to-receive" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="338,269;338,341" d="M 338 269 L 338 341" class="a-emphasis" data-animate="edge" style="--step:2" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="receive" data-edge-to="handle" data-edge-key="3" data-edge-id="receive-to-handle" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="384,367;416,367" d="M 384 367 L 416 367" class="a-emphasis" data-animate="edge" style="--step:3" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="reply" data-edge-to="resolve" data-edge-key="4" data-edge-id="reply-to-resolve" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="590,341;590,269" d="M 590 341 L 590 269" class="a-emphasis" data-animate="edge" style="--step:5" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="request" data-edge-to="queue" data-edge-key="5" data-edge-id="request-to-queue" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="260,243;292,243" d="M 260 243 L 292 243" class="a-emphasis" data-animate="edge" style="--step:1" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="resolve" data-edge-to="done" data-edge-key="6" data-edge-id="resolve-to-done" data-composition-routing="workflow-v2-auto" data-edge-role="main" data-composition-points="590,217;590,119;664,119" d="M 590 217 L 590 127 Q 590 119 598 119 L 664 119" class="a-emphasis" data-animate="edge" style="--step:6" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="admit" data-edge-to="take" data-edge-label="获得空位" data-edge-key="0" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="362.4,269;362.4,341" d="M 362.4 269 L 362.4 341" class="a-default" data-animate="edge" style="--step:2" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="handle" data-edge-to="reply" data-edge-label="组织回复" data-edge-key="1" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="556.8,367;613.1999999999999,367" d="M 556.8 367 L 613.1999999999999 367" class="a-default" data-animate="edge" style="--step:4" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="invoke" data-edge-to="prepare" data-edge-label="提交" data-edge-key="2" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="140,119;214,119;214,217" d="M 140 119 L 206 119 Q 214 119 214 127 L 214 217" class="a-default" data-animate="edge" style="--step:0" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="prepare" data-edge-to="admit" data-edge-label="封装消息" data-edge-key="3" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="260,243;316.4,243" d="M 260 243 L 316.4 243" class="a-default" data-animate="edge" style="--step:1" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="receive" data-edge-to="finish" data-edge-label="返回结果" data-edge-key="4" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="779.1999999999999,217;779.1999999999999,145" d="M 779.1999999999999 217 L 779.1999999999999 145" class="a-default" data-animate="edge" style="--step:6" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="reply" data-edge-to="receive" data-edge-label="oneshot" data-edge-key="5" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="659.1999999999999,341;659.1999999999999,243;733.1999999999999,243" d="M 659.1999999999999 341 L 659.1999999999999 251 Q 659.1999999999999 243 667.1999999999999 243 L 733.1999999999999 243" class="a-default" data-animate="edge" style="--step:5" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="take" data-edge-to="handle" data-edge-label="交付信封" data-edge-key="6" data-composition-routing="workflow-v2-auto" data-edge-role="" data-composition-points="408.4,367;464.79999999999995,367" d="M 408.4 367 L 464.79999999999995 367" class="a-default" data-animate="edge" style="--step:3" stroke-width="1.4" marker-end="url(#arrowhead)"/>
 
         <!-- Nodes -->
-        <g id="node-call" data-node-id="call" data-node-label="宿主调用" tabindex="0" role="button" aria-label="聚焦宿主调用，请求 ping, 宿主应用" aria-pressed="false" data-node-kind="external" data-node-sublabel="请求 ping" data-node-context="宿主应用">
-          <title>宿主调用 · 请求 ping · 宿主应用</title>
+        <g id="node-invoke" data-node-id="invoke" data-node-label="宿主调用" tabindex="0" role="button" aria-label="聚焦宿主调用，request_message_with, 宿主应用" aria-pressed="false" data-node-kind="external" data-node-sublabel="request_message_with" data-node-context="宿主应用">
+          <title>宿主调用 · request_message_with · 宿主应用</title>
           <rect x="48" y="93" width="92" height="52" rx="8" class="c-mask"/>
           <rect x="48" y="93" width="92" height="52" rx="8" class="c-external" data-animate="node" style="--step:0" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(54 99) scale(0.6875)">
             <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
             <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="94" y="125" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">宿主调用</text>
-          <text data-detail="context" x="94" y="137.3" class="t-muted" font-size="8" text-anchor="middle">请求 ping</text>
+          <text data-node-label="" data-detail-anchor="" x="94" y="127.2" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">宿主调用</text>
+          <text data-detail="context" x="94" y="140.9" class="t-muted" font-size="7" text-anchor="middle">request_message_with</text>
         </g>
 
-        <g id="node-done" data-node-id="done" data-node-label="宿主收取结果" tabindex="0" role="button" aria-label="聚焦宿主收取结果，读取响应与 headers, 宿主应用" aria-pressed="false" data-node-kind="external" data-node-sublabel="读取响应与 headers" data-node-context="宿主应用">
-          <title>宿主收取结果 · 读取响应与 headers · 宿主应用</title>
-          <rect x="664" y="93" width="92" height="52" rx="8" class="c-mask"/>
-          <rect x="664" y="93" width="92" height="52" rx="8" class="c-external" data-animate="node" style="--step:7" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(670 99) scale(0.6875)">
+        <g id="node-finish" data-node-id="finish" data-node-label="收到响应" tabindex="0" role="button" aria-label="聚焦收到响应，读取响应体与 headers, 宿主应用" aria-pressed="false" data-node-kind="external" data-node-sublabel="读取响应体与 headers" data-node-context="宿主应用">
+          <title>收到响应 · 读取响应体与 headers · 宿主应用</title>
+          <rect x="733.1999999999999" y="93" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="733.1999999999999" y="93" width="92" height="52" rx="8" class="c-external" data-animate="node" style="--step:7" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(739.1999999999999 99) scale(0.6875)">
             <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
             <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="710" y="125" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">宿主收取结果</text>
-          <text data-detail="context" x="710" y="137" class="t-muted" font-size="7.7" text-anchor="middle">读取响应与 headers</text>
+          <text data-node-label="" data-detail-anchor="" x="779.1999999999999" y="127.2" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">收到响应</text>
+          <text data-detail="context" x="779.1999999999999" y="140.9" class="t-muted" font-size="7" text-anchor="middle">读取响应体与 headers</text>
         </g>
 
-        <g id="node-request" data-node-id="request" data-node-label="EventBus" tabindex="0" role="button" aria-label="聚焦EventBus，建立回复通道, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="建立回复通道" data-node-context="EventBus 请求端">
-          <title>EventBus · 建立回复通道 · EventBus 请求端</title>
+        <g id="node-prepare" data-node-id="prepare" data-node-label="创建请求" tabindex="0" role="button" aria-label="聚焦创建请求，安装期限和回复通道, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="安装期限和回复通道" data-node-context="EventBus 请求端">
+          <title>创建请求 · 安装期限和回复通道 · EventBus 请求端</title>
           <rect x="168" y="217" width="92" height="52" rx="8" class="c-mask"/>
           <rect x="168" y="217" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:1" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(174 223) scale(0.6875)">
@@ -5309,85 +5309,100 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
             <circle cx="10.5" cy="8" r="1" class="sigil-fill"/>
             <circle cx="7" cy="11.5" r="1" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="214" y="249" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">EventBus</text>
-          <text data-detail="context" x="214" y="261.3" class="t-muted" font-size="8" text-anchor="middle">建立回复通道</text>
+          <text data-node-label="" data-detail-anchor="" x="214" y="249" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">创建请求</text>
+          <text data-detail="context" x="214" y="261" class="t-muted" font-size="7.7" text-anchor="middle">安装期限和回复通道</text>
         </g>
 
-        <g id="node-queue" data-node-id="queue" data-node-label="Route → Target" tabindex="0" role="button" aria-label="聚焦Route → Target，选目标并等待入队, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="选目标并等待入队" data-node-context="EventBus 请求端">
-          <title>Route → Target · 选目标并等待入队 · EventBus 请求端</title>
-          <rect x="292" y="217" width="92" height="52" rx="8" class="c-mask"/>
-          <rect x="292" y="217" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:2" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(298 223) scale(0.6875)">
+        <g id="node-admit" data-node-id="admit" data-node-label="路由与入队" tabindex="0" role="button" aria-label="聚焦路由与入队，选择消费者并等待空位, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="选择消费者并等待空位" data-node-context="EventBus 请求端">
+          <title>路由与入队 · 选择消费者并等待空位 · EventBus 请求端</title>
+          <rect x="316.4" y="217" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="316.4" y="217" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:2" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(322.4 223) scale(0.6875)">
             <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
             <circle cx="5" cy="4.5" r="1" class="sigil-fill"/>
             <circle cx="10.5" cy="8" r="1" class="sigil-fill"/>
             <circle cx="7" cy="11.5" r="1" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="338" y="250" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">Route → Target</text>
-          <text data-detail="context" x="338" y="264.6" class="t-muted" font-size="8" text-anchor="middle">选目标并等待入队</text>
+          <text data-node-label="" data-detail-anchor="" x="362.4" y="251.2" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">路由与入队</text>
+          <text data-detail="context" x="362.4" y="264.9" class="t-muted" font-size="7" text-anchor="middle">选择消费者并等待空位</text>
         </g>
 
-        <g id="node-resolve" data-node-id="resolve" data-node-label="EventBus" tabindex="0" role="button" aria-label="聚焦EventBus，接收并校验回复, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="接收并校验回复" data-node-context="EventBus 请求端">
-          <title>EventBus · 接收并校验回复 · EventBus 请求端</title>
-          <rect x="544" y="217" width="92" height="52" rx="8" class="c-mask"/>
-          <rect x="544" y="217" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:6" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(550 223) scale(0.6875)">
+        <g id="node-receive" data-node-id="receive" data-node-label="等待回复" tabindex="0" role="button" aria-label="聚焦等待回复，校验回复类型, EventBus 请求端" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="校验回复类型" data-node-context="EventBus 请求端">
+          <title>等待回复 · 校验回复类型 · EventBus 请求端</title>
+          <rect x="733.1999999999999" y="217" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="733.1999999999999" y="217" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:6" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(739.1999999999999 223) scale(0.6875)">
             <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
             <circle cx="5" cy="4.5" r="1" class="sigil-fill"/>
             <circle cx="10.5" cy="8" r="1" class="sigil-fill"/>
             <circle cx="7" cy="11.5" r="1" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="590" y="249" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">EventBus</text>
-          <text data-detail="context" x="590" y="261.3" class="t-muted" font-size="8" text-anchor="middle">接收并校验回复</text>
+          <text data-node-label="" data-detail-anchor="" x="779.1999999999999" y="249" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">等待回复</text>
+          <text data-detail="context" x="779.1999999999999" y="261.3" class="t-muted" font-size="8" text-anchor="middle">校验回复类型</text>
         </g>
 
-        <g id="node-receive" data-node-id="receive" data-node-label="Consumer" tabindex="0" role="button" aria-label="聚焦Consumer，读取并转换信封, 消费方 Context" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="读取并转换信封" data-node-context="消费方 Context">
-          <title>Consumer · 读取并转换信封 · 消费方 Context</title>
-          <rect x="292" y="341" width="92" height="52" rx="8" class="c-mask"/>
-          <rect x="292" y="341" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:3" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(298 347) scale(0.6875)">
-            <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
-            <circle cx="5" cy="4.5" r="1" class="sigil-fill"/>
-            <circle cx="10.5" cy="8" r="1" class="sigil-fill"/>
-            <circle cx="7" cy="11.5" r="1" class="sigil-fill"/>
-          </g>
-          <text data-node-label="" data-detail-anchor="" x="338" y="373" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Consumer</text>
-          <text data-detail="context" x="338" y="385.3" class="t-muted" font-size="8" text-anchor="middle">读取并转换信封</text>
-        </g>
-
-        <g id="node-handle" data-node-id="handle" data-node-label="Verticle 处理器" tabindex="0" role="button" aria-label="聚焦Verticle 处理器，执行业务逻辑, 消费方 Context" aria-pressed="false" data-node-kind="backend" data-node-sublabel="执行业务逻辑" data-node-context="消费方 Context">
-          <title>Verticle 处理器 · 执行业务逻辑 · 消费方 Context</title>
-          <rect x="416" y="341" width="96" height="52" rx="8" class="c-mask"/>
-          <rect x="416" y="341" width="96" height="52" rx="8" class="c-backend" data-animate="node" style="--step:4" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(422 347) scale(0.6875)">
+        <g id="node-take" data-node-id="take" data-node-label="Consumer" tabindex="0" role="button" aria-label="聚焦Consumer，取出并转换消息, 消费者 Context" aria-pressed="false" data-node-kind="backend" data-node-sublabel="取出并转换消息" data-node-context="消费者 Context">
+          <title>Consumer · 取出并转换消息 · 消费者 Context</title>
+          <rect x="316.4" y="341" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="316.4" y="341" width="92" height="52" rx="8" class="c-backend" data-animate="node" style="--step:3" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(322.4 347) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="464" y="373.7" class="t-primary" font-size="9.7" font-weight="600" text-anchor="middle">Verticle 处理器</text>
-          <text data-detail="context" x="464" y="388.3" class="t-muted" font-size="8" text-anchor="middle">执行业务逻辑</text>
+          <text data-node-label="" data-detail-anchor="" x="362.4" y="373" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Consumer</text>
+          <text data-detail="context" x="362.4" y="385.3" class="t-muted" font-size="8" text-anchor="middle">取出并转换消息</text>
         </g>
 
-        <g id="node-reply" data-node-id="reply" data-node-label="ReplyHandle" tabindex="0" role="button" aria-label="聚焦ReplyHandle，发送一次性回复, 消费方 Context" aria-pressed="false" data-node-kind="messagebus" data-node-sublabel="发送一次性回复" data-node-context="消费方 Context">
-          <title>ReplyHandle · 发送一次性回复 · 消费方 Context</title>
-          <rect x="544" y="341" width="92" height="52" rx="8" class="c-mask"/>
-          <rect x="544" y="341" width="92" height="52" rx="8" class="c-messagebus" data-animate="node" style="--step:5" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="messagebus" class="semantic-sigil s-messagebus" transform="translate(550 347) scale(0.6875)">
-            <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
-            <circle cx="5" cy="4.5" r="1" class="sigil-fill"/>
-            <circle cx="10.5" cy="8" r="1" class="sigil-fill"/>
-            <circle cx="7" cy="11.5" r="1" class="sigil-fill"/>
+        <g id="node-handle" data-node-id="handle" data-node-label="用户 handler" tabindex="0" role="button" aria-label="聚焦用户 handler，在所属 Context 执行, 消费者 Context" aria-pressed="false" data-node-kind="backend" data-node-sublabel="在所属 Context 执行" data-node-context="消费者 Context">
+          <title>用户 handler · 在所属 Context 执行 · 消费者 Context</title>
+          <rect x="464.79999999999995" y="341" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="464.79999999999995" y="341" width="92" height="52" rx="8" class="c-backend" data-animate="node" style="--step:4" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(470.79999999999995 347) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="590" y="373" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">ReplyHandle</text>
-          <text data-detail="context" x="590" y="385.3" class="t-muted" font-size="8" text-anchor="middle">发送一次性回复</text>
+          <text data-node-label="" data-detail-anchor="" x="510.79999999999995" y="373" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">用户 handler</text>
+          <text data-detail="context" x="510.79999999999995" y="384.6" class="t-muted" font-size="7.3" text-anchor="middle">在所属 Context 执行</text>
+        </g>
+
+        <g id="node-reply" data-node-id="reply" data-node-label="ReplyHandle" tabindex="0" role="button" aria-label="聚焦ReplyHandle，发送一次性回复, 消费者 Context" aria-pressed="false" data-node-kind="backend" data-node-sublabel="发送一次性回复" data-node-context="消费者 Context">
+          <title>ReplyHandle · 发送一次性回复 · 消费者 Context</title>
+          <rect x="613.1999999999999" y="341" width="92" height="52" rx="8" class="c-mask"/>
+          <rect x="613.1999999999999" y="341" width="92" height="52" rx="8" class="c-backend" data-animate="node" style="--step:5" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(619.1999999999999 347) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="659.1999999999999" y="373" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">ReplyHandle</text>
+          <text data-detail="context" x="659.1999999999999" y="385.3" class="t-muted" font-size="8" text-anchor="middle">发送一次性回复</text>
         </g>
 
         <!-- Edge labels -->
-
-
-
-
-
-
-
+        <g data-detail="context" data-edge-from="admit" data-edge-to="take" data-edge-label="获得空位" data-edge-key="0">
+          <rect x="338.2" y="295" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="362.4" y="305" class="t-muted" font-size="8" text-anchor="middle">获得空位</text>
+        </g>
+        <g data-detail="context" data-edge-from="handle" data-edge-to="reply" data-edge-label="组织回复" data-edge-key="1">
+          <rect x="560.8" y="347" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="585" y="357" class="t-muted" font-size="8" text-anchor="middle">组织回复</text>
+        </g>
+        <g data-detail="context" data-edge-from="invoke" data-edge-to="prepare" data-edge-label="提交" data-edge-key="2">
+          <rect x="162" y="99" width="30" height="14" rx="3" class="c-mask"/>
+          <text x="177" y="109" class="t-muted" font-size="8" text-anchor="middle">提交</text>
+        </g>
+        <g data-detail="context" data-edge-from="prepare" data-edge-to="admit" data-edge-label="封装消息" data-edge-key="3">
+          <rect x="264" y="223" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="288.2" y="233" class="t-muted" font-size="8" text-anchor="middle">封装消息</text>
+        </g>
+        <g data-detail="context" data-edge-from="receive" data-edge-to="finish" data-edge-label="返回结果" data-edge-key="4">
+          <rect x="754.9999999999999" y="171" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="779.1999999999999" y="181" class="t-muted" font-size="8" text-anchor="middle">返回结果</text>
+        </g>
+        <g data-detail="context" data-edge-from="reply" data-edge-to="receive" data-edge-label="oneshot" data-edge-key="5">
+          <rect x="674.4" y="223" width="43.6" height="14" rx="3" class="c-mask"/>
+          <text x="696.1999999999999" y="233" class="t-muted" font-size="8" text-anchor="middle">oneshot</text>
+        </g>
+        <g data-detail="context" data-edge-from="take" data-edge-to="handle" data-edge-label="交付信封" data-edge-key="6">
+          <rect x="412.4" y="347" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="436.59999999999997" y="357" class="t-muted" font-size="8" text-anchor="middle">交付信封</text>
+        </g>
 
         <!-- Legend -->
         <g data-legend="" data-legend-bridge="">
@@ -5585,112 +5600,20 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>流程与归属</h3>
+          <h3>一个期限</h3>
         </div>
         <ul>
-          <li>主线来自 ping_pong 的成功请求。EventBus 泳道是框架职责，请求 Future 由调用方执行器驱动。Consumer 循环在接收方 Context 上运行。</li>
-          <li>从 Vertx 外部注册的 Consumer 可以没有 owner，只能用 recv 或 Stream 拉取。使用 handler 时必须在所属 Context 中注册并派发。</li>
-          <li>已知分支：无消费者或消息类型不符时返回路由错误。队列满时等待空位，请求 deadline 覆盖入队和回复。已入队消息不会因调用方超时而撤回。</li>
-          <li>业务处理由应用提供。实际应用的 handler、部署位置及收到失败后的重试策略待定。</li>
+          <li>RequestOptions 默认 30 秒，覆盖等待队列容量和等待响应。</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <div class="card-dot emerald"></div>
-          <h3>实例与部署 · src/vertx.rs、src/deployment*.rs</h3>
+          <div class="card-dot rose"></div>
+          <h3>超时与迟到回复</h3>
         </div>
         <ul>
-          <li>Vertx 共享持有 VertxInner。VertxInner 共享持有 ContextShared，并用 DeploymentId 索引共享的 DeploymentScope。</li>
-          <li>VertxBuilder 持有 DiagnosticsOptions，构建 Vertx 时创建共享运行资源。</li>
-          <li>DeploymentScope 保存 DeploymentId，持有 ScopeState。ScopeState 保存 Phase、订阅地址与 ID、TaskAbortHandle。</li>
-          <li>CancelOnDrop 共享持有可选 DeploymentScope，丢弃时触发停止。Rollback 共享持有本批已部署的多个 DeploymentScope。</li>
-          <li>DeploymentOptions&lt;C&gt; 共享应用配置 C，并为批量部署提供实例数。DeploymentId 是部署值标识。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot emerald"></div>
-          <h3>执行归属 · src/context.rs、src/task.rs</h3>
-        </div>
-        <ul>
-          <li>Context 共享持有 ContextShared、DeploymentScope 与 ContextData。Kind 指向 EventLoopId 或标记 Worker。</li>
-          <li>ContextShared 持有 EventBus，共享 Diagnostics、EventLoopPool、WorkerPool，并弱引用 VertxInner。</li>
-          <li>ContextData 持有 Tokio Handle、执行门、blocking 有序锁和局部异常处理器。数值 id 以 ContextId 暴露。</li>
-          <li>ContextGuard 暂存上一份 Context，析构时恢复。ContextFuture 持有 Context、用户 Future 与 TaskRecord。Tracked 持有 Future 和 TaskTracker token。</li>
-          <li>TaskHandle&lt;T&gt; 持有 TaskId、TaskAbortHandle，以及 Tokio JoinHandle 或 oneshot receiver。TaskAbortHandle 共享 TaskControl，后端可用 Tokio AbortHandle、LocalTaskControl 或 WorkerControl。</li>
-          <li>TracedFuture 持有 Future、Dispatch 和 Span，用于每次 poll 或析构时恢复跟踪环境。TaskId 是任务值标识。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot violet"></div>
-          <h3>固定线程 · src/eventloop.rs</h3>
-        </div>
-        <ul>
-          <li>EventLoopPool 持有 EventLoop 和线程 join 句柄，使用 EventLoopId 定位单个 EventLoop。</li>
-          <li>EventLoop 持有 Tokio Handle、线程标识和命令队列发送端。SpawnCommand 实现 Command，把 factory 送到目标线程。</li>
-          <li>SpawnCommand 和 LocalTask 分别在派发和执行阶段持有 Completion。LocalTask 持有本地 Future。</li>
-          <li>Completion 持有结果发送端并共享 LocalTaskControl。LocalTaskControl 持有 CancelState，后者可持有 Tokio AbortHandle。</li>
-          <li>ThreadIdentityGuard 是零字段守卫，析构时清除当前线程身份。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot violet"></div>
-          <h3>Worker · src/worker_pool.rs</h3>
-        </div>
-        <ul>
-          <li>WorkerPool 共享 Core 并持有 Worker 线程 join 句柄。Core 持有 PoolState。</li>
-          <li>PoolState 持有就绪队列、Context 对应的 Lane 和所有存活 Task。Lane 持有待执行 Task 的共享引用。</li>
-          <li>Task 弱引用 Core，持有 TaskState 和 Tokio Handle。TaskState 通过 Work 持有 FutureWork。</li>
-          <li>FutureWork 持有用户 Future、输出和结果发送端。WorkerControl 弱引用 Task，与 Task 共享完成标记。</li>
-          <li>Worker Future 与 blocking 闭包共用线程池。Context 提供来源归属，实际 Worker 线程可变。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot cyan"></div>
-          <h3>地址路由与流 · src/eventbus/{mod,inner,consumer,options}.rs、src/streams.rs</h3>
-        </div>
-        <ul>
-          <li>EventBus 共享 EventBusInner，可持有注册用 Context。EventBusInner 共享 Diagnostics，并按地址持有 Route。</li>
-          <li>Route 持有消息类型、轮询位置和多个 Target。Target 持有 mpsc 发送端。Consumer&lt;T&gt; 持有对应接收端、共享 EventBusInner，并可持有 owner Context。</li>
-          <li>Target 与 Consumer 共享 QueueState。QueueState 可共享 QueueStats。Reservation 持有选定的 Target、等待状态与可选的入队许可。</li>
-          <li>MessageSink&lt;T&gt; 持有 Headers，共享 EventBusInner，可保存 Reservation 与 MessageTrace。PipeOptions 控制 pipe 何时关闭目标 Sink。</li>
-          <li>DeliveryOptions 持有 Headers 和可选超时。ConsumerOptions 提供队列容量。Headers 持有有序键值对。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot cyan"></div>
-          <h3>信封、回复与计时 · src/eventbus/envelope.rs、src/timer.rs</h3>
-        </div>
-        <ul>
-          <li>ErasedEnvelope 持有 MessageTrace、类型擦除的消息体、Headers 和可选的回复发送端。类型校验后转为 Envelope&lt;T&gt;。</li>
-          <li>Envelope&lt;T&gt; 持有 MessageTrace、强类型消息体、Headers 和可选 ReplyHandle。ReplyHandle 持有跟踪信息与一次性回复发送端。</li>
-          <li>MessageTrace 持有消息及请求标识、Span 和 Dispatch。响应信封沿用请求的跟踪信息。</li>
-          <li>Timer 持有 Future、取消 token 和共享完成状态。Periodic 持有可选的 Tokio Interval、周期和取消 token。两者的作用域来自 Context 或 Vertx。</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot amber"></div>
-          <h3>诊断 · src/diagnostics.rs</h3>
-        </div>
-        <ul>
-          <li>Diagnostics 持有 DiagnosticsOptions 和 State。State 持有 DiagnosticsSnapshot、任务及线程详情、部署阶段，并弱引用活跃 QueueStats。</li>
-          <li>DiagnosticsSnapshot 持有 QueueSnapshot、DeploymentSnapshot、TaskSnapshot 和 ThreadSnapshot 集合。QueueStats 持有 QueueSnapshot 元数据并弱引用 Diagnostics。</li>
-          <li>TaskSnapshot 记录 TaskId、ContextId、DeploymentId 和 TaskStage。ThreadSnapshot 记录 OS 线程、可选 EventLoopId、ContextId 和 TaskId。</li>
-          <li>DeploymentSnapshot 记录 DeploymentId 与阶段。QueueSnapshot 记录订阅及可选 ContextId 和 DeploymentId。</li>
-          <li>TaskRecord 共享 Diagnostics 与 StageState，保存 TaskId、ContextId 和 DeploymentId。StageState 保存可选 TaskStage 与起始时间。</li>
-          <li>ReadyWake 持有原 Waker，并弱引用 Diagnostics 和 StageState。OperationGuard 共享 Diagnostics，保存当前及原有 ThreadSnapshot。</li>
+          <li>已入队的请求仍会被消费。请求方释放回复通道后，ReplyHandle 返回 ReplyClosed。</li>
         </ul>
       </div>
     </div>
