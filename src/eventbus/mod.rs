@@ -6,12 +6,14 @@ mod queue;
 mod route;
 mod sink;
 
+use crate::deployment::ResourceRegistration;
 use crate::diagnostics::Diagnostics;
-use crate::{Context, DeploymentId, Result};
+use crate::{Context, Result};
 pub use consumer::Consumer;
 pub use envelope::{Envelope, ReplyHandle};
-pub use options::{ConsumerOptions, DeliveryOptions, Headers};
-use route::Router;
+pub use options::{ConsumerOptions, DeliveryOptions, Headers, RequestOptions};
+pub(crate) use route::SubscriptionRegistration;
+use route::{Router, SubscriptionOwner};
 pub use sink::MessageSink;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -43,9 +45,6 @@ impl EventBus {
     pub(crate) fn close(&self) {
         self.router.close();
     }
-    pub(crate) fn unregister_deployment(&self, deployment: DeploymentId) {
-        self.router.unregister_deployment(deployment);
-    }
     /// Immediately registers with capacity 256. A live address with a different
     /// body type returns `TypeMismatch`. Registration binds to the bus Context, or
     /// this instance's current Context; otherwise it is unbound and supports pull
@@ -64,8 +63,34 @@ impl EventBus {
         options.validate()?;
         self.ensure_open()?;
         let owner = self.owner.clone().or_else(|| {
-            Context::current().filter(|ctx| Arc::ptr_eq(&ctx.inner.event_bus.router, &self.router))
+            Context::current()
+                .filter(|ctx| Arc::ptr_eq(&ctx.instance_event_bus().router, &self.router))
         });
-        self.router.register(address, owner, options.capacity())
+        let cancel = owner
+            .as_ref()
+            .map(Context::cancellation_token)
+            .unwrap_or_else(|| self.router.closed.clone())
+            .child_token();
+        let registration = {
+            let mut admission = owner.as_ref().map(|ctx| ctx.scope().admit()).transpose()?;
+            let metadata = owner.as_ref().map(|ctx| SubscriptionOwner {
+                context: ctx.id(),
+                deployment: ctx.scope().deployment,
+            });
+            let registration =
+                self.router
+                    .register::<T>(address, metadata, cancel, options.capacity())?;
+            if let Some(admission) = &mut admission {
+                admission.register_resource(
+                    registration.subscription.id,
+                    ResourceRegistration::Subscription(registration.subscription.clone()),
+                );
+            }
+            registration
+        };
+        let consumer = Consumer::new(registration, owner);
+        // A global close can cancel before it acquires the router's admission lock.
+        self.ensure_open()?;
+        Ok(consumer)
     }
 }

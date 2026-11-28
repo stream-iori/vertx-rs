@@ -2,7 +2,7 @@ mod task;
 mod thread;
 
 use self::thread::EventLoop;
-use crate::context::{ThreadIdentity, thread_identity};
+use crate::context::{Context, ThreadIdentity, thread_identity};
 use crate::error::{panic_error, retain_failure};
 use crate::{Result, TaskHandle, VertxError};
 use std::future::Future;
@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::watch;
 
+/// Identifies one fixed-thread EventLoop within its Vertx instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventLoopId(pub(crate) usize);
 impl std::fmt::Display for EventLoopId {
@@ -76,7 +77,7 @@ impl EventLoopPool {
     }
 
     // Only for construction rollback: no business tasks have been admitted.
-    // Join synchronously so a failed try_build never leaves startup threads behind.
+    // Join synchronously so a failed build never leaves startup threads behind.
     fn shutdown_initialization(&self) -> Vec<VertxError> {
         self.request_stop();
         let mut handles = self
@@ -128,7 +129,7 @@ impl EventLoopPool {
         };
         let admission = self.loops[id.0].admission.lock().unwrap();
         let sender = admission.as_ref().ok_or(VertxError::VertxClosed)?;
-        if self.check_thread(id) {
+        if self.check_thread(id) && Context::current().is_some() {
             // Defer the factory as well: user code never executes inline.
             drop(admission);
             return Ok(TaskHandle::from_tokio(tokio::task::spawn_local(

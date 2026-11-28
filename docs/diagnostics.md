@@ -29,7 +29,8 @@ Stopped 阶段按枚举移除部署记录。
 诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
 任务销毁时删除详情；晚到的 wake 不复活记录。未采集的任务不会为了补齐列表而被保留。
 消费者数量指有效路由订阅；scope 清扫、close 与 Consumer Drop 不重复扣减。
-裸 Tokio 任务、用户自建线程及等待 Context 执行锁的时间不在监控范围内。
+诊断锁内取样计数、阶段和详情元数据。耗时换算、队列详情复制和排序在锁外完成。
+裸 Tokio 任务、用户自建线程及等待 Worker 执行门的时间不在监控范围内。
 
 | 耗时字段 | 起止 |
 |---|---|
@@ -57,16 +58,15 @@ Stopped 阶段按枚举移除部署记录。
 容量按消息数量计算，待发送 Future、单条消息大小及任务数量均没有全局上限，不能据此宣称整个进程内存有界。
 日志细节主要在 debug/trace；开启这些级别会增加开销，不承诺未经测量的性能提升。
 
-本项目对通用风格中限制 catch_unwind 的规则保留明确的框架边界例外：factory、生命周期、
-用户 Future 的 poll/drop、消息 handler、blocking 闭包及异常 hook 需要在 panic=unwind 下隔离用户 panic，
-恢复 Context 并完成资源跟踪，避免一次用户失败破坏执行器。不是用 panic 代替普通 Result 错误，
-也不以捕获 panic 掩盖内部不变量损坏；panic=abort 或进程终止时不保证捕获或清理。
+本项目对通用风格中限制 `catch_unwind` 的规则保留框架边界例外。`panic=unwind` 时隔离 factory、生命周期回调构造 Future、
+用户 Future 的 poll/drop、消息 handler、blocking 闭包和异常 hook 的调用及析构。遇到用户 panic 时会恢复 Context 并继续资源跟踪和清理。
+`panic=abort` 或进程终止时没有展开过程可供框架捕获。
 普通与 Worker 生命周期保留两个静态驱动，以保留 Send/!Send 差异；消息处理复用泛型循环，
 不额外装箱 Future，不改变逐消息串行、Span/Dispatch 恢复或异常报告次数。
 
-异常仍按 Context exception handler → 全局 exception handler 调用；调用前释放配置锁，handler 可重设自身。
-框架错误事件独立于用户 hook，安装 hook 也不会吞掉框架诊断；每个报告入口只输出一次框架错误事件。
-异常 handler panic 被捕获后单独记录，避免递归。生命周期结束和全局关闭清除 handler 引用。
+异常按 Context hook → 全局 hook 回退。调用、替换和清除都先释放配置锁，hook 及其析构可以重设注册。
+框架错误事件独立于用户 hook，每个报告入口只输出一次。hook 自身的 panic 单独记录，避免递归。
+生命周期结束与实例关闭时释放 hook 并收集析构错误，再继续完成清理。
 受管任务自身的部署终止、实例关闭和显式取消不作为业务异常报告；读取其他部署的流而遇到终止，仍是失败并报告。
 
 | 错误 | 用途 |

@@ -1,13 +1,82 @@
 //! Business errors, panic recovery, hooks and retained cleanup failures.
 
-use super::support::{local, vx, worker};
-use async_trait::async_trait;
+use super::support::{capture, in_test_subprocess, local, vx, worker};
 use rstest::rstest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
+
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        self.0.take().unwrap()();
+    }
+}
+
+#[tokio::test]
+async fn exception_handler_destructor_can_reenter_its_slot() {
+    if !in_test_subprocess("errors::exception_handler_destructor_can_reenter_its_slot") {
+        return;
+    }
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let (_, ctx) = capture(&vx).await;
+
+    let owner = vx.clone();
+    let global = OnDrop(Some(move || owner.clear_exception_handler()));
+    vx.set_exception_handler(move |_| {
+        std::hint::black_box(&global);
+    });
+    vx.set_exception_handler(|_| {});
+
+    let handle = ctx.clone();
+    let local = OnDrop(Some(move || handle.set_exception_handler(|_| {})));
+    ctx.set_exception_handler(move |_| {
+        std::hint::black_box(&local);
+    });
+    ctx.clear_exception_handler();
+    vx.close().await.unwrap();
+}
+
+#[rstest]
+#[case::context(false)]
+#[case::global(true)]
+#[tokio::test]
+async fn exception_handler_destructor_panic_is_a_cleanup_error(vx: Vertx, #[case] global: bool) {
+    let (id, ctx) = capture(&vx).await;
+    let probe = OnDrop(Some(|| panic!("hook destructor")));
+    let hook = move |_: &VertxError| {
+        std::hint::black_box(&probe);
+    };
+    if global {
+        vx.set_exception_handler(hook);
+        for _ in 0..2 {
+            assert!(matches!(vx.close().await,
+                Err(VertxError::CleanupFailed(errors))
+                    if matches!(errors.as_slice(), [VertxError::Panic(message)] if message == "hook destructor")
+            ));
+        }
+        let snapshot = vx.diagnostics();
+        assert_eq!(snapshot.close_stage, "failed");
+        assert_eq!(snapshot.active_tasks, 0);
+        assert!(snapshot.threads.is_empty());
+    } else {
+        ctx.set_exception_handler(hook);
+        assert!(
+            matches!(vx.undeploy(id).await, Err(VertxError::Panic(message)) if message == "hook destructor")
+        );
+        assert_eq!(vx.diagnostics().active_deployments, 0);
+        // The next deployment exercises the instance after the isolated panic.
+        let _ = capture(&vx).await;
+        vx.close().await.unwrap();
+    }
+}
 
 #[rstest]
 #[tokio::test]
@@ -80,7 +149,7 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
         Err(VertxError::ReplyClosed)
     ));
     let (owner, message) = rx.recv().await.unwrap();
-    assert_eq!(owner, Some(id));
+    assert_eq!(owner, id);
     assert!(message.contains(if panic {
         "test panic"
     } else {
@@ -157,7 +226,6 @@ async fn lifecycle_keeps_start_stop_and_drop_errors_and_source(vx: Vertx) {
             panic!("drop failure");
         }
     }
-    #[async_trait(?Send)]
     impl Verticle for Broken {
         async fn start(&mut self, _: Context) -> Result<()> {
             Err(VertxError::StartFailed("start failure".into()))

@@ -1,11 +1,10 @@
-use super::{Vertx, VertxInner};
-use crate::context::ContextShared;
+use super::{Executors, InstanceLifetime, InstanceServices, Vertx, VertxInner};
+use crate::context::ExceptionSlot;
 use crate::eventloop::EventLoopPool;
 use crate::worker_pool::WorkerPool;
 use crate::{EventBus, Result, VertxError};
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -52,15 +51,6 @@ impl VertxBuilder {
         self.shutdown_grace = d;
         self
     }
-    /// Creates an instance with the configured fixed thread pools.
-    ///
-    /// # Panics
-    /// Panics on zero thread counts, zero shutdown grace, or initialization failure.
-    /// Use [`Self::try_build`] to handle these failures without unwinding.
-    pub fn build(self) -> Vertx {
-        self.try_build().expect("failed to initialize Vertx")
-    }
-
     /// Creates an instance, joining startup threads before returning a failure.
     ///
     /// Zero thread counts or shutdown grace return [`VertxError::InvalidOptions`].
@@ -69,13 +59,15 @@ impl VertxBuilder {
     /// [`VertxError::LifecycleFailed`]. No business work runs during rollback.
     ///
     /// ```
-    /// # use vertx_rs::{Result, Vertx};
-    /// # async fn example() -> Result<()> {
-    /// let vx = Vertx::builder().event_loop_threads(1).worker_threads(2).try_build()?;
-    /// vx.close().await?;
-    /// # Ok(()) }
+    /// use vertx_rs::{Result, Vertx};
+    ///
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> Result<()> {
+    ///     let vertx = Vertx::builder().event_loop_threads(1).worker_threads(2).build()?;
+    ///     vertx.close().await
+    /// }
     /// ```
-    pub fn try_build(self) -> Result<Vertx> {
+    pub fn build(self) -> Result<Vertx> {
         self.build_with_pools(EventLoopPool::new, WorkerPool::new)
     }
 
@@ -115,25 +107,24 @@ impl VertxBuilder {
         let diagnostics = crate::diagnostics::Diagnostics::new(instance, self.diagnostics);
         let cancel = CancellationToken::new();
         let event_bus = EventBus::new(cancel.clone(), diagnostics.clone());
-        let inner = Arc::new_cyclic(|weak| {
-            let shared = Arc::new(ContextShared {
+        let inner = Arc::new(VertxInner {
+            executors: Arc::new(Executors {
+                event_loops,
+                workers,
+            }),
+            services: Arc::new(InstanceServices {
                 diagnostics,
                 event_bus,
                 tcp: crate::tcp::TcpListeners::default(),
-                event_loops: Arc::new(event_loops),
-                workers: Arc::new(workers),
-                vertx: weak.clone(),
-                exception_handler: RwLock::new(None),
+                exception_handler: ExceptionSlot::default(),
+            }),
+            lifetime: Arc::new(InstanceLifetime {
                 cancel,
                 blocking: TaskTracker::new(),
                 shutdown_grace: self.shutdown_grace,
-            });
-            VertxInner {
-                shared,
-                deployments: Mutex::new(HashMap::new()),
-                close_started: Mutex::new(false),
-                close_result: watch::channel(None).0,
-            }
+            }),
+            deployments: Default::default(),
+            close_result: watch::channel(None).0,
         });
         Vertx { inner }
     }
@@ -202,7 +193,7 @@ mod tests {
         assert_eq!(
             exited.load(Ordering::SeqCst),
             2,
-            "try_build must join startup threads before returning"
+            "build must join startup threads before returning"
         );
     }
 }

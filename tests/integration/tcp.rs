@@ -28,6 +28,7 @@ fn instance(loops: usize) -> Vertx {
         .event_loop_threads(loops)
         .worker_threads(1)
         .build()
+        .unwrap()
 }
 
 async fn serve<F, Fut>(
@@ -390,6 +391,27 @@ async fn last_undeploy_releases_port_even_with_retained_receiver() {
 }
 
 #[tokio::test]
+async fn start_panic_releases_listener_even_if_its_handle_is_retained() {
+    let vx = instance(1);
+    let (ready, bound) = oneshot::channel();
+    let result = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let listener = ctx.listen_tcp(EPHEMERAL).await?;
+                ready.send(listener.local_addr()).unwrap();
+                retain(listener);
+                panic!("start after binding");
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(VertxError::Panic(message)) if message == "start after binding"));
+    let addr = bound.await.unwrap();
+    let rebound = std::net::TcpListener::bind(addr).unwrap();
+    drop(rebound);
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_start_rolls_back_listener_before_returning() {
     let vx = instance(1);
     let (ready, bound) = oneshot::channel();
@@ -425,7 +447,7 @@ async fn cancelling_deploy_rolls_back_its_registration() {
                     let incoming = ctx.listen_tcp(EPHEMERAL).await?;
                     let addr = incoming.local_addr();
                     retain(incoming);
-                    ready.send((ctx.deployment_id().unwrap(), addr)).unwrap();
+                    ready.send((ctx.deployment_id(), addr)).unwrap();
                     pending::<Result<()>>().await
                 })
             })
@@ -493,7 +515,8 @@ async fn close_wakes_accept_and_drops_socket_owned_by_managed_task() {
         .event_loop_threads(1)
         .worker_threads(1)
         .shutdown_grace(Duration::from_millis(500))
-        .build();
+        .build()
+        .unwrap();
     let (ready, waiting) = oneshot::channel();
     let (started, holding) = oneshot::channel();
     let (dropped, mut drop_notice) = oneshot::channel();

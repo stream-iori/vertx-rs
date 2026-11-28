@@ -7,9 +7,8 @@
 //! handler 等待上一条处理结束后才消费下一条；增加消费者才会增加消息并行度。
 //! deploy_with 用同一份强类型配置部署两个 Hasher；结果按 seed 排序后展示。
 mod support;
-
-use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
@@ -17,7 +16,6 @@ use vertx_rs::{
     VertxError, WorkerVerticle, pipe_to,
 };
 struct Source;
-#[async_trait(?Send)]
 impl Verticle for Source {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let bus = ctx.event_bus();
@@ -40,7 +38,6 @@ struct HashConfig {
 struct Hasher {
     salt: u64,
 }
-#[async_trait(?Send)]
 impl Verticle for Hasher {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let salt = self.salt;
@@ -64,7 +61,6 @@ impl Verticle for Hasher {
 struct Sink {
     done: Option<oneshot::Sender<Vec<(u64, u64)>>>,
 }
-#[async_trait]
 impl WorkerVerticle for Sink {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let done = self.done.take().expect("start is called once");
@@ -93,7 +89,9 @@ async fn run(vx: &Vertx) -> Result<()> {
     let hashers = vx
         .deploy_with(
             |_, config| Hasher { salt: config.salt },
-            DeploymentOptions::new().instances(2).config(config),
+            DeploymentOptions::new()
+                .instances(NonZeroUsize::new(2).unwrap())
+                .config(config),
         )
         .await?;
     assert_eq!(hashers.len(), 2);
@@ -173,7 +171,7 @@ async fn main() -> Result<()> {
             max_task_details: 32,
             ..Default::default()
         })
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     let result = support::finish(&vx, outcome).await;
     print_snapshot("closed", &vx);

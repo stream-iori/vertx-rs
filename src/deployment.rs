@@ -1,13 +1,17 @@
-use crate::TaskAbortHandle;
-use crate::{Result, VertxError};
-use std::sync::Mutex;
+use crate::eventbus::SubscriptionRegistration;
+use crate::task::ActiveTasks;
+use crate::tcp::ListenerRegistration;
+use crate::{Result, TaskAbortHandle, TaskId, VertxError};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
+/// Process-unique deployment identifier, assigned before the factory runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeploymentId(pub(crate) u64);
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -21,6 +25,21 @@ impl std::fmt::Display for DeploymentId {
         write!(f, "deployment#{}", self.0)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ResourceId(pub(crate) u64);
+
+impl ResourceId {
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+pub(crate) enum ResourceRegistration {
+    Subscription(SubscriptionRegistration),
+    Listener(ListenerRegistration),
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Starting,
@@ -30,12 +49,16 @@ enum Phase {
 }
 pub(crate) struct ScopeState {
     phase: Phase,
-    tasks: Vec<TaskAbortHandle>,
+    tasks: ActiveTasks,
+    resources: HashMap<ResourceId, ResourceRegistration>,
 }
+
 impl ScopeState {
-    pub fn track_task(&mut self, handle: TaskAbortHandle) {
-        self.tasks.retain(|task| !task.is_finished());
-        self.tasks.push(handle);
+    pub fn register_resource(&mut self, id: ResourceId, registration: ResourceRegistration) {
+        assert!(
+            self.resources.insert(id, registration).is_none(),
+            "duplicate resource ID"
+        );
     }
 }
 pub(crate) struct DeploymentScope {
@@ -53,7 +76,8 @@ impl DeploymentScope {
             cancel,
             state: Mutex::new(ScopeState {
                 phase: Phase::Starting,
-                tasks: Vec::new(),
+                tasks: ActiveTasks::default(),
+                resources: HashMap::new(),
             }),
             tracker: TaskTracker::new(),
             blocking: TaskTracker::new(),
@@ -68,6 +92,41 @@ impl DeploymentScope {
             Ok(state)
         }
     }
+    pub fn register_task(self: &Arc<Self>, id: TaskId) -> Result<TaskRegistration> {
+        let mut state = self.admit()?;
+        state.tasks.register(id);
+        Ok(TaskRegistration {
+            scope: Arc::downgrade(self),
+            id,
+            _token: self.tracker.token(),
+        })
+    }
+
+    pub fn attach_task(&self, id: TaskId, handle: TaskAbortHandle) {
+        let abort = self.state.lock().unwrap().tasks.attach(id, &handle);
+        if abort {
+            handle.abort();
+        }
+    }
+
+    pub fn forget_resource(&self, id: ResourceId) {
+        let removed = self.state.lock().unwrap().resources.remove(&id);
+        drop(removed);
+    }
+
+    /// The scope has stopped admitting resources before lifecycle cleanup calls this.
+    pub fn unregister_resources(&self) {
+        let registrations = std::mem::take(&mut self.state.lock().unwrap().resources);
+        for registration in registrations.into_values() {
+            match registration {
+                ResourceRegistration::Subscription(registration) => registration.unregister(),
+                ResourceRegistration::Listener(registration) => {
+                    registration.unregister();
+                }
+            }
+        }
+    }
+
     pub fn admit_blocking(
         &self,
         instance_cancel: &CancellationToken,
@@ -75,7 +134,8 @@ impl DeploymentScope {
     ) -> Result<TaskTrackerToken> {
         let state = self.state.lock().unwrap();
         let running = matches!(state.phase, Phase::Starting | Phase::Running)
-            && !instance_cancel.is_cancelled();
+            && !instance_cancel.is_cancelled()
+            && !self.cancel.is_cancelled();
         let cleanup = in_stop_callback && state.phase == Phase::Stopping;
         if running || cleanup {
             Ok(self.blocking.token())
@@ -105,11 +165,11 @@ impl DeploymentScope {
         self.cancel.cancel();
     }
     pub async fn drain_tasks(&self, grace: Duration) {
-        let timed_out = tokio::time::timeout(grace / 2, self.tracker.wait())
+        if tokio::time::timeout(grace / 2, self.tracker.wait())
             .await
-            .is_err();
-        let tasks = std::mem::take(&mut self.state.lock().unwrap().tasks);
-        if timed_out {
+            .is_err()
+        {
+            let tasks = self.state.lock().unwrap().tasks.take_abort_handles();
             for task in &tasks {
                 task.abort();
             }
@@ -141,5 +201,78 @@ impl DeploymentScope {
     }
     pub fn task_token(&self) -> TaskTrackerToken {
         self.tracker.token()
+    }
+}
+
+pub(crate) struct TaskRegistration {
+    scope: Weak<DeploymentScope>,
+    id: TaskId,
+    _token: TaskTrackerToken,
+}
+
+impl Drop for TaskRegistration {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.upgrade() {
+            let handle = scope.state.lock().unwrap().tasks.remove(self.id);
+            drop(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeploymentId, DeploymentScope, TaskId};
+    use crate::TaskHandle;
+    use crate::task::TaskControl;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Default)]
+    struct AbortProbe(AtomicBool);
+
+    impl TaskControl for AbortProbe {
+        fn abort(&self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draining_aborts_a_late_handle_but_ignores_completed_tasks() {
+        let scope = Arc::new(DeploymentScope::new(
+            DeploymentId::next(),
+            CancellationToken::new(),
+        ));
+        let pending = TaskId::next();
+        let finished = TaskId::next();
+        let registration = scope.register_task(pending).unwrap();
+        drop(scope.register_task(finished).unwrap());
+        scope.request_stop();
+        let grace = Duration::from_secs(2);
+        let drain = scope.drain_tasks(grace);
+        tokio::pin!(drain);
+        assert!(futures::poll!(&mut drain).is_pending());
+        tokio::time::advance(grace).await;
+        assert!(futures::poll!(&mut drain).is_pending());
+
+        let pending_probe = Arc::new(AbortProbe::default());
+        let pending_handle =
+            TaskHandle::<()>::from_channel(oneshot::channel().1, pending_probe.clone());
+        scope.attach_task(pending, pending_handle.abort_handle());
+        assert!(pending_probe.0.load(Ordering::Relaxed));
+
+        let finished_probe = Arc::new(AbortProbe::default());
+        let finished_handle =
+            TaskHandle::<()>::from_channel(oneshot::channel().1, finished_probe.clone());
+        scope.attach_task(finished, finished_handle.abort_handle());
+        assert!(!finished_probe.0.load(Ordering::Relaxed));
+        drop(registration);
+        drain.await;
     }
 }

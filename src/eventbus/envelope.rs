@@ -53,15 +53,14 @@ impl MessageTrace {
             return tracing::Span::none();
         }
         let task_id = ctx
-            .inner
-            .diagnostics
+            .diagnostics()
             .current_task_id()
             .expect("handler polls inside a managed task operation");
         tracing::dispatcher::with_default(&self.dispatch, || {
             // The message's parent may describe its sender. Name the receiving
             // execution explicitly so causal ancestry cannot masquerade as CURRENT.
             tracing::debug_span!(parent: &self.span, "message_handler", instance_id = self.instance,
-                deployment_id = %ctx.scope.deployment, context_id = %ctx.id(), task_id = %task_id)
+                deployment_id = %ctx.scope().deployment, context_id = %ctx.id(), task_id = %task_id)
         })
     }
     pub fn mark_enqueued(&mut self) -> Option<Self> {
@@ -119,9 +118,11 @@ pub struct ReplyHandle {
     tx: oneshot::Sender<Result<ErasedEnvelope>>,
 }
 impl ReplyHandle {
+    /// Sends a reply with empty headers. Returns `ReplyClosed` after timeout or cancellation.
     pub fn reply<R: Send + 'static>(self, response: R) -> Result<()> {
         self.reply_with(response, DeliveryOptions::new())
     }
+    /// Sends a reply with explicit headers using the one-shot channel.
     pub fn reply_with<R: Send + 'static>(
         self,
         response: R,
@@ -132,7 +133,7 @@ impl ReplyHandle {
             .send(Ok(ErasedEnvelope {
                 trace: self.trace.clone(),
                 body: Box::new(response),
-                headers: options.take_headers(),
+                headers: options.into_headers(),
                 reply_to: None,
             }))
             .map_err(|_| VertxError::ReplyClosed);
@@ -143,6 +144,7 @@ impl ReplyHandle {
         });
         result
     }
+    /// Sends a `RecipientFailure` to the requester if it is still waiting.
     pub fn fail(self, code: i32, message: impl Into<String>) -> Result<()> {
         let result = self
             .tx
@@ -159,6 +161,7 @@ impl ReplyHandle {
         result
     }
 }
+/// A typed message or reply with headers and optional one-shot reply capability.
 pub struct Envelope<T> {
     pub(crate) trace: MessageTrace,
     body: T,
@@ -166,21 +169,28 @@ pub struct Envelope<T> {
     reply: Option<ReplyHandle>,
 }
 impl<T> Envelope<T> {
+    /// Borrows the typed message body.
     pub fn body(&self) -> &T {
         &self.body
     }
+    /// Borrows the body mutably while retaining headers and reply capability.
     pub fn body_mut(&mut self) -> &mut T {
         &mut self.body
     }
+    /// Returns the headers attached by the sender.
     pub fn headers(&self) -> &Headers {
         &self.headers
     }
+    /// Reports whether this message originated from a request expecting a reply.
     pub fn has_reply(&self) -> bool {
         self.reply.is_some()
     }
+    /// Consumes a request envelope and sends a one-shot reply.
+    /// An envelope without a reply channel returns `Other`.
     pub fn reply<R: Send + 'static>(self, response: R) -> Result<()> {
         self.reply_handle()?.reply(response)
     }
+    /// Consumes a request envelope and sends a reply with headers.
     pub fn reply_with<R: Send + 'static>(
         self,
         response: R,
@@ -188,6 +198,7 @@ impl<T> Envelope<T> {
     ) -> Result<()> {
         self.reply_handle()?.reply_with(response, options)
     }
+    /// Consumes a request envelope and replies with an application failure.
     pub fn fail(self, code: i32, message: impl Into<String>) -> Result<()> {
         self.reply_handle()?.fail(code, message)
     }
@@ -195,9 +206,11 @@ impl<T> Envelope<T> {
         self.reply
             .ok_or_else(|| VertxError::Other("envelope has no reply channel".into()))
     }
+    /// Extracts the body, headers and reply handle for independent use.
     pub fn into_parts(self) -> (T, Headers, Option<ReplyHandle>) {
         (self.body, self.headers, self.reply)
     }
+    /// Extracts the body and releases the headers and any pending reply handle.
     pub fn into_body(self) -> T {
         self.body
     }

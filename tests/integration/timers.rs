@@ -100,7 +100,8 @@ fn timers_can_be_constructed_without_an_entered_tokio_runtime() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let timer = vx.timer(Duration::from_secs(1)).unwrap();
     let periodic = vx.periodic(Duration::ZERO, Duration::from_secs(1)).unwrap();
     timer.cancel();
@@ -117,4 +118,35 @@ async fn completed_timer_does_not_become_cancelled_on_close(vx: Vertx) {
     vx.close().await.unwrap();
     timer.cancel();
     assert!(!timer.is_cancelled());
+}
+
+#[rstest]
+#[tokio::test]
+async fn out_of_range_deadlines_leave_the_scope_usable(vx: Vertx) {
+    let (id, ctx) = capture(&vx).await;
+    assert!(matches!(
+        vx.timer(Duration::MAX),
+        Err(VertxError::InvalidOptions(_))
+    ));
+    assert!(matches!(
+        ctx.timer(Duration::MAX),
+        Err(VertxError::InvalidOptions(_))
+    ));
+    for (initial, period) in [
+        (Duration::MAX, Duration::from_secs(1)),
+        (Duration::ZERO, Duration::MAX),
+    ] {
+        assert!(matches!(
+            vx.periodic(initial, period),
+            Err(VertxError::InvalidOptions(_))
+        ));
+        assert!(matches!(
+            ctx.periodic(initial, period),
+            Err(VertxError::InvalidOptions(_))
+        ));
+    }
+    assert!(ctx.is_alive());
+    ctx.timer(Duration::ZERO).unwrap().await.unwrap();
+    vx.undeploy(id).await.unwrap();
+    vx.close().await.unwrap();
 }

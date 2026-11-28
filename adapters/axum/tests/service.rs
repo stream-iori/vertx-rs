@@ -1,13 +1,14 @@
 #[path = "../examples/support/mod.rs"]
 mod support;
-
-use async_trait::async_trait;
 use axum::{
     Router,
     extract::{ConnectInfo, State},
     routing::get,
 };
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -16,8 +17,6 @@ use tokio::{
 use vertx_rs::{Context, Result, TcpServerOptions, Verticle, Vertx};
 
 struct Echo;
-
-#[async_trait(?Send)]
 impl Verticle for Echo {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
@@ -35,7 +34,8 @@ async fn graceful() {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     vx.deploy(|_| Echo).await.unwrap();
     let options = TcpServerOptions {
         max_connections: NonZeroUsize::new(8).unwrap(),

@@ -1,37 +1,56 @@
 use crate::{Context, Result};
-use async_trait::async_trait;
+use std::future::{Future, ready};
 
 /// A deployment whose construction, lifecycle, tasks and destruction stay on
 /// one OS thread. Start message loops with `Context::spawn_local` in `start`.
 ///
 /// ```
-/// use async_trait::async_trait;
 /// use vertx_rs::{Context, Result, Verticle};
-/// struct Service;
-/// #[async_trait(?Send)]
+/// struct Service(std::rc::Rc<String>);
 /// impl Verticle for Service {
 ///     async fn start(&mut self, ctx: Context) -> Result<()> {
-///         ctx.event_bus().consumer::<String>("echo")?.handler(|env| async move {
-///             let body = env.body().clone();
-///             env.reply(body)
-///         })?;
-///         Ok(())
+///         let prefix = self.0.clone();
+///         ctx.event_bus().consumer::<String>("greet")?.handler(move |message| {
+///             let prefix = prefix.clone();
+///             async move {
+///                 tokio::task::yield_now().await;
+///                 let greeting = format!("{prefix} {}", message.body());
+///                 message.reply(greeting)
+///             }
+///         })
 ///     }
 /// }
 /// ```
-#[async_trait(?Send)]
 pub trait Verticle: 'static {
-    async fn start(&mut self, ctx: Context) -> Result<()>;
-    async fn stop(&mut self, _ctx: Context) -> Result<()> {
-        Ok(())
+    /// Initializes the deployment. Successful return makes it ready.
+    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>>;
+
+    /// Releases application resources after managed work has drained.
+    fn stop(&mut self, _ctx: Context) -> impl Future<Output = Result<()>> {
+        ready(Ok(()))
     }
 }
 /// Worker executions may migrate threads, but ordinary polls sharing a
 /// Context are serialized. Blocking closures are separately ordered.
-#[async_trait]
+///
+/// ```compile_fail,E0277
+/// use vertx_rs::{Context, Result, WorkerVerticle};
+/// struct Service;
+/// impl WorkerVerticle for Service {
+///     async fn start(&mut self, _: Context) -> Result<()> {
+///         let local = std::rc::Rc::new(1);
+///         tokio::task::yield_now().await;
+///         assert_eq!(*local, 1);
+///         Ok(())
+///     }
+/// }
+/// ```
 pub trait WorkerVerticle: Send + 'static {
-    async fn start(&mut self, ctx: Context) -> Result<()>;
-    async fn stop(&mut self, _ctx: Context) -> Result<()> {
-        Ok(())
+    /// Initializes the deployment on the Worker pool. The future must be `Send`.
+    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>> + Send;
+
+    /// Releases application resources after managed work has drained.
+    fn stop(&mut self, _ctx: Context) -> impl Future<Output = Result<()>> + Send {
+        ready(Ok(()))
     }
 }

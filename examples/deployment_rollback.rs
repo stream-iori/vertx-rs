@@ -2,7 +2,7 @@
 //! cargo run --example deployment_rollback
 //! 预期出现启动失败日志，但正确回滚后程序退出成功。
 mod support;
-use async_trait::async_trait;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use vertx_rs::{Context, DeploymentOptions, Result, Verticle, Vertx, VertxError};
@@ -15,7 +15,6 @@ struct Instance {
     fail: bool,
     stopped: Arc<Mutex<Vec<usize>>>,
 }
-#[async_trait(?Send)]
 impl Verticle for Instance {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
@@ -49,7 +48,7 @@ async fn run(vx: &Vertx) -> Result<()> {
                 }
             },
             DeploymentOptions::new()
-                .instances(3)
+                .instances(NonZeroUsize::new(3).unwrap())
                 .config(Config { fail_at: 1 }),
         )
         .await;
@@ -79,7 +78,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

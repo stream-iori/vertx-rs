@@ -1,4 +1,5 @@
-use super::Context;
+use super::{Context, Target};
+use crate::deployment::TaskRegistration;
 use crate::diagnostics::{OperationGuard, TaskRecord, TaskStage};
 use crate::error::{panic_error, panic_error_ref};
 use crate::{Result, TaskId, VertxError};
@@ -7,106 +8,116 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use tokio_util::task::task_tracker::TaskTrackerToken;
 use tracing::{Dispatch, Span};
 
 impl Context {
-    pub(crate) fn wrap<F: Future>(&self, future: F) -> ContextFuture<F> {
-        let diagnostics = &self.inner.diagnostics;
-        let record = diagnostics.task(self.id(), self.scope.deployment, TaskStage::Ready);
+    pub(super) fn frame(&self, id: TaskId) -> TaskFrame {
+        let diagnostics = self.diagnostics();
+        let record = diagnostics.task(id, self.id(), self.scope().deployment, TaskStage::Ready);
         let span = if diagnostics.options.enabled {
             let span = tracing::info_span!(
                 "context_task", instance_id = diagnostics.instance,
-                deployment_id = %self.scope.deployment, context_id = %self.id(), task_id = %record.id
+                deployment_id = %self.scope().deployment, context_id = %self.id(), task_id = %record.id
             );
             span.in_scope(|| tracing::debug!(task_id = %record.id, "task submitted"));
             span
         } else {
             Span::none()
         };
-        ContextFuture {
-            ctx: self.clone(),
-            future: Some(Box::pin(future)),
+        TaskFrame {
             record,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
             span,
         }
     }
 
-    // The lifecycle driver already owns the execution gate and tracing guards.
-    pub(crate) fn scope_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
-        let ctx = self.clone();
-        let mut future = Box::pin(future);
-        futures::future::poll_fn(move |cx| {
-            let _context = ctx.enter();
-            future.as_mut().poll(cx)
-        })
+    pub(crate) fn wrap<F: Future>(&self, future: F) -> ContextFuture<F> {
+        ContextFuture::new(self.clone(), self.frame(TaskId::next()), future)
     }
 
-    // The caller holds deployment admission through scheduling and registration.
     pub(super) fn track_future<F>(
-        &self,
+        self,
+        frame: TaskFrame,
+        registration: TaskRegistration,
         future: F,
-    ) -> (impl Future<Output = Result<()>> + use<F>, TaskId)
+    ) -> impl Future<Output = Result<()>> + use<F>
     where
         F: Future<Output = Result<()>>,
     {
-        let future = self.wrap(run_managed(self.clone(), future));
-        let id = future.record.id;
-        let tracked = Tracked {
-            future,
-            _token: self.scope.task_token(),
-        };
-        (tracked, id)
+        Tracked {
+            future: ContextFuture::new(self.clone(), frame, run_managed(self, future)),
+            _registration: registration,
+        }
     }
 }
 
-async fn run_managed(ctx: Context, future: impl Future<Output = Result<()>>) -> Result<()> {
-    if ctx.scope.cancel.is_cancelled() {
-        return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
+pub(crate) enum TaskResult<T> {
+    Finished(Result<T>),
+    Cancelled(VertxError),
+}
+
+async fn run_managed(ctx: Context, future: impl Future<Output = Result<()>>) -> TaskResult<()> {
+    if ctx.scope().cancel.is_cancelled() {
+        return TaskResult::Cancelled(VertxError::DeploymentTerminated(ctx.scope().deployment));
     }
     let result = AssertUnwindSafe(future)
         .catch_unwind()
         .await
         .unwrap_or_else(|error| Err(panic_error(error)));
-    if let Err(error) = &result {
-        if !ctx.is_expected_cancellation(error) {
-            ctx.report_error(error);
-        } else if matches!(error, VertxError::VertxClosed) {
-            return Err(VertxError::DeploymentTerminated(ctx.scope.deployment));
+    if let Err(error) = result {
+        if ctx.is_expected_cancellation(&error) {
+            let error = if matches!(error, VertxError::VertxClosed) {
+                VertxError::DeploymentTerminated(ctx.scope().deployment)
+            } else {
+                error
+            };
+            return TaskResult::Cancelled(error);
         }
+        ctx.report_error(&error);
+        return TaskResult::Finished(Err(error));
     }
-    result
+    TaskResult::Finished(result)
 }
 
-pub(crate) struct ContextFuture<F> {
-    ctx: Context,
-    future: Option<Pin<Box<F>>>,
+pub(super) struct TaskFrame {
     record: TaskRecord,
     dispatch: Dispatch,
     span: Span,
 }
 
-impl<F: Future<Output = Result<T>>, T> Future for ContextFuture<F> {
+pub(crate) struct ContextFuture<F> {
+    ctx: Context,
+    future: Option<Pin<Box<F>>>,
+    frame: TaskFrame,
+}
+
+impl<F> ContextFuture<F> {
+    fn new(ctx: Context, frame: TaskFrame, future: F) -> Self {
+        Self {
+            ctx,
+            frame,
+            future: Some(Box::pin(future)),
+        }
+    }
+}
+
+impl<F: Future<Output = TaskResult<T>>, T> Future for ContextFuture<F> {
     type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let Self {
             ctx,
             future,
-            record,
-            dispatch,
-            span,
+            frame:
+                TaskFrame {
+                    record,
+                    dispatch,
+                    span,
+                },
         } = self.get_mut();
-        if let Some(id) = ctx.event_loop_id() {
-            assert!(
-                ctx.inner.event_loops.check_thread(id),
-                "EventLoop affinity violated"
-            );
-        }
         with_execution(ctx, dispatch, span, || {
             record.stage(TaskStage::Polling);
-            if ctx.inner.diagnostics.options.enabled {
+            if ctx.diagnostics().options.enabled {
                 tracing::trace!(
                     thread_id = ?std::thread::current().id(), event_loop_id = ?ctx.event_loop_id(),
                     "task poll"
@@ -122,13 +133,22 @@ impl<F: Future<Output = Result<T>>, T> Future for ContextFuture<F> {
                 // Poll can also drop an awaited future that has just completed.
                 let error = panic_error(payload);
                 ctx.report_error(&error);
-                Poll::Ready(Err(error))
+                Poll::Ready(TaskResult::Finished(Err(error)))
             });
-            match &result {
-                Poll::Ready(result) => record.result(result),
-                Poll::Pending => record.pending(),
+            match result {
+                Poll::Ready(outcome) => {
+                    let (result, cancelled) = match outcome {
+                        TaskResult::Finished(result) => (result, false),
+                        TaskResult::Cancelled(error) => (Err(error), true),
+                    };
+                    record.result(&result, cancelled);
+                    Poll::Ready(result)
+                }
+                Poll::Pending => {
+                    record.pending();
+                    Poll::Pending
+                }
             }
-            result
         })
     }
 }
@@ -138,9 +158,12 @@ impl<F> Drop for ContextFuture<F> {
         let Self {
             ctx,
             future,
-            record,
-            dispatch,
-            span,
+            frame:
+                TaskFrame {
+                    record,
+                    dispatch,
+                    span,
+                },
         } = self;
         let result = with_execution(ctx, dispatch, span, || {
             let _operation = operation_guard(ctx, record, "future_drop");
@@ -165,11 +188,20 @@ fn with_execution<T>(
     span: &Span,
     run: impl FnOnce() -> T,
 ) -> T {
-    let _execution = ctx
-        .data
-        .execution
-        .lock()
-        .expect("Context execution gate poisoned by an internal failure");
+    let _execution = match &ctx.data.target {
+        Target::EventLoop(id) => {
+            assert!(
+                ctx.data.executors.event_loops.check_thread(*id),
+                "EventLoop affinity violated"
+            );
+            None
+        }
+        Target::Worker { execution, .. } => Some(
+            execution
+                .lock()
+                .expect("Worker execution gate poisoned by an internal failure"),
+        ),
+    };
     let _context = ctx.enter();
     let _dispatch = tracing::dispatcher::set_default(dispatch);
     let _span = span.enter();
@@ -177,7 +209,7 @@ fn with_execution<T>(
 }
 
 fn operation_guard(ctx: &Context, record: &TaskRecord, operation: &'static str) -> OperationGuard {
-    let diagnostics = &ctx.inner.diagnostics;
+    let diagnostics = ctx.diagnostics();
     let event_loop = ctx.event_loop_id();
     let threshold = if event_loop.is_some() {
         diagnostics.options.event_loop_poll_threshold
@@ -190,10 +222,10 @@ fn operation_guard(ctx: &Context, record: &TaskRecord, operation: &'static str) 
 struct Tracked<F> {
     // Fields drop in order, including when the future's destructor unwinds.
     future: ContextFuture<F>,
-    _token: TaskTrackerToken,
+    _registration: TaskRegistration,
 }
 
-impl<F: Future<Output = Result<()>>> Future for Tracked<F> {
+impl<F: Future<Output = TaskResult<()>>> Future for Tracked<F> {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {

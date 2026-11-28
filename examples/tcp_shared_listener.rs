@@ -3,8 +3,6 @@
 //! 内置客户端核对两个字节的回显，每条连接都会打印所属 EventLoop。
 //! 运行：`cargo run --example tcp_shared_listener`。
 mod support;
-
-use async_trait::async_trait;
 use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,8 +15,6 @@ struct Echo {
     ready: Option<oneshot::Sender<(SocketAddr, TaskHandle<()>)>>,
     served: Option<oneshot::Sender<EventLoopId>>,
 }
-
-#[async_trait(?Send)]
 impl Verticle for Echo {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let mut incoming = ctx.listen_tcp(self.addr).await?;
@@ -88,6 +84,6 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(1)
-        .try_build()?;
+        .build()?;
     support::finish(&vx, support::bounded(run(&vx)).await).await
 }

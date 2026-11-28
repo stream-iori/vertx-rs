@@ -1,4 +1,5 @@
 use crate::{Result, VertxError};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,6 +61,41 @@ impl TaskAbortHandle {
     /// Returns true after the executor has destroyed the user Future.
     pub fn is_finished(&self) -> bool {
         self.control.is_finished()
+    }
+}
+
+/// Tracks live tasks and covers a submission whose abort handle arrives late.
+#[derive(Default)]
+pub(crate) struct ActiveTasks {
+    entries: HashMap<TaskId, Option<TaskAbortHandle>>,
+    aborting: bool,
+}
+
+impl ActiveTasks {
+    pub fn register(&mut self, id: TaskId) {
+        assert!(self.entries.insert(id, None).is_none(), "duplicate task ID");
+    }
+
+    /// Returns true if the caller must abort this handle after unlocking.
+    pub fn attach(&mut self, id: TaskId, handle: &TaskAbortHandle) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if self.aborting {
+            return true;
+        }
+        assert!(entry.is_none(), "abort handle already attached");
+        *entry = Some(handle.clone());
+        false
+    }
+
+    pub fn remove(&mut self, id: TaskId) -> Option<TaskAbortHandle> {
+        self.entries.remove(&id).flatten()
+    }
+
+    pub fn take_abort_handles(&mut self) -> Vec<TaskAbortHandle> {
+        self.aborting = true;
+        self.entries.values_mut().filter_map(Option::take).collect()
     }
 }
 impl<T> TaskHandle<T> {

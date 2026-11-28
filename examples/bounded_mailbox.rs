@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

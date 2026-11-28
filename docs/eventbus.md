@@ -27,8 +27,9 @@ address → Route { TypeId, subscribers, round-robin cursor }
 | fail(code, message) | 返回 RecipientFailure |
 | into_parts | 拆出 body、Headers 和可跨任务移动的 ReplyHandle |
 
-请求取消/超时不会撤回已经入队的业务消息；迟到 reply 返回 ReplyClosed。
-Headers 按插入顺序保存、键大小写敏感、支持重复值；header 追加，insert 替换，get_all 读取全部值。
+`DeliveryOptions` 给发送、广播、Sink 和回复配置 headers。请求用 `RequestOptions`，其中 timeout 覆盖入队和回复等待。
+请求取消或超时后，已入队的消息仍可被消费。迟到 reply 返回 `ReplyClosed`。
+Headers 按插入顺序保存，键大小写敏感且可重复。`get` 返回第一个值的 `&str`，`get_all` 遍历所有匹配的值。
 
 ## 归属与竞态
 
@@ -36,9 +37,9 @@ Headers 按插入顺序保存、键大小写敏感、支持重复值；header �
 - Vertx::event_bus 在框架外注册为 unbound；在本实例的 Context 中注册时自动绑定当前 Context。
 - 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
 - handler 接受本地 !Send 闭包；handler_worker 要求 Send 闭包及 Future。都校验调用 Context。
-- 所有消费者都只登记在 EventBus 路由表。每条订阅记录可选的 DeploymentId，部署作用域不另存订阅清单。
-- 绑定部署时，存活检查到路由插入全程持有部署准入锁。进入 Stopping 后拒绝新订阅。
-- 撤销部署时扫描路由表，按 DeploymentId 删除该部署的订阅。关闭 EventBus 时清除全部路由。发送仍按地址查表。
+- EventBus 路由表拥有订阅和队列。绑定消费者在部署作用域登记地址和注册 ID，生命周期可以按登记准确注销。
+- 绑定部署时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
+- 撤销部署只处理属于它的登记。关闭 EventBus 清除所有路由，包括框架外的注册。发送始终按地址查表。
 - Consumer Drop 按地址和订阅 ID 注销单条记录。每次移除都和路由更新原子进行，移除地址下最后一个订阅时同时清除轮询状态。
 - 注销先在路由锁内标记失活、移除目标并更新计数，再释放相关注册表锁，取消并释放 sender；Waker 可重入路由。
 

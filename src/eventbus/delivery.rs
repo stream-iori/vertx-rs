@@ -1,6 +1,6 @@
 use super::envelope::{self, ErasedEnvelope, MessageTrace};
 use super::queue::QueueSender;
-use super::{DeliveryOptions, Envelope, EventBus, Headers};
+use super::{DeliveryOptions, Envelope, EventBus, Headers, RequestOptions};
 use crate::{Result, VertxError};
 use tokio::sync::oneshot;
 
@@ -19,7 +19,7 @@ impl EventBus {
         options: DeliveryOptions,
     ) -> Result<()> {
         let senders = self.router.subscribers::<T>(address)?;
-        let headers = options.take_headers();
+        let headers = options.into_headers();
         let diagnostics = &self.router.diagnostics;
         let mut dropped = 0;
         for sender in senders {
@@ -56,14 +56,13 @@ impl EventBus {
         self.send_with(address, body, DeliveryOptions::new()).await
     }
     /// Sends with headers using [`Self::send`] semantics.
-    /// The timeout option applies to request APIs, not as a queue deadline.
     pub async fn send_with<T: Send + 'static>(
         &self,
         address: &str,
         body: T,
         options: DeliveryOptions,
     ) -> Result<()> {
-        let (sender, envelope) = self.prepare(address, body, options.take_headers(), None, None)?;
+        let (sender, envelope) = self.prepare(address, body, options.into_headers(), None, None)?;
         sender.send(envelope).await
     }
     /// Attempts immediate admission to one consumer.
@@ -78,7 +77,7 @@ impl EventBus {
         body: T,
         options: DeliveryOptions,
     ) -> Result<()> {
-        let (sender, envelope) = self.prepare(address, body, options.take_headers(), None, None)?;
+        let (sender, envelope) = self.prepare(address, body, options.into_headers(), None, None)?;
         sender.try_reserve()?.send(envelope)
     }
     /// Waits for a typed reply; one default 30-second timeout covers admission and reply.
@@ -89,7 +88,7 @@ impl EventBus {
         address: &str,
         body: T,
     ) -> Result<R> {
-        self.request_with(address, body, DeliveryOptions::new())
+        self.request_with(address, body, RequestOptions::new())
             .await
     }
     /// Requests a typed body with headers and a timeout covering queueing plus reply.
@@ -98,7 +97,7 @@ impl EventBus {
         &self,
         address: &str,
         body: T,
-        options: DeliveryOptions,
+        options: RequestOptions,
     ) -> Result<R> {
         Ok(self
             .request_message_with::<T, R>(address, body, options)
@@ -112,7 +111,7 @@ impl EventBus {
         address: &str,
         body: T,
     ) -> Result<Envelope<R>> {
-        self.request_message_with(address, body, DeliveryOptions::new())
+        self.request_message_with(address, body, RequestOptions::new())
             .await
     }
     /// Requests a full response with explicit headers and timeout.
@@ -122,11 +121,11 @@ impl EventBus {
         &self,
         address: &str,
         body: T,
-        options: DeliveryOptions,
+        options: RequestOptions,
     ) -> Result<Envelope<R>> {
         let request_id = envelope::next_message_id();
         let timeout = options.timeout();
-        let request = self.request_reply(request_id, address, body, options.take_headers());
+        let request = self.request_reply(request_id, address, body, options.into_headers());
         tokio::time::timeout(timeout, request).await.map_err(|_| {
             let diagnostics = &self.router.diagnostics;
             diagnostics.timeout();

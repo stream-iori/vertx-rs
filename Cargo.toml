@@ -15,7 +15,6 @@ default-members = ["."]
 tokio = { version = "1.54.0", features = ["rt", "sync", "macros", "time", "net"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 dashmap = "6.2.1"
-async-trait = "0.1.92"
 thiserror = "2.0.21"
 futures = "0.3.34"
 tracing = "0.1.44"
@@ -64,3 +63,7 @@ path = "examples/error_handling.rs"
 [[example]]
 name = "tcp_shared_listener"
 path = "examples/tcp_shared_listener.rs"
+
+[[bench]]
+name = "runtime"
+harness = false

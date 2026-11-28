@@ -13,25 +13,28 @@
 //! We *don't* mirror `worker: bool` — use `Vertx::deploy_worker` instead
 //! (explicit > flag). HA / clustering are out of scope.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+/// Configures the number of deployments and their immutable shared configuration.
 #[derive(Debug, Clone)]
 #[must_use = "options take effect only when passed to an operation"]
 pub struct DeploymentOptions<C = ()> {
-    instances: usize,
+    instances: NonZeroUsize,
     config: Arc<C>,
 }
 
 impl Default for DeploymentOptions<()> {
     fn default() -> Self {
         Self {
-            instances: 1,
+            instances: NonZeroUsize::MIN,
             config: Arc::new(()),
         }
     }
 }
 
 impl DeploymentOptions<()> {
+    /// Creates options for one deployment with unit configuration.
     pub fn new() -> Self {
         Self::default()
     }
@@ -40,9 +43,13 @@ impl DeploymentOptions<()> {
 impl<C> DeploymentOptions<C> {
     /// Deploy this many instances of the verticle. Each instance gets its
     /// own `Context` (picked round-robin across EventLoops). Default is 1.
-    /// Zero is normalized to one for compatibility.
-    pub fn instances(mut self, n: usize) -> Self {
-        self.instances = n.max(1);
+    ///
+    /// ```compile_fail,E0308
+    /// use vertx_rs::DeploymentOptions;
+    /// DeploymentOptions::new().instances(0);
+    /// ```
+    pub fn instances(mut self, n: NonZeroUsize) -> Self {
+        self.instances = n;
         self
     }
 
@@ -54,10 +61,12 @@ impl<C> DeploymentOptions<C> {
         }
     }
 
-    pub fn instances_count(&self) -> usize {
+    /// Returns the positive number of verticle instances to deploy.
+    pub fn instances_count(&self) -> NonZeroUsize {
         self.instances
     }
 
+    /// Clones the shared configuration handle passed to each factory.
     pub fn shared_config(&self) -> Arc<C> {
         Arc::clone(&self.config)
     }

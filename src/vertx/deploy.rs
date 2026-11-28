@@ -20,11 +20,11 @@ impl Vertx {
         F: FnOnce(Context) -> V + Send + 'static,
         V: Verticle,
     {
-        let shared = &self.inner.shared;
+        let loops = &self.inner.executors.event_loops;
         let pending = self.submit_deployment(|scope, ready| {
-            let loop_id = shared.event_loops.pick();
-            let ctx = Context::new_event_loop(loop_id, shared.clone(), scope);
-            shared.event_loops.spawn_pinned(loop_id, move || {
+            let loop_id = loops.pick();
+            let ctx = Context::new_event_loop(loop_id, &self.inner, scope);
+            loops.spawn_pinned(loop_id, move || {
                 ctx.wrap(drive_local(ctx.clone(), factory, ready))
             })
         })?;
@@ -39,13 +39,10 @@ impl Vertx {
         F: FnOnce(Context) -> V + Send + 'static,
         V: WorkerVerticle,
     {
-        let shared = &self.inner.shared;
         let pending = self.submit_deployment(|scope, ready| {
-            let ctx = Context::new_worker(shared.clone(), scope);
+            let ctx = Context::new_worker(&self.inner, scope);
             let future = ctx.wrap(drive_worker(ctx.clone(), factory, ready));
-            shared
-                .workers
-                .spawn(ctx.worker_lane(), ctx.worker_driver(), future)
+            ctx.spawn_worker(future)
         })?;
         pending
             .wait_ready("worker lifecycle driver terminated")
@@ -54,8 +51,7 @@ impl Vertx {
 
     /// Deploys instances sequentially with shared typed configuration.
     /// Failure rolls back prior instances and retains rollback errors. Dropping
-    /// the waiter requests cleanup of current and prior instances. Zero instances
-    /// are normalized to one by [`DeploymentOptions::instances`].
+    /// the waiter requests cleanup of current and prior instances.
     pub async fn deploy_with<F, V, C>(
         &self,
         factory: F,
@@ -70,7 +66,7 @@ impl Vertx {
         let config = options.shared_config();
         let mut ids = Vec::new();
         let mut rollback = Rollback::default();
-        for _ in 0..options.instances_count() {
+        for _ in 0..options.instances_count().get() {
             let (factory, config) = (factory.clone(), config.clone());
             match self.deploy(move |ctx| factory(ctx, config)).await {
                 Ok(id) => {
@@ -80,7 +76,7 @@ impl Vertx {
                     ids.push(id);
                 }
                 Err(cause) => {
-                    let failures = rollback.wait(self.inner.shared.shutdown_grace).await;
+                    let failures = rollback.wait(self.inner.lifetime.shutdown_grace).await;
                     return Err(VertxError::DeploymentFailed {
                         cause: Box::new(cause),
                         rollback: failures,
@@ -98,7 +94,7 @@ impl Vertx {
     /// [`Context::request_undeploy`] there. Unknown IDs return `DeploymentNotFound`.
     pub async fn undeploy(&self, id: DeploymentId) -> Result<()> {
         if Context::current()
-            .is_some_and(|ctx| ctx.deployment_id() == Some(id) && self.owns_context(&ctx))
+            .is_some_and(|ctx| ctx.deployment_id() == id && self.owns_context(&ctx))
         {
             return Err(VertxError::WouldDeadlock);
         }
@@ -107,7 +103,7 @@ impl Vertx {
             .ok_or(VertxError::DeploymentNotFound(id))?;
         scope.request_stop();
         let result = scope
-            .wait_with_grace(self.inner.shared.shutdown_grace)
+            .wait_with_grace(self.inner.lifetime.shutdown_grace)
             .await;
         if matches!(result, Err(VertxError::ShutdownTimeout(_))) {
             tracing::warn!(deployment = %id, "shutdown timed out; cleanup continues");
@@ -116,32 +112,40 @@ impl Vertx {
     }
 
     fn deployment_scope(&self, id: DeploymentId) -> Option<Arc<DeploymentScope>> {
-        self.inner.deployments.lock().unwrap().get(&id).cloned()
+        self.inner
+            .deployments
+            .lock()
+            .unwrap()
+            .scopes
+            .get(&id)
+            .cloned()
     }
 
     fn submit_deployment(
         &self,
         submit: impl FnOnce(Arc<DeploymentScope>, ReadySender) -> Result<TaskHandle<()>>,
     ) -> Result<PendingDeployment> {
-        let close_started = self.inner.close_started.lock().unwrap();
-        if *close_started {
-            return Err(VertxError::VertxClosed);
-        }
-        let shared = &self.inner.shared;
-        shared.event_bus.ensure_open()?;
-
+        let diagnostics = &self.inner.services.diagnostics;
         let id = DeploymentId::next();
-        let scope = Arc::new(DeploymentScope::new(id, shared.cancel.child_token()));
+        let scope = Arc::new(DeploymentScope::new(
+            id,
+            self.inner.lifetime.cancel.child_token(),
+        ));
         let (started, ready) = oneshot::channel();
-        shared.diagnostics.deployment(id, DeploymentStage::Queued);
-        self.inner
-            .deployments
-            .lock()
-            .unwrap()
-            .insert(id, scope.clone());
+        {
+            let mut deployments = self.inner.deployments.lock().unwrap();
+            if deployments.closing {
+                return Err(VertxError::VertxClosed);
+            }
+            diagnostics.record_deployment(id, DeploymentStage::Queued);
+            deployments.scopes.insert(id, scope.clone());
+        }
+        diagnostics.trace_deployment(id, DeploymentStage::Queued);
+        // Close includes the scope in its snapshot even if submission is still in progress.
         if let Err(error) = submit(scope.clone(), started) {
-            self.inner.deployments.lock().unwrap().remove(&id);
-            shared.diagnostics.deployment(id, DeploymentStage::Stopped);
+            diagnostics.deployment(id, DeploymentStage::Stopped);
+            self.inner.forget_deployment(id);
+            scope.finish(Err(error.clone()));
             return Err(error);
         }
         Ok(PendingDeployment {
@@ -204,5 +208,44 @@ impl Rollback {
 impl Drop for Rollback {
     fn drop(&mut self) {
         self.request_stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Vertx, VertxError};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn close_waits_for_a_registered_submission_to_fail() {
+        let vertx = Vertx::builder()
+            .event_loop_threads(1)
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (registered, ready) = oneshot::channel();
+        let (fail, release) = std::sync::mpsc::channel();
+        let submitter = vertx.clone();
+        let submission = std::thread::spawn(move || {
+            submitter.submit_deployment(|_, _| {
+                registered.send(()).unwrap();
+                release.recv().unwrap();
+                Err(VertxError::Other("executor rejected submission".into()))
+            })
+        });
+        ready.await.unwrap();
+        let close = vertx.close();
+        tokio::pin!(close);
+        assert!(futures::poll!(&mut close).is_pending());
+        assert_eq!(vertx.diagnostics().active_deployments, 1);
+        fail.send(()).unwrap();
+        assert!(matches!(
+            submission.join().unwrap(),
+            Err(VertxError::Other(_))
+        ));
+        assert!(matches!(close.await, Err(VertxError::CleanupFailed(errors))
+            if matches!(errors.as_slice(), [VertxError::Other(error)] if error == "executor rejected submission")
+        ));
+        assert_eq!(vertx.diagnostics().active_deployments, 0);
     }
 }

@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 use rstest::fixture;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use vertx_rs::{Context, Result, Verticle, Vertx, VertxError, WorkerVerticle};
 
@@ -14,6 +13,33 @@ pub(super) fn vx() -> Vertx {
         .worker_threads(2)
         .shutdown_grace(Duration::from_millis(500))
         .build()
+        .unwrap()
+}
+
+/// Gates a test body on running in a child that the parent can stop on deadlock.
+pub(super) fn in_test_subprocess(name: &str) -> bool {
+    const CHILD_TEST: &str = "VERTX_RS_CHILD_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(name) {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD_TEST, name)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "child test {name} failed: {status}");
+            return false;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("child test {name} did not complete in five seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub(super) struct Local<F>(Option<F>);
@@ -25,8 +51,6 @@ where
 {
     Local(Some(f))
 }
-
-#[async_trait(?Send)]
 impl<F, Fut> Verticle for Local<F>
 where
     F: FnOnce(Context) -> Fut + 'static,
@@ -46,8 +70,6 @@ where
 {
     Worker(Some(f))
 }
-
-#[async_trait]
 impl<F, Fut> WorkerVerticle for Worker<F>
 where
     F: FnOnce(Context) -> Fut + Send + 'static,
@@ -102,7 +124,7 @@ pub(super) async fn capture_worker(vx: &Vertx) -> (vertx_rs::DeploymentId, Conte
 }
 
 pub(super) struct WorkerDropProbe {
-    pub(super) id: Option<vertx_rs::DeploymentId>,
+    pub(super) id: vertx_rs::DeploymentId,
     pub(super) dropped: Arc<AtomicUsize>,
     pub(super) panic: bool,
 }

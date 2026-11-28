@@ -1,7 +1,6 @@
 //! 外部 OS 线程提交任务到已有 Context；逻辑模型不描述提交方线程。
 //! cargo run --example external_dispatch
 mod support;
-use async_trait::async_trait;
 use std::thread::{JoinHandle, ThreadId};
 use tokio::sync::oneshot;
 use vertx_rs::{Context, Result, ThreadingModel, Verticle, Vertx, VertxError};
@@ -9,7 +8,6 @@ use vertx_rs::{Context, Result, ThreadingModel, Verticle, Vertx, VertxError};
 struct Service {
     ready: Option<oneshot::Sender<(Context, ThreadId)>>,
 }
-#[async_trait(?Send)]
 impl Verticle for Service {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         self.ready
@@ -31,7 +29,7 @@ async fn run(vx: &Vertx, external: &mut Option<JoinHandle<()>>) -> Result<()> {
         assert!(!Context::is_on_vertx_thread());
         assert_eq!(target.threading_model(), ThreadingModel::EventLoop);
         let id = target.id();
-        let task = target.run_on_context(async move {
+        let task = target.spawn(async move {
             assert_eq!(Context::current().unwrap().id(), id);
             assert_eq!(std::thread::current().id(), owner_thread);
             assert!(Context::is_on_event_loop_thread());
@@ -45,7 +43,7 @@ async fn run(vx: &Vertx, external: &mut Option<JoinHandle<()>>) -> Result<()> {
     assert!(Context::current().is_none());
     vx.undeploy(deployment).await?;
     assert!(matches!(
-        ctx.run_on_context(async { Ok(()) }),
+        ctx.spawn(async { Ok(()) }),
         Err(VertxError::DeploymentTerminated(_))
     ));
     println!("submission after undeploy: DeploymentTerminated");
@@ -60,7 +58,7 @@ fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let mut external = None;
     let outcome = runtime.block_on(async {
         let outcome = support::bounded(run(&vx, &mut external)).await;

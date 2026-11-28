@@ -80,10 +80,8 @@ async fn execute_blocking_is_fifo_by_default(vx: Vertx) {
 }
 
 #[rstest]
-#[case::boolean_api(false)]
-#[case::named_api(true)]
 #[tokio::test]
-async fn unordered_blocking_obeys_configured_limit_and_can_overlap(vx: Vertx, #[case] named: bool) {
+async fn unordered_blocking_obeys_configured_limit_and_can_overlap(vx: Vertx) {
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let m = maximum.clone();
@@ -103,11 +101,7 @@ async fn unordered_blocking_obeys_configured_limit_and_can_overlap(vx: Vertx, #[
                         b.wait();
                         a.fetch_sub(1, Ordering::SeqCst);
                     };
-                    if named {
-                        ctx.execute_blocking_unordered(operation).await
-                    } else {
-                        ctx.execute_blocking_with(operation, false).await
-                    }
+                    ctx.execute_blocking_unordered(operation).await
                 }
             });
             for r in futures::future::join_all(jobs).await {
@@ -128,7 +122,8 @@ async fn started_blocking_task_is_not_reported_as_aborted() {
         .event_loop_threads(1)
         .worker_threads(2)
         .shutdown_grace(Duration::from_millis(40))
-        .build();
+        .build()
+        .unwrap();
     let (started_tx, started_rx) = oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let id = vx
@@ -162,18 +157,16 @@ async fn queued_blocking_operation_is_skipped_after_scope_cancellation() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (id, ctx) = capture(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
-    let first = ctx.execute_blocking_with(
-        move || {
-            entered.send(()).ok();
-            wait.recv().unwrap();
-            42
-        },
-        false,
-    );
+    let first = ctx.execute_blocking_unordered(move || {
+        entered.send(()).ok();
+        wait.recv().unwrap();
+        42
+    });
     tokio::pin!(first);
     assert!(futures::poll!(&mut first).is_pending());
     started.await.unwrap();
@@ -185,13 +178,10 @@ async fn queued_blocking_operation_is_skipped_after_scope_cancellation() {
         dropped: dropped.clone(),
         panic: false,
     };
-    let queued = ctx.execute_blocking_with(
-        move || {
-            let _probe = probe;
-            count.fetch_add(1, Ordering::SeqCst);
-        },
-        false,
-    );
+    let queued = ctx.execute_blocking_unordered(move || {
+        let _probe = probe;
+        count.fetch_add(1, Ordering::SeqCst);
+    });
     tokio::pin!(queued);
     assert!(futures::poll!(&mut queued).is_pending());
     let undeploy = vx.undeploy(id);

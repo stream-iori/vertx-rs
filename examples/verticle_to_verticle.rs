@@ -7,13 +7,11 @@
 //! 实际演示丢弃 TaskHandle 后继续运行、abort 后等待析构、undeploy 后路由移除。
 //! 未获选服务的迟到回复可能返回 ReplyClosed；服务显式处理这个预期结果。
 mod support;
-
-use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::{join_all, select_ok, try_join_all};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeliveryOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Context, RequestOptions, Result, Verticle, Vertx, VertxError};
 fn allow_late_reply(result: Result<()>) -> Result<()> {
     match result {
         Err(VertxError::ReplyClosed) => {
@@ -24,7 +22,6 @@ fn allow_late_reply(result: Result<()>) -> Result<()> {
     }
 }
 struct Upper;
-#[async_trait(?Send)]
 impl Verticle for Upper {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
@@ -36,7 +33,6 @@ impl Verticle for Upper {
     }
 }
 struct Reject;
-#[async_trait(?Send)]
 impl Verticle for Reject {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
@@ -47,7 +43,6 @@ impl Verticle for Reject {
 struct Caller {
     context: Option<oneshot::Sender<Context>>,
 }
-#[async_trait(?Send)]
 impl Verticle for Caller {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let bus = ctx.event_bus();
@@ -58,7 +53,7 @@ impl Verticle for Caller {
                     bus.request_with::<_, String>(
                         address,
                         env.body().clone(),
-                        DeliveryOptions::new().with_timeout(Duration::from_secs(1)),
+                        RequestOptions::new().with_timeout(Duration::from_secs(1)),
                     )
                     .boxed()
                 });
@@ -138,7 +133,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         bus.request_with::<_, String>(
             "caller",
             word.to_owned(),
-            DeliveryOptions::new().with_timeout(Duration::from_secs(1)),
+            RequestOptions::new().with_timeout(Duration::from_secs(1)),
         )
     }))
     .await?;
@@ -148,7 +143,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         bus.request_with::<_, String>(
             address,
             "example".to_owned(),
-            DeliveryOptions::new().with_timeout(Duration::from_secs(1)),
+            RequestOptions::new().with_timeout(Duration::from_secs(1)),
         )
     }))
     .await;
@@ -170,7 +165,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use axum::Router;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -15,8 +14,6 @@ struct Http {
     options: Option<TcpServerOptions>,
     ready: Option<oneshot::Sender<(TcpServer, Context)>>,
 }
-
-#[async_trait(?Send)]
 impl Verticle for Http {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let server = match self.options {

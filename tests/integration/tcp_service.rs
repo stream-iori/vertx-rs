@@ -33,6 +33,7 @@ fn instance() -> Vertx {
         .worker_threads(1)
         .shutdown_grace(GRACE)
         .build()
+        .unwrap()
 }
 
 async fn start<F, H>(
@@ -170,7 +171,7 @@ async fn timeout_cancels_connections_even_after_shutdown_waiter_is_dropped() {
     .await
     .unwrap();
     let copy = server.clone();
-    ctx.run_on_context(async move {
+    ctx.spawn(async move {
         assert!(matches!(
             copy.shutdown(GRACE).await,
             Err(VertxError::WouldDeadlock)
@@ -227,7 +228,7 @@ async fn bind_failure_rolls_back_and_raw_registration_conflicts() {
     let (id, server, ctx) = start(&vx, addr, opts, || async |_: TcpConnection<'_>| Ok(()))
         .await
         .unwrap();
-    ctx.run_on_context(async move {
+    ctx.spawn(async move {
         let ctx = Context::current().unwrap();
         assert!(matches!(
             ctx.listen_tcp(addr).await,

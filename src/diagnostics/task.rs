@@ -16,11 +16,11 @@ impl Diagnostics {
     }
     pub fn task(
         self: &Arc<Self>,
+        id: TaskId,
         context_id: ContextId,
         deployment_id: DeploymentId,
         stage: TaskStage,
     ) -> TaskRecord {
-        let id = TaskId::next();
         let record = TaskRecord {
             diagnostics: self.clone(),
             id,
@@ -180,14 +180,11 @@ impl TaskRecord {
             tracing::trace!(task_id = %self.id, ?ready_queue_wait, "task dequeued for poll");
         }
     }
-    pub fn result<T>(&mut self, result: &crate::Result<T>) {
+    pub fn result<T>(&mut self, result: &crate::Result<T>, cancelled: bool) {
         self.error_kind = result.as_ref().err().map(VertxError::kind);
         self.outcome = Some(match result {
             Ok(_) => TaskOutcome::Completed,
-            Err(VertxError::TaskCancelled) => TaskOutcome::Cancelled,
-            Err(VertxError::DeploymentTerminated(id)) if *id == self.deployment_id => {
-                TaskOutcome::Cancelled
-            }
+            Err(_) if cancelled => TaskOutcome::Cancelled,
             Err(_) => TaskOutcome::Failed,
         });
     }

@@ -1,7 +1,6 @@
 //! Read-only snapshots, bounded details and lifecycle accounting.
 
 use super::support::{TraceOutput, capture, vx};
-use async_trait::async_trait;
 use rstest::rstest;
 use std::future::Future;
 use std::sync::Arc;
@@ -21,7 +20,8 @@ async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
             max_task_details: 2,
             ..Default::default()
         })
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture(&vx).await;
     let before = vx.diagnostics();
     let ok = ctx.spawn(async { Ok(()) }).unwrap();
@@ -74,7 +74,8 @@ async fn diagnostics_read_current_poll_without_waiting_for_blocked_eventloop() {
             event_loop_poll_threshold: Duration::ZERO,
             ..Default::default()
         })
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture(&vx).await;
     let dispatch = output.dispatch();
     let (entered, ready) = oneshot::channel();
@@ -125,7 +126,8 @@ async fn diagnostics_can_be_disabled_and_consumers_do_not_double_decrement(#[cas
             enabled,
             ..Default::default()
         })
-        .build();
+        .build()
+        .unwrap();
     let consumer = vx.event_bus().consumer::<()>("diagnostic-count").unwrap();
     assert_eq!(vx.diagnostics().active_consumers, usize::from(enabled));
     vx.close().await.unwrap();
@@ -150,7 +152,8 @@ async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
                 blocking_threshold: Duration::ZERO,
                 ..Default::default()
             })
-            .build();
+            .build()
+            .unwrap();
         let (_, ctx) = capture(&vx).await;
         let (entered, ready) = oneshot::channel();
         let (release, gate) = std::sync::mpsc::channel();
@@ -179,7 +182,7 @@ async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
         let third = ctx
             .spawn(async move {
                 submitted.send(()).ok();
-                c.execute_blocking_with(|| (), false).await
+                c.execute_blocking_unordered(|| ()).await
             })
             .unwrap();
         observed.await.unwrap();
@@ -226,7 +229,6 @@ async fn diagnostics_show_cleanup_stage_while_stop_is_pending(vx: Vertx) {
         entered: Option<oneshot::Sender<()>>,
         release: Option<oneshot::Receiver<()>>,
     }
-    #[async_trait(?Send)]
     impl Verticle for StopGate {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -337,7 +339,8 @@ async fn queue_details_are_bounded_and_optional(#[case] enabled: bool) {
             max_queue_details: 1,
             ..Default::default()
         })
-        .build();
+        .build()
+        .unwrap();
     let a = vx.event_bus().consumer::<()>("a").unwrap();
     let b = vx.event_bus().consumer::<()>("b").unwrap();
     vx.event_bus().send("a", ()).await.unwrap();

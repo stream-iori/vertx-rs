@@ -1,6 +1,6 @@
 use super::envelope::ErasedEnvelope;
 use super::queue::QueueState;
-use super::route::{Router, SubscriberId};
+use super::route::{Registration, SubscriptionRegistration};
 use crate::{Context, Envelope, Result, VertxError};
 use futures::stream::FusedStream;
 use futures::{Stream, StreamExt};
@@ -15,9 +15,7 @@ use tokio::sync::mpsc;
 /// when messages remain buffered. Handler tasks are tracked by the owner scope.
 pub struct Consumer<T> {
     rx: mpsc::Receiver<ErasedEnvelope>,
-    address: String,
-    id: SubscriberId,
-    router: Arc<Router>,
+    registration: SubscriptionRegistration,
     owner: Option<Context>,
     queue: Arc<QueueState>,
     cancellation: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
@@ -25,19 +23,15 @@ pub struct Consumer<T> {
     _marker: PhantomData<T>,
 }
 impl<T: Send + 'static> Consumer<T> {
-    pub(super) fn new(
-        rx: mpsc::Receiver<ErasedEnvelope>,
-        address: String,
-        id: SubscriberId,
-        router: Arc<Router>,
-        owner: Option<Context>,
-        queue: Arc<QueueState>,
-    ) -> Self {
+    pub(super) fn new(registration: Registration, owner: Option<Context>) -> Self {
+        let Registration {
+            rx,
+            subscription,
+            state: queue,
+        } = registration;
         Self {
             rx,
-            address,
-            id,
-            router,
+            registration: subscription,
             owner,
             cancellation: queue.cancellation(),
             terminal: false,
@@ -61,8 +55,9 @@ impl<T: Send + 'static> Consumer<T> {
             }
         }
     }
+    /// Returns the address this consumer was registered for.
     pub fn address(&self) -> &str {
-        &self.address
+        self.registration.address()
     }
     fn handler_context(&self) -> Result<Context> {
         let ctx = self.owner.clone().ok_or(VertxError::ContextMismatch)?;
@@ -75,10 +70,9 @@ impl<T: Send + 'static> Consumer<T> {
     /// Attach a non-Send handler on its owning EventLoop.
     ///
     /// ```
-    /// # use async_trait::async_trait;
     /// # use vertx_rs::{Context, Result, Verticle};
     /// # struct Example;
-    /// # #[async_trait(?Send)] impl Verticle for Example {
+    /// # impl Verticle for Example {
     /// # async fn start(&mut self, ctx: Context) -> Result<()> {
     /// let mut count = 0u64;
     /// ctx.event_bus().consumer::<()>("count")?.handler(move |env| {
@@ -100,10 +94,8 @@ impl<T: Send + 'static> Consumer<T> {
     /// Worker counterpart; the closure and its future must be Send.
     ///
     /// ```
-    /// use async_trait::async_trait;
     /// use vertx_rs::{Context, Result, WorkerVerticle};
     /// struct Worker;
-    /// #[async_trait]
     /// impl WorkerVerticle for Worker {
     ///     async fn start(&mut self, ctx: Context) -> Result<()> {
     ///         ctx.event_bus().consumer::<u32>("worker")?.handler_worker(|env| async move {
@@ -159,7 +151,10 @@ impl<T: Send + 'static> Consumer<T> {
 impl<T> Unpin for Consumer<T> {}
 impl<T> Consumer<T> {
     fn unregister(&self) {
-        self.router.unregister(&self.address, self.id);
+        self.registration.unregister();
+        if let Some(ctx) = &self.owner {
+            ctx.scope().forget_resource(self.registration.id);
+        }
     }
     fn terminate(&mut self) {
         self.terminal = true;
@@ -178,7 +173,7 @@ impl<T: Send + 'static> Stream for Consumer<T> {
             let error = this
                 .owner
                 .as_ref()
-                .map(|ctx| VertxError::DeploymentTerminated(ctx.scope.deployment))
+                .map(|ctx| VertxError::DeploymentTerminated(ctx.scope().deployment))
                 .unwrap_or(VertxError::VertxClosed);
             this.terminate();
             return Poll::Ready(Some(Err(error)));
@@ -192,7 +187,7 @@ impl<T: Send + 'static> Stream for Consumer<T> {
             Poll::Ready(Some(envelope)) => {
                 this.queue.dequeued();
                 envelope.trace.dequeue();
-                let result = envelope.typed(&this.address);
+                let result = envelope.typed(this.registration.address());
                 if result.is_err() {
                     this.terminate();
                 }
@@ -223,7 +218,8 @@ mod tests {
         let vx = crate::Vertx::builder()
             .event_loop_threads(1)
             .worker_threads(1)
-            .build();
+            .build()
+            .unwrap();
         let mut consumer = vx.event_bus().consumer::<()>("eof").unwrap();
         for _ in 0..buffered {
             vx.event_bus().send("eof", ()).await.unwrap();

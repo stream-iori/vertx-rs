@@ -70,13 +70,21 @@ impl CloseStage {
 /// is retained. Queue summary metadata scales with registered consumers.
 #[derive(Debug, Clone)]
 pub struct DiagnosticsOptions {
+    /// Enables runtime counters, current operations and optional detail collection.
     pub enabled: bool,
+    /// Includes individual live task records in a snapshot.
     pub task_details: bool,
+    /// Includes individual registered queue records in a snapshot.
     pub queue_details: bool,
+    /// Caps the number of queue details returned per snapshot.
     pub max_queue_details: usize,
+    /// Caps the number of task details tracked concurrently.
     pub max_task_details: usize,
+    /// Logs a slow synchronous poll or drop on an EventLoop after it returns.
     pub event_loop_poll_threshold: Duration,
+    /// Logs a slow synchronous poll or drop on a Worker after it returns.
     pub worker_poll_threshold: Duration,
+    /// Logs a long blocking closure after it returns.
     pub blocking_threshold: Duration,
 }
 impl Default for DiagnosticsOptions {
@@ -93,13 +101,20 @@ impl Default for DiagnosticsOptions {
         }
     }
 }
+/// Current scheduling phase of a managed task or blocking operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStage {
+    /// Submitted or woken and awaiting its next poll.
     Ready,
+    /// Returned `Pending` and awaits a wake.
     Waiting,
+    /// Executing a synchronous future poll.
     Polling,
+    /// Awaiting the source Context's FIFO blocking admission.
     BlockingOrderedWait,
+    /// Submitted to the shared Worker pool.
     BlockingQueued,
+    /// Executing on a Worker thread.
     BlockingRunning,
 }
 #[derive(Default)]
@@ -125,6 +140,11 @@ impl Diagnostics {
         })
     }
     pub fn deployment(&self, id: DeploymentId, stage: DeploymentStage) {
+        self.record_deployment(id, stage);
+        self.trace_deployment(id, stage);
+    }
+
+    pub fn record_deployment(&self, id: DeploymentId, stage: DeploymentStage) {
         if !self.options.enabled {
             return;
         }
@@ -134,8 +154,12 @@ impl Diagnostics {
         } else {
             state.deployments.insert(id, stage);
         }
-        drop(state);
-        tracing::debug!(instance_id = self.instance, deployment_id = %id, stage = stage.as_str(), "deployment stage");
+    }
+
+    pub fn trace_deployment(&self, id: DeploymentId, stage: DeploymentStage) {
+        if self.options.enabled {
+            tracing::debug!(instance_id = self.instance, deployment_id = %id, stage = stage.as_str(), "deployment stage");
+        }
     }
     pub fn close_stage(&self, stage: CloseStage) {
         if !self.options.enabled {

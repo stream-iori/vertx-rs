@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(1)
-        .try_build()?;
+        .build()?;
     let result = demo(&vx).await;
     let closed = vx.close().await;
     result.and(closed)

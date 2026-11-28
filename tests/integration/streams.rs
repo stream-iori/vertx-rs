@@ -34,10 +34,7 @@ async fn message_sink_reserves_once_and_only_closes_its_adapter(vx: Vertx) {
     std::pin::Pin::new(&mut sink).start_send(7).unwrap();
     sink.flush().await.unwrap();
     let envelope = consumer.recv().await.unwrap().unwrap();
-    assert_eq!(
-        envelope.headers().get("source").map(String::as_str),
-        Some("sink")
-    );
+    assert_eq!(envelope.headers().get("source"), Some("sink"));
     assert_eq!(envelope.into_body(), 7);
     futures::future::poll_fn(|cx| std::pin::Pin::new(&mut sink).poll_ready(cx))
         .await
@@ -320,7 +317,8 @@ async fn pipe_local_futures_keep_context_and_spans_across_interleaved_awaits() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, a) = capture(&vx).with_subscriber(dispatch.clone()).await;
     let (_, b) = capture(&vx).with_subscriber(dispatch.clone()).await;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));

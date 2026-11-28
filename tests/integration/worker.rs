@@ -39,7 +39,8 @@ async fn worker_context_serializes_all_ordinary_executions() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(4)
-        .build();
+        .build()
+        .unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = oneshot::channel();
@@ -87,7 +88,8 @@ async fn worker_contexts_can_execute_in_parallel() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(4)
-        .build();
+        .build()
+        .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let mut jobs = Vec::new();
     for _ in 0..2 {
@@ -118,7 +120,8 @@ async fn single_worker_reuses_thread_while_future_waits_and_can_await_blocking()
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = oneshot::channel();
@@ -170,7 +173,8 @@ async fn worker_and_blocking_use_exactly_the_same_fixed_thread_set() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     let threads = Arc::new(Mutex::new(HashSet::new()));
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let mut deployments = Vec::new();
@@ -195,13 +199,10 @@ async fn worker_and_blocking_use_exactly_the_same_fixed_thread_set() {
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let jobs = (0..2).map(|_| {
         let (barrier, threads) = (barrier.clone(), blocking_threads.clone());
-        ctx.execute_blocking_with(
-            move || {
-                threads.lock().unwrap().insert(std::thread::current().id());
-                barrier.wait();
-            },
-            false,
-        )
+        ctx.execute_blocking_unordered(move || {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            barrier.wait();
+        })
     });
     for result in futures::future::join_all(jobs).await {
         result.unwrap();
@@ -217,7 +218,8 @@ async fn worker_can_use_eventloop_io_and_timer_drivers_without_changing_executor
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -261,7 +263,8 @@ async fn worker_abort_before_first_poll_drops_on_owner_and_finishes_after_drop()
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
@@ -305,7 +308,8 @@ async fn worker_destructor_panic_does_not_kill_thread_or_leak_context() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let dropped = Arc::new(AtomicUsize::new(0));
     let probe = WorkerDropProbe {
@@ -342,7 +346,8 @@ async fn future_combinations_preserve_worker_context_and_keep_spawned_tasks_inde
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let owner = ctx.clone();
     ctx.spawn(async move {
@@ -416,7 +421,7 @@ async fn worker_cancellation_destructor_serializes_with_ordinary_polls() {
         entered: Option<oneshot::Sender<()>>,
         release: std::sync::mpsc::Receiver<()>,
         active: Arc<AtomicUsize>,
-        id: Option<vertx_rs::DeploymentId>,
+        id: vertx_rs::DeploymentId,
     }
     impl Drop for DropGate {
         fn drop(&mut self) {
@@ -430,7 +435,8 @@ async fn worker_cancellation_destructor_serializes_with_ordinary_polls() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let (_, other) = capture_worker(&vx).await;
     let active = Arc::new(AtomicUsize::new(0));

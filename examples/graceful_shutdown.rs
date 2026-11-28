@@ -2,7 +2,6 @@
 //! cargo run --example graceful_shutdown
 //! 首次 ShutdownTimeout 是预期结果；不用 sleep 猜测清理进度。
 mod support;
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,7 +16,6 @@ struct Service {
     cleaned: Option<oneshot::Sender<()>>,
     stop_count: Arc<AtomicUsize>,
 }
-#[async_trait(?Send)]
 impl Verticle for Service {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let cancelled = self.cancelled.take().expect("start called once");
@@ -103,7 +101,7 @@ async fn main() -> Result<()> {
         .event_loop_threads(1)
         .worker_threads(2)
         .shutdown_grace(Duration::from_millis(250))
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

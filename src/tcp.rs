@@ -1,3 +1,4 @@
+use crate::deployment::{ResourceId, ResourceRegistration};
 use crate::{Context, DeploymentId, Result, VertxError};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -26,7 +27,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 /// ```
 pub struct TcpIncoming {
     ctx: Context,
-    addr: SocketAddr,
+    registration: ListenerRegistration,
     turn: Arc<AsyncMutex<()>>,
     budget: Option<Arc<service::PortBudget>>,
     _local: PhantomData<Rc<()>>,
@@ -53,8 +54,8 @@ impl Context {
         self.check_local()?;
         tokio::select! {
             biased;
-            _ = self.scope.cancel.cancelled() => Err(stopped(self)),
-            incoming = self.inner.tcp.listen(self, addr, options) => incoming,
+            _ = self.scope().cancel.cancelled() => Err(stopped(self)),
+            incoming = self.tcp_listeners().listen(self, addr, options) => incoming,
         }
     }
 }
@@ -62,7 +63,7 @@ impl Context {
 impl TcpIncoming {
     /// Returns the bound address, including the OS-assigned port.
     pub fn local_addr(&self) -> SocketAddr {
-        self.addr
+        self.registration.addr
     }
 
     /// Receives the next connection in order of waiting calls.
@@ -72,32 +73,31 @@ impl TcpIncoming {
     /// If nobody is waiting, connections stay in the OS backlog.
     pub async fn accept(&mut self) -> Result<(TcpStream, SocketAddr)> {
         self.ctx.check_local()?;
-        let registry = &self.ctx.inner.tcp;
+        let registry = self.ctx.tcp_listeners();
         let accept = async {
             let _turn = self.turn.lock().await;
             let accepted = poll_fn(|cx| {
                 // Keep the listener alive only while this poll can use it.
                 registry
-                    .registered_listener(&self.ctx, self.addr)?
+                    .registered_listener(&self.ctx, &self.registration)?
                     .poll_accept(cx)
             })
             .await?;
             // The OS may have accepted a connection while shutdown closed admission.
-            registry.registered_listener(&self.ctx, self.addr)?;
+            registry.registered_listener(&self.ctx, &self.registration)?;
             Ok(accepted)
         };
         tokio::select! {
             biased;
-            _ = self.ctx.scope.cancel.cancelled() => Err(stopped(&self.ctx)),
+            _ = self.ctx.scope().cancel.cancelled() => Err(stopped(&self.ctx)),
             accepted = accept => accepted,
         }
     }
 
     fn unregister(&self) -> Option<CancellationToken> {
-        self.ctx
-            .inner
-            .tcp
-            .unregister(self.addr, self.ctx.scope.deployment)
+        let done = self.registration.unregister();
+        self.ctx.scope().forget_resource(self.registration.id);
+        done
     }
 }
 
@@ -125,14 +125,27 @@ enum Slot {
     Closing {
         done: CancellationToken,
         tracked: TaskTrackerToken,
-        deployment: DeploymentId,
+        id: ResourceId,
     },
 }
 
 struct OpenListener {
     bound: Arc<BoundListener>,
-    members: HashMap<DeploymentId, TaskTrackerToken>,
+    members: HashMap<DeploymentId, Member>,
     budget: Option<Arc<service::PortBudget>>,
+}
+
+struct Member {
+    id: ResourceId,
+    tracked: TaskTrackerToken,
+}
+
+#[derive(Clone)]
+pub(crate) struct ListenerRegistration {
+    registry: Weak<Mutex<State>>,
+    addr: SocketAddr,
+    deployment: DeploymentId,
+    id: ResourceId,
 }
 
 struct BoundListener {
@@ -166,7 +179,11 @@ impl Drop for BoundListener {
 }
 
 enum Registration {
-    Ready(Arc<BoundListener>, Option<Arc<service::PortBudget>>),
+    Ready {
+        registration: ListenerRegistration,
+        turn: Arc<AsyncMutex<()>>,
+        budget: Option<Arc<service::PortBudget>>,
+    },
     Unbound,
     Closing(CancellationToken),
 }
@@ -203,11 +220,15 @@ impl TcpListeners {
             };
             drop(binding);
             match registration {
-                Registration::Ready(bound, budget) => {
+                Registration::Ready {
+                    registration,
+                    turn,
+                    budget,
+                } => {
                     return Ok(TcpIncoming {
                         ctx: ctx.clone(),
-                        addr: bound.addr,
-                        turn: bound.turn.clone(),
+                        registration,
+                        turn,
                         budget,
                         _local: PhantomData,
                     });
@@ -226,7 +247,8 @@ impl TcpListeners {
         socket: Option<TcpListener>,
     ) -> Result<Registration> {
         ctx.check_local()?;
-        let _admission = ctx.scope.admit()?;
+        let scope = ctx.scope();
+        let mut admission = scope.admit()?;
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return Err(VertxError::VertxClosed);
@@ -238,19 +260,29 @@ impl TcpListeners {
         {
             return Err(incompatible(addr));
         }
-        let bound = match state.entries.entry(addr) {
+        let registration = ListenerRegistration {
+            registry: Arc::downgrade(&self.state),
+            addr,
+            deployment: scope.deployment,
+            id: ResourceId::next(),
+        };
+        let new_member = || Member {
+            id: registration.id,
+            tracked: scope.task_token(),
+        };
+        let turn = match state.entries.entry(addr) {
             Entry::Occupied(entry) => match entry.into_mut() {
                 Slot::Open(open) => {
                     if open.budget.as_ref().map(|budget| budget.options) != options {
                         return Err(incompatible(addr));
                     }
-                    let Entry::Vacant(member) = open.members.entry(ctx.scope.deployment) else {
+                    let Entry::Vacant(member) = open.members.entry(scope.deployment) else {
                         return Err(VertxError::InvalidOptions(format!(
                             "deployment already listens on {addr}"
                         )));
                     };
-                    member.insert(ctx.scope.task_token());
-                    open.bound.clone()
+                    member.insert(new_member());
+                    open.bound.turn.clone()
                 }
                 Slot::Closing { done, .. } => return Ok(Registration::Closing(done.clone())),
             },
@@ -261,93 +293,100 @@ impl TcpListeners {
                 if budget.is_none() {
                     budget = options.map(service::PortBudget::new).map(Arc::new);
                 }
+                let turn = Arc::new(AsyncMutex::new(()));
                 let bound = Arc::new(BoundListener {
                     addr,
                     socket: Some(socket),
-                    turn: Arc::new(AsyncMutex::new(())),
+                    turn: turn.clone(),
                     registry: Arc::downgrade(&self.state),
                 });
                 entry.insert(Slot::Open(OpenListener {
-                    bound: bound.clone(),
-                    members: HashMap::from([(ctx.scope.deployment, ctx.scope.task_token())]),
+                    bound,
+                    members: HashMap::from([(scope.deployment, new_member())]),
                     budget: budget.clone(),
                 }));
                 if let Some(budget) = &budget {
                     state.budgets.insert(addr, Arc::downgrade(budget));
                 }
-                bound
+                turn
             }
         };
-        Ok(Registration::Ready(bound, budget))
+        admission.register_resource(
+            registration.id,
+            ResourceRegistration::Listener(registration.clone()),
+        );
+        Ok(Registration::Ready {
+            registration,
+            turn,
+            budget,
+        })
     }
 
-    fn registered_listener(&self, ctx: &Context, addr: SocketAddr) -> Result<Arc<BoundListener>> {
+    fn registered_listener(
+        &self,
+        ctx: &Context,
+        registration: &ListenerRegistration,
+    ) -> Result<Arc<BoundListener>> {
         ctx.check_local()?;
-        let _admission = ctx.scope.admit()?;
+        let _admission = ctx.scope().admit()?;
         let state = self.state.lock().unwrap();
         if state.closed {
             return Err(VertxError::VertxClosed);
         }
-        match state.entries.get(&addr) {
-            Some(Slot::Open(open)) if open.members.contains_key(&ctx.scope.deployment) => {
+        match state.entries.get(&registration.addr) {
+            Some(Slot::Open(open))
+                if open
+                    .members
+                    .get(&registration.deployment)
+                    .is_some_and(|member| member.id == registration.id) =>
+            {
                 Ok(open.bound.clone())
             }
-            _ => Err(VertxError::DeploymentTerminated(ctx.scope.deployment)),
+            _ => Err(VertxError::DeploymentTerminated(ctx.scope().deployment)),
         }
     }
 
-    fn unregister(&self, addr: SocketAddr, deployment: DeploymentId) -> Option<CancellationToken> {
+    pub(crate) fn close_admission(&self) {
+        self.state.lock().unwrap().closed = true;
+    }
+}
+
+impl ListenerRegistration {
+    pub fn unregister(&self) -> Option<CancellationToken> {
+        let registry = self.registry.upgrade()?;
         let (member, listener, done) = {
-            let mut state = self.state.lock().unwrap();
-            let slot = state.entries.get_mut(&addr)?;
+            let mut state = registry.lock().unwrap();
+            let slot = state.entries.get_mut(&self.addr)?;
             let Slot::Open(open) = slot else {
                 return match slot {
-                    Slot::Closing {
-                        done,
-                        deployment: owner,
-                        ..
-                    } if *owner == deployment => Some(done.clone()),
+                    Slot::Closing { done, id, .. } if *id == self.id => Some(done.clone()),
                     _ => None,
                 };
             };
-            let tracked = open.members.remove(&deployment)?;
+            let member = open.members.get(&self.deployment)?;
+            if member.id != self.id {
+                return None;
+            }
+            let member = open
+                .members
+                .remove(&self.deployment)
+                .expect("member remains registered");
             if open.members.is_empty() {
                 let done = CancellationToken::new();
                 let closing = Slot::Closing {
                     done: done.clone(),
-                    tracked,
-                    deployment,
+                    tracked: member.tracked,
+                    id: self.id,
                 };
                 (None, Some(std::mem::replace(slot, closing)), Some(done))
             } else {
-                (Some(tracked), None, None)
+                (Some(member), None, None)
             }
         };
         // A concurrent accept can still hold a reference during its current
         // poll. The last deployment is tracked until the socket actually drops.
         drop((member, listener));
         done
-    }
-
-    pub(crate) fn unregister_deployment(&self, deployment: DeploymentId) {
-        let addresses: Vec<_> = self
-            .state
-            .lock()
-            .unwrap()
-            .entries
-            .iter()
-            .filter_map(|(&addr, slot)| match slot {
-                Slot::Open(open) if open.members.contains_key(&deployment) => Some(addr),
-                _ => None,
-            })
-            .collect();
-        for addr in addresses {
-            self.unregister(addr, deployment);
-        }
-    }
-
-    pub(crate) fn close_admission(&self) {
-        self.state.lock().unwrap().closed = true;
     }
 }
 
@@ -367,10 +406,10 @@ fn bind_managed(addr: SocketAddr) -> io::Result<TcpListener> {
 }
 
 fn stopped(ctx: &Context) -> VertxError {
-    if ctx.inner.cancel.is_cancelled() {
+    if ctx.instance_closed() {
         VertxError::VertxClosed
     } else {
-        VertxError::DeploymentTerminated(ctx.scope.deployment)
+        VertxError::DeploymentTerminated(ctx.scope().deployment)
     }
 }
 

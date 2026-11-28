@@ -2,7 +2,6 @@
 //! cargo run --example error_handling
 //! 预期会出现 panic hook 输出和错误日志，但消费者继续运行，程序最终退出成功。
 mod support;
-use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
 
@@ -17,7 +16,6 @@ struct Service {
     events: mpsc::UnboundedSender<(&'static str, &'static str)>,
     ready: Option<oneshot::Sender<Context>>,
 }
-#[async_trait(?Send)]
 impl Verticle for Service {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let events = self.events.clone();
@@ -94,7 +92,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

@@ -17,8 +17,7 @@ impl EventBus {
         self.sink_with(address, DeliveryOptions::default())
     }
 
-    /// Configures headers for send-only messages. The timeout option, as with
-    /// send_with, applies only to request APIs and is not an admission deadline.
+    /// Creates a send-only adapter with fixed headers for every message.
     pub fn sink_with<T: Send + 'static>(
         &self,
         address: &str,
@@ -28,7 +27,7 @@ impl EventBus {
         Ok(MessageSink {
             router: self.router.clone(),
             address: address.into(),
-            headers: options.take_headers(),
+            headers: options.into_headers(),
             pending: None,
             closed: false,
             marker: PhantomData,

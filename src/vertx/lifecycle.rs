@@ -1,10 +1,12 @@
+use crate::context::TaskResult;
 use crate::diagnostics::DeploymentStage;
 use crate::error::{panic_error, retain_failure};
 use crate::{Context, Result, Verticle, VertxError, WorkerVerticle};
-use futures::FutureExt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::task::Poll;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 pub(super) type ReadySender = oneshot::Sender<Result<()>>;
 
@@ -13,16 +15,16 @@ pub(super) async fn drive_local<V: Verticle>(
     ctx: Context,
     factory: impl FnOnce(Context) -> V,
     ready: ReadySender,
-) -> Result<()> {
+) -> TaskResult<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
     if let Some(mut verticle) = lifecycle.create(factory) {
-        let startup = lifecycle.start(verticle.start(ctx.clone())).await;
+        let startup = lifecycle.start(|| verticle.start(ctx.clone())).await;
         let run_stop = startup.runs_stop();
         lifecycle.quiesce_after_start(startup).await;
         if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
-                .stop(&stop_ctx, verticle.stop(stop_ctx.clone()))
+                .stop(&stop_ctx, || verticle.stop(stop_ctx.clone()))
                 .await;
         }
         lifecycle.destroy(verticle);
@@ -30,24 +32,23 @@ pub(super) async fn drive_local<V: Verticle>(
     } else {
         lifecycle.quiesce().await;
     }
-    lifecycle.finish();
-    Ok(())
+    lifecycle.finish()
 }
 
 pub(super) async fn drive_worker<V: WorkerVerticle>(
     ctx: Context,
     factory: impl FnOnce(Context) -> V,
     ready: ReadySender,
-) -> Result<()> {
+) -> TaskResult<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
     if let Some(mut verticle) = lifecycle.create(factory) {
-        let startup = lifecycle.start(verticle.start(ctx.clone())).await;
+        let startup = lifecycle.start(|| verticle.start(ctx.clone())).await;
         let run_stop = startup.runs_stop();
         lifecycle.quiesce_after_start(startup).await;
         if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
-                .stop(&stop_ctx, verticle.stop(stop_ctx.clone()))
+                .stop(&stop_ctx, || verticle.stop(stop_ctx.clone()))
                 .await;
         }
         lifecycle.destroy(verticle);
@@ -55,8 +56,60 @@ pub(super) async fn drive_worker<V: WorkerVerticle>(
     } else {
         lifecycle.quiesce().await;
     }
-    lifecycle.finish();
-    Ok(())
+    lifecycle.finish()
+}
+
+enum CallbackOutcome {
+    Returned(Result<()>),
+    Panicked(VertxError),
+    Cancelled,
+}
+
+// The lifecycle driver owns the execution gate. Switch the logical Context
+// inside that gate for each operation, including the stop future's destructor.
+async fn invoke<F: Future<Output = Result<()>>>(
+    ctx: &Context,
+    callback: impl FnOnce() -> F,
+    cancel: Option<&CancellationToken>,
+) -> CallbackOutcome {
+    let constructed = {
+        let _context = ctx.enter();
+        catch_unwind(AssertUnwindSafe(callback))
+    };
+    let mut future = match constructed {
+        Ok(future) => Box::pin(future),
+        Err(payload) => return CallbackOutcome::Panicked(panic_error(payload)),
+    };
+    let poll = poll_fn(|cx| {
+        let _context = ctx.enter();
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(CallbackOutcome::Returned),
+            Err(payload) => Poll::Ready(CallbackOutcome::Panicked(panic_error(payload))),
+        }
+    });
+    let outcome = if let Some(cancel) = cancel {
+        tokio::select! { biased;
+            _ = cancel.cancelled() => CallbackOutcome::Cancelled,
+            outcome = poll => outcome,
+        }
+    } else {
+        poll.await
+    };
+    let dropped = {
+        let _context = ctx.enter();
+        catch_unwind(AssertUnwindSafe(|| drop(future)))
+    };
+    if let Err(payload) = dropped {
+        let mut error = match outcome {
+            CallbackOutcome::Returned(result) => result,
+            CallbackOutcome::Panicked(error) => Err(error),
+            CallbackOutcome::Cancelled => Ok(()),
+        };
+        retain_failure(&mut error, panic_error(payload));
+        CallbackOutcome::Panicked(error.expect_err("future destructor failed"))
+    } else {
+        outcome
+    }
 }
 
 enum Startup {
@@ -104,19 +157,23 @@ impl<'a> Lifecycle<'a> {
         }
     }
 
-    async fn start(&self, start: impl Future<Output = Result<()>>) -> Startup {
-        let scope = &self.ctx.scope;
-        let cancelled = Startup::Cancelled(VertxError::DeploymentTerminated(scope.deployment));
-        let result = tokio::select! { biased;
-            _ = scope.cancel.cancelled() => return cancelled,
-            result = AssertUnwindSafe(start).catch_unwind() => result,
-        };
-        match result {
-            Ok(Ok(())) if scope.running() => Startup::Started,
-            Ok(Ok(())) => cancelled,
-            Ok(Err(error @ VertxError::DeploymentTerminated(_))) => Startup::Cancelled(error),
-            Ok(Err(error)) => Startup::Failed(error),
-            Err(error) => Startup::Panicked(panic_error(error)),
+    async fn start<F: Future<Output = Result<()>>>(&self, start: impl FnOnce() -> F) -> Startup {
+        let scope = self.ctx.scope();
+        match invoke(self.ctx, start, Some(&scope.cancel)).await {
+            CallbackOutcome::Returned(Ok(())) if scope.running() => Startup::Started,
+            CallbackOutcome::Returned(Ok(())) | CallbackOutcome::Cancelled => {
+                Startup::Cancelled(VertxError::DeploymentTerminated(scope.deployment))
+            }
+            CallbackOutcome::Returned(Err(error)) => {
+                if matches!(error, VertxError::DeploymentTerminated(id) if id == scope.deployment && scope.cancel.is_cancelled())
+                    || matches!(error, VertxError::VertxClosed if self.ctx.instance_closed())
+                {
+                    Startup::Cancelled(error)
+                } else {
+                    Startup::Failed(error)
+                }
+            }
+            CallbackOutcome::Panicked(error) => Startup::Panicked(error),
         }
     }
 
@@ -124,7 +181,7 @@ impl<'a> Lifecycle<'a> {
         match startup {
             Startup::Started => {
                 self.notify_started();
-                self.ctx.scope.cancel.cancelled().await;
+                self.ctx.scope().cancel.cancelled().await;
             }
             Startup::Cancelled(error) => {
                 // Report non-readiness to the deploy waiter and allow orderly close.
@@ -141,20 +198,16 @@ impl<'a> Lifecycle<'a> {
         self.stage(DeploymentStage::Running);
         let ready = self.ready.take().expect("readiness sent only once");
         if ready.send(Ok(())).is_err() {
-            self.ctx.scope.request_stop();
+            self.ctx.scope().request_stop();
         }
     }
 
     async fn quiesce(&self) {
         self.stage(DeploymentStage::Quiescing);
-        let scope = &self.ctx.scope;
+        let scope = self.ctx.scope();
         scope.request_stop();
-        self.ctx
-            .inner
-            .event_bus
-            .unregister_deployment(scope.deployment);
-        self.ctx.inner.tcp.unregister_deployment(scope.deployment);
-        scope.drain_tasks(self.ctx.inner.shutdown_grace).await;
+        scope.unregister_resources();
+        scope.drain_tasks(self.ctx.shutdown_grace()).await;
         scope.wait_blocking().await;
     }
 
@@ -163,13 +216,17 @@ impl<'a> Lifecycle<'a> {
         self.ctx.for_stop()
     }
 
-    async fn stop(&mut self, ctx: &Context, stop: impl Future<Output = Result<()>>) {
-        let result = AssertUnwindSafe(ctx.scope_future(stop))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|error| Err(panic_error(error)));
-        if let Err(error) = result {
-            retain_failure(&mut self.outcome, error);
+    async fn stop<F: Future<Output = Result<()>>>(
+        &mut self,
+        ctx: &Context,
+        stop: impl FnOnce() -> F,
+    ) {
+        match invoke(ctx, stop, None).await {
+            CallbackOutcome::Returned(Err(error)) | CallbackOutcome::Panicked(error) => {
+                retain_failure(&mut self.outcome, error);
+            }
+            CallbackOutcome::Returned(Ok(())) => {}
+            CallbackOutcome::Cancelled => unreachable!("stop is not cancelled"),
         }
     }
 
@@ -181,41 +238,52 @@ impl<'a> Lifecycle<'a> {
 
     async fn wait_for_stop_work(&self) {
         self.stage(DeploymentStage::Quiescing);
-        self.ctx.scope.wait_blocking().await;
+        self.ctx.scope().wait_blocking().await;
     }
 
-    fn finish(self) {
+    fn finish(self) -> TaskResult<()> {
         let Self {
             ctx,
             ready,
-            outcome,
+            mut outcome,
             startup_cancellation,
         } = self;
-        let id = ctx.scope.deployment;
+        let id = ctx.scope().deployment;
         if let Err(error) = &outcome {
             ctx.report_error(error);
         }
-        ctx.clear_exception_handler();
-        ctx.scope.finish(outcome.clone());
+        if let Err(error) = ctx.seal_exception_handler() {
+            tracing::error!(deployment = %id, error_kind = error.kind(), %error, "exception handler destructor panicked");
+            retain_failure(&mut outcome, error);
+        }
+        ctx.diagnostics().deployment(id, DeploymentStage::Stopped);
+        if let Some(owner) = ctx.owner() {
+            owner.inner.forget_deployment(id);
+        }
+        ctx.scope().finish(outcome.clone());
         if let Some(ready) = ready {
-            let error = outcome
-                .err()
-                .or(startup_cancellation)
-                .unwrap_or_else(|| VertxError::StartFailed("startup cancelled".into()));
-            let _ = ready.send(Err(error));
+            let readiness = match (startup_cancellation.clone(), outcome.clone()) {
+                (Some(cancellation), cleanup) => {
+                    let mut result = Err(cancellation);
+                    if let Err(error) = cleanup {
+                        retain_failure(&mut result, error);
+                    }
+                    result
+                }
+                (None, Err(error)) => Err(error),
+                (None, Ok(())) => Err(VertxError::StartFailed("startup cancelled".into())),
+            };
+            let _ = ready.send(readiness);
         }
-        if let Some(owner) = ctx.inner.vertx.upgrade() {
-            owner.deployments.lock().unwrap().remove(&id);
+        match (outcome, startup_cancellation) {
+            (Ok(()), Some(error)) => TaskResult::Cancelled(error),
+            (outcome, _) => TaskResult::Finished(outcome),
         }
-        ctx.inner
-            .diagnostics
-            .deployment(id, DeploymentStage::Stopped);
     }
 
     fn stage(&self, stage: DeploymentStage) {
         self.ctx
-            .inner
-            .diagnostics
-            .deployment(self.ctx.scope.deployment, stage);
+            .diagnostics()
+            .deployment(self.ctx.scope().deployment, stage);
     }
 }

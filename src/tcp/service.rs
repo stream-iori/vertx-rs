@@ -1,11 +1,12 @@
 use super::TcpIncoming;
-use crate::{Context, ContextId, Result, TaskAbortHandle, VertxError};
+use crate::task::ActiveTasks;
+use crate::{Context, ContextId, Result, TaskAbortHandle, TaskId, VertxError};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFn;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
@@ -18,6 +19,7 @@ use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 /// Options shared by all managed services on one bound address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpServerOptions {
+    /// Connection admission budget shared by managed services on the address.
     pub max_connections: NonZeroUsize,
 }
 
@@ -45,6 +47,7 @@ pub struct TcpConnection<'a> {
 }
 
 impl TcpConnection<'_> {
+    /// Returns the remote address recorded on accept.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer
     }
@@ -103,6 +106,7 @@ pub struct TcpServer {
 }
 
 impl TcpServer {
+    /// Returns the bound address, including any OS-assigned port.
     pub fn local_addr(&self) -> SocketAddr {
         self.control.addr
     }
@@ -227,7 +231,22 @@ struct ConnectionPermit {
     _capacity: OwnedSemaphorePermit,
     _budget: Arc<PortBudget>,
     _tracked: TaskTrackerToken,
+    registration: Option<ConnectionRegistration>,
     _completion: Arc<Completion>,
+}
+
+struct ConnectionRegistration {
+    control: Weak<Control>,
+    id: TaskId,
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.upgrade() {
+            let handle = control.state.lock().unwrap().children.remove(self.id);
+            drop(handle);
+        }
+    }
 }
 
 struct Control {
@@ -242,7 +261,7 @@ struct Control {
 struct State {
     drain: Option<Drain>,
     forced: bool,
-    children: Vec<TaskAbortHandle>,
+    children: ActiveTasks,
 }
 
 #[derive(Clone, Copy)]
@@ -252,27 +271,30 @@ struct Drain {
 }
 
 impl Control {
-    fn admitting(&self) -> bool {
-        self.state.lock().unwrap().drain.is_none()
+    fn register(self: &Arc<Self>, id: TaskId) -> Option<ConnectionRegistration> {
+        let mut state = self.state.lock().unwrap();
+        if state.drain.is_some() || state.forced {
+            return None;
+        }
+        state.children.register(id);
+        Some(ConnectionRegistration {
+            control: Arc::downgrade(self),
+            id,
+        })
     }
 
-    fn track(&self, task: TaskAbortHandle) {
-        {
-            let mut state = self.state.lock().unwrap();
-            if !state.forced {
-                state.children.retain(|task| !task.is_finished());
-                state.children.push(task);
-                return;
-            }
+    fn attach(&self, id: TaskId, task: TaskAbortHandle) {
+        let abort = self.state.lock().unwrap().children.attach(id, &task);
+        if abort {
+            task.abort();
         }
-        task.abort();
     }
 
     fn abort_connections(&self) {
         let children = {
             let mut state = self.state.lock().unwrap();
             state.forced = true;
-            std::mem::take(&mut state.children)
+            state.children.take_abort_handles()
         };
         for child in children {
             child.abort();
@@ -287,8 +309,6 @@ struct Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        let children = std::mem::take(&mut self.control.state.lock().unwrap().children);
-        drop(children);
         self.control
             .done
             .send_replace(Some(self.outcome.get_mut().unwrap().clone()));
@@ -355,7 +375,7 @@ where
         tokio::select! {
             biased;
             _ = cleaned.as_mut() => return outcome,
-            _ = ctx.scope.cancel.cancelled() => {}
+            _ = ctx.scope().cancel.cancelled() => {}
             _ = tokio::time::sleep_until(drain.deadline) => {}
         }
     }
@@ -375,7 +395,7 @@ where
         let accepted = tokio::select! {
             biased;
             _ = control.stop.cancelled() => return Ok(()),
-            _ = ctx.scope.cancel.cancelled() => return Ok(()),
+            _ = ctx.scope().cancel.cancelled() => return Ok(()),
             accepted = async {
                 let capacity = budget.capacity.clone().acquire_owned().await
                     .expect("the port capacity semaphore is never closed");
@@ -383,13 +403,14 @@ where
                     _capacity: capacity,
                     _budget: budget.clone(),
                     _tracked: task.connections.token(),
+                    registration: None,
                     _completion: task.completion.clone(),
                 };
                 let (socket, peer) = incoming.accept().await?;
                 Ok(Accepted { socket, peer, _permit: permit })
             } => accepted,
         };
-        let accepted = match accepted {
+        let mut accepted = match accepted {
             Err(VertxError::TcpIo {
                 operation: "accept",
                 kind: io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted,
@@ -401,14 +422,19 @@ where
             other => other?,
         };
         // Commit admission before handing the connection to a managed task.
-        if !control.admitting() {
+        let id = TaskId::next();
+        let Some(registration) = control.register(id) else {
             return Ok(());
-        }
-        let task = ctx.spawn_local(handle(ConnectionTask {
-            handler: task.handler.clone(),
-            accepted,
-            stop: control.stop.child_token(),
-        }))?;
-        control.track(task.abort_handle());
+        };
+        accepted._permit.registration = Some(registration);
+        let task = ctx.spawn_local_with_id(
+            id,
+            handle(ConnectionTask {
+                handler: task.handler.clone(),
+                accepted,
+                stop: control.stop.child_token(),
+            }),
+        )?;
+        control.attach(id, task.abort_handle());
     }
 }

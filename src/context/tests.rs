@@ -1,4 +1,4 @@
-use super::{Context, ContextId};
+use super::{Context, ContextId, TaskResult};
 use crate::deployment::DeploymentScope;
 use crate::{DeploymentId, EventLoopId, Result, Vertx, VertxError};
 use std::future::Future;
@@ -11,19 +11,20 @@ async fn context_restored_when_send_future_moves_between_os_threads() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     let scope = Arc::new(DeploymentScope::new(
         DeploymentId::next(),
-        vx.inner.shared.cancel.child_token(),
+        vx.inner.lifetime.cancel.child_token(),
     ));
-    let ctx = Context::new_worker(vx.inner.shared.clone(), scope);
+    let ctx = Context::new_worker(&vx.inner, scope);
     let id = ctx.deployment_id();
     let mut polls = 0;
     let mut future = Box::pin(ctx.wrap(futures::future::poll_fn(move |_| {
         assert_eq!(Context::current().unwrap().deployment_id(), id);
         polls += 1;
         if polls == 2 {
-            Poll::Ready(Ok::<(), VertxError>(()))
+            Poll::Ready(TaskResult::Finished(Ok(())))
         } else {
             Poll::Pending
         }
@@ -58,10 +59,11 @@ async fn guard_restores_nested_context_and_panic(#[case] panic: bool) {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     let make = || {
         Context::new_worker(
-            vx.inner.shared.clone(),
+            &vx.inner,
             Arc::new(DeploymentScope::new(
                 DeploymentId::next(),
                 CancellationToken::new(),
@@ -104,15 +106,16 @@ async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] wor
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let scope = Arc::new(DeploymentScope::new(
         DeploymentId::next(),
-        vx.inner.shared.cancel.child_token(),
+        vx.inner.lifetime.cancel.child_token(),
     ));
     let ctx = if worker {
-        Context::new_worker(vx.inner.shared.clone(), scope)
+        Context::new_worker(&vx.inner, scope)
     } else {
-        Context::new_event_loop(EventLoopId(0), vx.inner.shared.clone(), scope)
+        Context::new_event_loop(EventLoopId(0), &vx.inner, scope)
     };
     let (ready, started) = tokio::sync::oneshot::channel();
     let probe = PanicDrop {
@@ -129,10 +132,15 @@ async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] wor
     started.await.unwrap();
     task.abort();
     assert!(matches!(task.await, Err(VertxError::Panic(_))));
-    assert!(
-        !ctx.data.execution.is_poisoned(),
-        "user panic must not poison the execution gate"
-    );
+    if let super::Target::Worker {
+        execution: gate, ..
+    } = &ctx.data.target
+    {
+        assert!(
+            !gate.is_poisoned(),
+            "user panic must not poison the Worker execution gate"
+        );
+    }
     let id = ctx.id();
     ctx.spawn(async move {
         assert_eq!(Context::current().unwrap().id(), id);
@@ -151,13 +159,14 @@ async fn registration_and_stop_share_one_admission_transaction() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     for _ in 0..50 {
         let scope = Arc::new(DeploymentScope::new(
             DeploymentId::next(),
-            vx.inner.shared.cancel.child_token(),
+            vx.inner.lifetime.cancel.child_token(),
         ));
-        let ctx = Context::new_worker(vx.inner.shared.clone(), scope.clone());
+        let ctx = Context::new_worker(&vx.inner, scope.clone());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let c = ctx.clone();
         let b = barrier.clone();
@@ -169,8 +178,8 @@ async fn registration_and_stop_share_one_admission_transaction() {
         let b = barrier.clone();
         let stop = std::thread::spawn(move || {
             b.wait();
-            c.scope.request_stop();
-            c.inner.event_bus.unregister_deployment(c.scope.deployment);
+            c.scope().request_stop();
+            c.scope().unregister_resources();
         });
         let result = register.join().unwrap();
         stop.join().unwrap();
@@ -189,4 +198,38 @@ async fn registration_and_stop_share_one_admission_transaction() {
         }
     }
     vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_dispatch_releases_its_task_registration() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let scope = Arc::new(DeploymentScope::new(
+        DeploymentId::next(),
+        vx.inner.lifetime.cancel.child_token(),
+    ));
+    let ctx = Context::new_event_loop(EventLoopId(0), &vx.inner, scope.clone());
+    let (completion, mut joined) = tokio::sync::watch::channel(None);
+    vx.inner
+        .executors
+        .event_loops
+        .finish_shutdown(Vec::new(), completion);
+    joined.changed().await.unwrap();
+    assert!(matches!(joined.borrow().as_ref(), Some(Ok(()))));
+    assert!(matches!(
+        ctx.spawn(async { Ok(()) }),
+        Err(VertxError::VertxClosed)
+    ));
+    scope.request_stop();
+    let drain = scope.drain_tasks(std::time::Duration::from_secs(1));
+    tokio::pin!(drain);
+    assert!(
+        futures::poll!(&mut drain).is_ready(),
+        "rejected dispatch left pending tracked work"
+    );
+    assert_eq!(vx.diagnostics().active_tasks, 0);
+    assert!(vx.inner.executors.workers.shutdown().await.is_empty());
 }

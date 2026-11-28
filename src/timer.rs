@@ -21,8 +21,8 @@ pub struct Timer {
     state: Arc<AtomicU8>,
 }
 impl Timer {
-    pub(crate) fn new(delay: Duration, scope: CancellationToken) -> Self {
-        let deadline = Instant::now() + delay;
+    pub(crate) fn new(delay: Duration, scope: CancellationToken) -> Result<Self> {
+        let deadline = deadline_after(Instant::now(), delay)?;
         let own = CancellationToken::new();
         let state = Arc::new(AtomicU8::new(PENDING));
         let (own_c, scope_c, state_c) = (own.clone(), scope.clone(), state.clone());
@@ -38,12 +38,12 @@ impl Timer {
             );
             result
         });
-        Self {
+        Ok(Self {
             future,
             own,
             scope,
             state,
-        }
+        })
     }
     /// Cancels a pending timer without changing an already-completed timer.
     pub fn cancel(&self) {
@@ -82,9 +82,11 @@ impl Periodic {
         if period.is_zero() {
             return Err(VertxError::InvalidOptions("period must be positive".into()));
         }
+        let deadline = deadline_after(Instant::now(), init)?;
+        deadline_after(deadline, period)?;
         Ok(Self {
             interval: None,
-            deadline: Instant::now() + init,
+            deadline,
             period,
             own: CancellationToken::new(),
             scope,
@@ -108,10 +110,17 @@ impl Periodic {
             _ = interval.tick() => Ok(()),
         }
     }
+    /// Cancels this interval and wakes any pending tick.
     pub fn cancel(&self) {
         self.own.cancel();
     }
+    /// Reports whether this interval or its owning scope has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.own.is_cancelled() || self.scope.is_cancelled()
     }
+}
+
+fn deadline_after(base: Instant, duration: Duration) -> Result<Instant> {
+    base.checked_add(duration)
+        .ok_or_else(|| VertxError::InvalidOptions("timer deadline is out of range".into()))
 }

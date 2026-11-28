@@ -2,8 +2,7 @@
 //! cargo run --example deferred_reply
 //! handler 本身仍然串行；并发来自应用主动 spawn，输入固定为三个请求。
 mod support;
-use async_trait::async_trait;
-use vertx_rs::{Context, DeliveryOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Context, DeliveryOptions, RequestOptions, Result, Verticle, Vertx, VertxError};
 
 fn transform(body: &str) -> String {
     let hash = body.bytes().cycle().take(100_000).fold(0u64, |hash, byte| {
@@ -12,7 +11,6 @@ fn transform(body: &str) -> String {
     format!("{}:{hash:016x}", body.to_uppercase())
 }
 struct Transformer;
-#[async_trait(?Send)]
 impl Verticle for Transformer {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
@@ -26,7 +24,7 @@ impl Verticle for Transformer {
                     // Headers/reply 不会自动转发，应用明确选择需要返回的关联字段。
                     let correlation = headers
                         .get("correlation-id")
-                        .cloned()
+                        .map(str::to_owned)
                         .ok_or_else(|| VertxError::Other("missing correlation-id".into()))?;
                     let task_ctx = ctx.clone();
                     ctx.spawn_local(async move {
@@ -57,11 +55,14 @@ async fn run(vx: &Vertx) -> Result<()> {
                     .request_message_with::<_, String>(
                         "transform",
                         word.to_owned(),
-                        DeliveryOptions::new().header("correlation-id", correlation.clone()),
+                        RequestOptions::new().header("correlation-id", correlation.clone()),
                     )
                     .await?;
                 assert_eq!(response.body(), &transform(word));
-                assert_eq!(response.headers().get("correlation-id"), Some(&correlation));
+                assert_eq!(
+                    response.headers().get("correlation-id"),
+                    Some(correlation.as_str())
+                );
                 println!("{correlation}: {}", response.body());
                 Ok::<_, VertxError>(())
             }
@@ -75,7 +76,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

@@ -28,7 +28,7 @@ pub use diagnostics::{
 pub use error::{Result, VertxError};
 pub use eventbus::{
     Consumer, ConsumerOptions, DeliveryOptions, Envelope, EventBus, Headers, MessageSink,
-    ReplyHandle,
+    ReplyHandle, RequestOptions,
 };
 pub use eventloop::EventLoopId;
 pub use streams::{PipeOptions, pipe_to, pipe_to_with};

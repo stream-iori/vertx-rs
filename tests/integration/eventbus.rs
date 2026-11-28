@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{DeliveryOptions, Vertx, VertxError};
+use vertx_rs::{DeliveryOptions, RequestOptions, Vertx, VertxError};
 
 #[rstest]
 #[tokio::test]
@@ -103,7 +103,7 @@ async fn request_timeout_fires(vx: Vertx) {
         bus.request_with::<_, ()>(
             "timeout",
             (),
-            DeliveryOptions::new().with_timeout(Duration::from_millis(5))
+            RequestOptions::new().with_timeout(Duration::from_millis(5))
         )
         .await,
         Err(VertxError::Timeout(_))
@@ -207,7 +207,7 @@ async fn delivery_options_headers_round_trip(vx: Vertx) {
         .request_message_with::<_, u32>(
             "headers",
             (),
-            DeliveryOptions::new().header("tag", "a").header("tag", "b"),
+            RequestOptions::new().header("tag", "a").header("tag", "b"),
         )
         .await
         .unwrap();
@@ -233,7 +233,7 @@ async fn request_timeout_includes_waiting_for_full_queue(vx: Vertx) {
         bus.request_with::<_, ()>(
             "full",
             999u32,
-            DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+            RequestOptions::new().with_timeout(Duration::from_millis(5)),
         ),
     )
     .await
@@ -265,7 +265,7 @@ async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
         b.request_with::<_, ()>(
             "late",
             (),
-            DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+            RequestOptions::new().with_timeout(Duration::from_millis(5)),
         )
         .await
     });
@@ -334,7 +334,8 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
-        .build();
+        .build()
+        .unwrap();
     let (entered, started) = oneshot::channel();
     let mut entered = Some(entered);
     let (release, wait) = oneshot::channel();
@@ -413,7 +414,8 @@ async fn consumer_capacity_and_waiting_sender_accounting() {
             queue_details: true,
             ..Default::default()
         })
-        .build();
+        .build()
+        .unwrap();
     let bus = vx.event_bus();
     let mut consumer = bus
         .consumer_with::<u32>("small", vertx_rs::ConsumerOptions::new().with_capacity(1))

@@ -12,15 +12,27 @@ pub(crate) struct QueueStats {
     full: AtomicU64,
     diagnostics: Weak<Diagnostics>,
 }
-impl QueueStats {
-    fn snapshot(&self) -> QueueSnapshot {
-        let mut out = self.metadata.clone();
-        out.queued = self.queued.load(Ordering::Relaxed);
-        out.reserved = self.reserved.load(Ordering::Relaxed);
-        out.waiting_senders = self.waiting.load(Ordering::Relaxed);
-        out.full_events = self.full.load(Ordering::Relaxed);
+
+pub(super) struct QueueSample {
+    stats: Arc<QueueStats>,
+    queued: usize,
+    reserved: usize,
+    waiting: usize,
+    full: u64,
+}
+
+impl QueueSample {
+    pub(super) fn snapshot(self) -> QueueSnapshot {
+        let mut out = self.stats.metadata.clone();
+        out.queued = self.queued;
+        out.reserved = self.reserved;
+        out.waiting_senders = self.waiting;
+        out.full_events = self.full;
         out
     }
+}
+
+impl QueueStats {
     pub fn full(&self) {
         self.full.fetch_add(1, Ordering::Relaxed);
         if let Some(diagnostics) = self.diagnostics.upgrade() {
@@ -77,16 +89,27 @@ impl State {
         &self,
         out: &mut DiagnosticsSnapshot,
         options: &DiagnosticsOptions,
-    ) {
+    ) -> Vec<QueueSample> {
+        let mut samples = Vec::new();
         for stats in self.queues.values().filter_map(Weak::upgrade) {
-            out.queued_messages += stats.queued.load(Ordering::Relaxed);
-            out.reserved_slots += stats.reserved.load(Ordering::Relaxed);
-            out.waiting_senders += stats.waiting.load(Ordering::Relaxed);
-            if options.queue_details && out.queues.len() < options.max_queue_details {
-                out.queues.push(stats.snapshot());
+            let queued = stats.queued.load(Ordering::Relaxed);
+            let reserved = stats.reserved.load(Ordering::Relaxed);
+            let waiting = stats.waiting.load(Ordering::Relaxed);
+            out.queued_messages += queued;
+            out.reserved_slots += reserved;
+            out.waiting_senders += waiting;
+            if options.queue_details && samples.len() < options.max_queue_details {
+                let full = stats.full.load(Ordering::Relaxed);
+                samples.push(QueueSample {
+                    stats,
+                    queued,
+                    reserved,
+                    waiting,
+                    full,
+                });
             }
         }
-        out.queues.sort_by_key(|queue| queue.consumer_id);
-        out.queue_details_truncated = options.queue_details && self.queues.len() > out.queues.len();
+        out.queue_details_truncated = options.queue_details && self.queues.len() > samples.len();
+        samples
     }
 }

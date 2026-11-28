@@ -7,17 +7,14 @@
 //! 超时不会撤回已入队消息；同步慢操作必须放进 execute_blocking。
 //! 三次周期心跳广播给两个订阅者；定时器取消不会撤销 Pinger 部署。
 mod support;
-
-use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
-use vertx_rs::{Context, DeliveryOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Context, DeliveryOptions, RequestOptions, Result, Verticle, Vertx, VertxError};
 struct Pinger {
     count: Rc<Cell<u64>>,
 }
-#[async_trait(?Send)]
 impl Verticle for Pinger {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let count = self.count.clone();
@@ -54,10 +51,7 @@ impl Verticle for Pinger {
                         ));
                         return Ok(());
                     }
-                    assert_eq!(
-                        env.headers().get("caller").map(String::as_str),
-                        Some("example")
-                    );
+                    assert_eq!(env.headers().get("caller"), Some("example"));
                     count.set(count.get() + 1);
                     env.reply_with(
                         format!("pong#{}", count.get()),
@@ -97,7 +91,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         .request_message_with::<_, String>(
             "ping",
             "hello".to_owned(),
-            DeliveryOptions::new()
+            RequestOptions::new()
                 .header("caller", "example")
                 .with_timeout(Duration::from_secs(1)),
         )
@@ -117,7 +111,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         .request_with(
             "ping",
             "slow".to_owned(),
-            DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+            RequestOptions::new().with_timeout(Duration::from_millis(5)),
         )
         .await;
     assert!(matches!(timeout, Err(VertxError::Timeout(_))));
@@ -127,7 +121,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         .request_with(
             "ping",
             "hello".to_owned(),
-            DeliveryOptions::new()
+            RequestOptions::new()
                 .header("caller", "example")
                 .with_timeout(Duration::from_secs(1)),
         )
@@ -141,7 +135,7 @@ async fn main() -> Result<()> {
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(2)
-        .try_build()?;
+        .build()?;
     let outcome = support::bounded(run(&vx)).await;
     support::finish(&vx, outcome).await
 }

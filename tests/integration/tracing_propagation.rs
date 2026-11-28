@@ -6,7 +6,51 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeliveryOptions, Result, Vertx, VertxError};
+use vertx_rs::{Context, RequestOptions, Result, Vertx, VertxError};
+
+#[tokio::test]
+async fn span_creation_can_reenter_deployment_admission() {
+    use tracing_subscriber::prelude::*;
+
+    if !super::support::in_test_subprocess(
+        "tracing_propagation::span_creation_can_reenter_deployment_admission",
+    ) {
+        return;
+    }
+
+    struct Probe(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Probe {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attributes.metadata().name() == "context_task"
+                && let Some(ctx) = Context::current()
+            {
+                assert!(ctx.is_alive());
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let reentries = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(Probe(reentries.clone())),
+    )
+    .unwrap();
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    vx.deploy(|_| local(|ctx| async move { ctx.spawn_local(async { Ok(()) })?.await }))
+        .await
+        .unwrap();
+    assert_eq!(reentries.load(Ordering::Relaxed), 1);
+    vx.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
@@ -17,7 +61,8 @@ async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, a) = capture(&vx).with_subscriber(dispatch.clone()).await;
     let (_, b) = capture(&vx).with_subscriber(dispatch.clone()).await;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -95,7 +140,7 @@ async fn diagnostic_logs_separate_admission_queue_timeout_and_user_hook() {
             .request_with(
                 "stages",
                 (),
-                DeliveryOptions::new().with_timeout(Duration::from_millis(5)),
+                RequestOptions::new().with_timeout(Duration::from_millis(5)),
             )
             .await;
         assert!(matches!(reply, Err(VertxError::Timeout(_))));
@@ -207,16 +252,13 @@ async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx)
         let (ctx, barrier, wait, blocked) =
             (ctx.clone(), barrier.clone(), wait.clone(), blocked.clone());
         jobs.push(tokio::spawn(async move {
-            ctx.execute_blocking_with(
-                move || {
-                    barrier.wait();
-                    if std::thread::current().id() == first {
-                        blocked.lock().unwrap().take().unwrap().send(()).ok();
-                        wait.lock().unwrap().recv().unwrap();
-                    }
-                },
-                false,
-            )
+            ctx.execute_blocking_unordered(move || {
+                barrier.wait();
+                if std::thread::current().id() == first {
+                    blocked.lock().unwrap().take().unwrap().send(()).ok();
+                    wait.lock().unwrap().recv().unwrap();
+                }
+            })
             .await
         }));
     }

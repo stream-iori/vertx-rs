@@ -2,7 +2,7 @@
 
 [返回文档索引](index.md)
 
-核心示例可独立运行，无需外部服务，均通过 `try_build()` 创建实例，业务阶段最多等待 5 秒，
+核心示例可独立运行，无需外部服务，均通过可失败的 `build()` 创建实例，业务阶段最多等待 5 秒，
 最后显式 `close().await`；业务和关闭同时失败时，通过 `LifecycleFailed` 保留两者。
 三个综合示例使用两个 EventLoop 和两个 Worker，共享 TCP 示例使用两个 EventLoop 和一个 Worker。
 核心示例共用 `support/mod.rs` 中的日志、超时和关闭处理。
@@ -30,7 +30,7 @@
 | 示例 | 场景 | 重点 API |
 |---|---|---|
 | [deployment_rollback](../examples/deployment_rollback.rs) | 第二个实例启动失败，整批回滚 | deploy_with、stop、DeploymentFailed |
-| [external_dispatch](../examples/external_dispatch.rs) | 外部 OS 线程进入已有 Context | current、run_on_context、threading_model |
+| [external_dispatch](../examples/external_dispatch.rs) | 外部 OS 线程派发到已有 Context | current、spawn、threading_model |
 | [graceful_shutdown](../examples/graceful_shutdown.rs) | close 超时后继续清理并再次等待 | cancellation_token、stop、execute_blocking、close |
 | [error_handling](../examples/error_handling.rs) | 业务失败、异常及 panic 隔离 | fail、set_exception_handler、clear_exception_handler |
 
@@ -166,7 +166,7 @@ abort 只能在执行器重新取得执行权后生效，不能抢占同步死�
 
 ```text
 外部 OS 线程（current=None）
-    → run_on_context
+    → Context::spawn
     → EventLoop 执行任务（指定 Context、所属 ThreadId）
 ```
 

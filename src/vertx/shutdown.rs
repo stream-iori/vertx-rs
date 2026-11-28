@@ -13,13 +13,13 @@ impl Vertx {
     /// again after timeout. Waiting in this instance's Context or on any of its
     /// EventLoop threads returns `WouldDeadlock`, including from raw Tokio tasks.
     pub async fn close(&self) -> Result<()> {
-        if self.inner.shared.event_loops.owns_current_thread()
+        if self.inner.executors.event_loops.owns_current_thread()
             || Context::current().is_some_and(|ctx| self.owns_context(&ctx))
         {
             return Err(VertxError::WouldDeadlock);
         }
         self.start_close()?;
-        let grace = self.inner.shared.shutdown_grace;
+        let grace = self.inner.lifetime.shutdown_grace;
         tokio::time::timeout(grace, self.inner.wait_closed())
             .await
             .map_err(|_| VertxError::ShutdownTimeout(grace))?
@@ -30,22 +30,20 @@ impl Vertx {
             return Ok(());
         };
         // Cancellation and task submission can wake code that reenters Vertx.
-        let shared = &self.inner.shared;
-        shared.diagnostics.close_stage(CloseStage::Deployments);
-        shared.tcp.close_admission();
-        shared.cancel.cancel();
-        shared.event_bus.close();
+        let services = &self.inner.services;
+        services.diagnostics.close_stage(CloseStage::Deployments);
+        services.tcp.close_admission();
+        self.inner.lifetime.cancel.cancel();
+        services.event_bus.close();
         for scope in &scopes {
             scope.request_stop();
         }
-        shared.blocking.close();
+        self.inner.lifetime.blocking.close();
 
         let owner = self.inner.clone();
-        let control_loop = shared.event_loops.pick();
-        if let Err(error) = shared
-            .event_loops
-            .spawn_pinned(control_loop, move || owner.finish_close(scopes))
-        {
+        let loops = &self.inner.executors.event_loops;
+        let control_loop = loops.pick();
+        if let Err(error) = loops.spawn_pinned(control_loop, move || owner.finish_close(scopes)) {
             self.inner
                 .close_result
                 .send_replace(Some(Err(error.clone())));
@@ -57,12 +55,12 @@ impl Vertx {
 
 impl VertxInner {
     fn begin_close(&self) -> Option<Vec<Arc<DeploymentScope>>> {
-        let mut close_started = self.close_started.lock().unwrap();
-        if *close_started {
+        let mut deployments = self.deployments.lock().unwrap();
+        if deployments.closing {
             return None;
         }
-        *close_started = true;
-        Some(self.deployments.lock().unwrap().values().cloned().collect())
+        deployments.closing = true;
+        Some(deployments.scopes.values().cloned().collect())
     }
 
     async fn finish_close(self: Arc<Self>, scopes: Vec<Arc<DeploymentScope>>) -> Result<()> {
@@ -73,16 +71,17 @@ impl VertxInner {
             }
         }
 
-        let shared = &self.shared;
-        shared.diagnostics.close_stage(CloseStage::Blocking);
-        shared.blocking.wait().await;
-        let handler = shared.exception_handler.write().unwrap().take();
-        drop(handler);
-        shared.diagnostics.close_stage(CloseStage::WorkerJoin);
-        errors.extend(shared.workers.shutdown().await);
+        let diagnostics = &self.services.diagnostics;
+        diagnostics.close_stage(CloseStage::Blocking);
+        self.lifetime.blocking.wait().await;
+        if let Err(error) = self.services.exception_handler.seal() {
+            errors.push(error);
+        }
+        diagnostics.close_stage(CloseStage::WorkerJoin);
+        errors.extend(self.executors.workers.shutdown().await);
 
-        shared.diagnostics.close_stage(CloseStage::EventLoopJoin);
-        shared
+        diagnostics.close_stage(CloseStage::EventLoopJoin);
+        self.executors
             .event_loops
             .finish_shutdown(errors, self.close_result.clone());
         Ok(())

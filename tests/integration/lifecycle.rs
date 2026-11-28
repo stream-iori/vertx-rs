@@ -1,19 +1,174 @@
 //! Deployment readiness, rollback, cancellation and resource ownership.
 
 use super::support::{Local, capture, capture_worker, echo, local, vx, worker};
-use async_trait::async_trait;
 use rstest::rstest;
+use std::future::Future;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeploymentOptions, Result, Verticle, Vertx, VertxError, WorkerVerticle};
+use vertx_rs::{
+    Consumer, Context, DeploymentOptions, Result, Verticle, Vertx, VertxError, WorkerVerticle,
+};
+
+#[derive(Clone, Copy)]
+enum Fault {
+    StartConstruction,
+    StartDrop,
+    StopConstruction,
+    StopDrop,
+}
+
+struct ReadyCallback {
+    ctx: Context,
+    drop_panic: Option<&'static str>,
+}
+
+impl Future for ReadyCallback {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        assert_eq!(Context::current().unwrap().id(), self.ctx.id());
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for ReadyCallback {
+    fn drop(&mut self) {
+        assert_eq!(Context::current().unwrap().id(), self.ctx.id());
+        assert_eq!(Context::is_on_worker_thread(), self.ctx.is_worker());
+        if let Some(message) = self.drop_panic {
+            panic!("{message}");
+        }
+    }
+}
+
+struct CallbackFault {
+    fault: Fault,
+    consumer: Option<Consumer<()>>,
+    stops: Arc<AtomicUsize>,
+}
+
+impl CallbackFault {
+    fn start_callback(&mut self, ctx: Context) -> ReadyCallback {
+        assert_eq!(Context::current().unwrap().id(), ctx.id());
+        self.consumer = Some(ctx.event_bus().consumer("callback_fault").unwrap());
+        assert!(
+            !matches!(self.fault, Fault::StartConstruction),
+            "start construction"
+        );
+        ReadyCallback {
+            ctx,
+            drop_panic: matches!(self.fault, Fault::StartDrop).then_some("start future destructor"),
+        }
+    }
+
+    fn stop_callback(&mut self, ctx: Context) -> ReadyCallback {
+        assert_eq!(Context::current().unwrap().id(), ctx.id());
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !matches!(self.fault, Fault::StopConstruction),
+            "stop construction"
+        );
+        ReadyCallback {
+            ctx,
+            drop_panic: matches!(self.fault, Fault::StopDrop).then_some("stop future destructor"),
+        }
+    }
+}
+
+impl Verticle for CallbackFault {
+    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>> {
+        self.start_callback(ctx)
+    }
+
+    fn stop(&mut self, ctx: Context) -> impl Future<Output = Result<()>> {
+        self.stop_callback(ctx)
+    }
+}
+
+impl WorkerVerticle for CallbackFault {
+    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>> + Send {
+        self.start_callback(ctx)
+    }
+
+    fn stop(&mut self, ctx: Context) -> impl Future<Output = Result<()>> + Send {
+        self.stop_callback(ctx)
+    }
+}
+
+#[rstest]
+#[case::start_construction(Fault::StartConstruction, "start construction", 0)]
+#[case::start_drop(Fault::StartDrop, "start future destructor", 0)]
+#[case::stop_construction(Fault::StopConstruction, "stop construction", 1)]
+#[case::stop_drop(Fault::StopDrop, "stop future destructor", 1)]
+#[tokio::test]
+async fn lifecycle_contains_panics_outside_future_poll(
+    vx: Vertx,
+    #[case] fault: Fault,
+    #[case] message: &str,
+    #[case] expected_stops: usize,
+    #[values(false, true)] worker: bool,
+) {
+    let stops = Arc::new(AtomicUsize::new(0));
+    let count = stops.clone();
+    let factory = move |_| CallbackFault {
+        fault,
+        consumer: None,
+        stops: count,
+    };
+    let deployment = if worker {
+        vx.deploy_worker(factory).await
+    } else {
+        vx.deploy(factory).await
+    };
+    let result = match deployment {
+        Ok(id) => vx.undeploy(id).await,
+        Err(error) => Err(error),
+    };
+    assert!(matches!(result, Err(VertxError::Panic(actual)) if actual == message));
+    assert_eq!(stops.load(Ordering::SeqCst), expected_stops);
+    assert_eq!(vx.diagnostics().active_deployments, 0);
+    assert!(matches!(
+        vx.event_bus().try_send("callback_fault", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
+    vx.close().await.unwrap();
+    assert_eq!(vx.diagnostics().failed, 1);
+}
+
+#[rstest]
+#[case::foreign_deployment(false)]
+#[case::own_live_deployment(true)]
+#[tokio::test]
+async fn a_live_start_reports_deployment_terminated_as_failure(vx: Vertx, #[case] own: bool) {
+    let (foreign, _) = capture(&vx).await;
+    vx.undeploy(foreign).await.unwrap();
+    let reports = Arc::new(AtomicUsize::new(0));
+    let count = reports.clone();
+    vx.set_exception_handler(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    let result = vx
+        .deploy(move |_| {
+            local(move |ctx| async move {
+                let id = if own { ctx.deployment_id() } else { foreign };
+                Err(VertxError::DeploymentTerminated(id))
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(VertxError::DeploymentTerminated(id)) if (id != foreign) == own));
+    vx.close().await.unwrap();
+    assert_eq!(reports.load(Ordering::SeqCst), 1);
+    assert_eq!(vx.diagnostics().failed, 1);
+}
 
 struct Lifecycle {
     started: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
 }
-
-#[async_trait(?Send)]
 impl Verticle for Lifecycle {
     async fn start(&mut self, _: Context) -> Result<()> {
         tokio::task::yield_now().await;
@@ -119,7 +274,9 @@ async fn deploy_with_instances_and_typed_config(vx: Vertx) {
                         })
                 })
             },
-            DeploymentOptions::new().instances(3).config("P".to_owned()),
+            DeploymentOptions::new()
+                .instances(NonZeroUsize::new(3).unwrap())
+                .config("P".to_owned()),
         )
         .await
         .unwrap();
@@ -177,8 +334,6 @@ async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: 
         stopped: Arc<AtomicBool>,
         dropped: Arc<AtomicBool>,
     }
-
-    #[async_trait(?Send)]
     impl Verticle for PanicStart {
         async fn start(&mut self, _: Context) -> Result<()> {
             panic!("start panicked");
@@ -189,8 +344,6 @@ async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: 
             Ok(())
         }
     }
-
-    #[async_trait]
     impl WorkerVerticle for PanicStart {
         async fn start(&mut self, _: Context) -> Result<()> {
             panic!("start panicked");
@@ -211,7 +364,8 @@ async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: 
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let stopped = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicBool::new(false));
     let verticle = PanicStart {
@@ -278,7 +432,7 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
                         .handler(|_| async { Ok(()) })
                 })
             },
-            DeploymentOptions::new().instances(3),
+            DeploymentOptions::new().instances(NonZeroUsize::new(3).unwrap()),
         )
         .await;
     assert!(matches!(result, Err(VertxError::DeploymentFailed { .. })));
@@ -371,7 +525,7 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
                     Ok(())
                 })
             },
-            DeploymentOptions::new().instances(3),
+            DeploymentOptions::new().instances(NonZeroUsize::new(3).unwrap()),
         )
         .await
     });

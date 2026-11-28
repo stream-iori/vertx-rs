@@ -83,17 +83,34 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
         turn: Arc::new(AsyncMutex::new(())),
         registry: Arc::downgrade(&registry.state),
     });
+    let id = ResourceId::next();
+    let registration = ListenerRegistration {
+        registry: Arc::downgrade(&registry.state),
+        addr,
+        id,
+        deployment: scope.deployment,
+    };
+    scope
+        .admit()
+        .unwrap()
+        .register_resource(id, ResourceRegistration::Listener(registration));
     registry.state.lock().unwrap().entries.insert(
         addr,
         Slot::Open(OpenListener {
             bound: bound.clone(),
-            members: HashMap::from([(scope.deployment, scope.task_token())]),
+            members: HashMap::from([(
+                scope.deployment,
+                Member {
+                    id,
+                    tracked: scope.task_token(),
+                },
+            )]),
             budget: None,
         }),
     );
 
     scope.request_stop();
-    registry.unregister_deployment(scope.deployment);
+    scope.unregister_resources();
     let done = match registry.state.lock().unwrap().entries.get(&addr) {
         Some(Slot::Closing { done, .. }) => done.clone(),
         _ => panic!("address should be reserved until the in-flight poll completes"),
@@ -113,4 +130,31 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
     assert!(registry.state.lock().unwrap().entries.is_empty());
     let rebound = std::net::TcpListener::bind(addr).unwrap();
     drop(rebound);
+}
+
+#[tokio::test]
+async fn stale_registration_from_same_deployment_does_not_close_the_new_listener() {
+    struct Rebind;
+    impl crate::Verticle for Rebind {
+        async fn start(&mut self, ctx: Context) -> Result<()> {
+            let old = ctx.listen_tcp("127.0.0.1:0".parse().unwrap()).await?;
+            let addr = old.local_addr();
+            let registration = old.registration.clone();
+            drop(old);
+            let mut current = ctx.listen_tcp(addr).await?;
+            assert_ne!(current.registration.id, registration.id);
+            assert!(registration.unregister().is_none());
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), current.accept());
+            client.unwrap();
+            accepted.unwrap();
+            Ok(())
+        }
+    }
+    let vertx = crate::Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    vertx.deploy(|_| Rebind).await.unwrap();
+    vertx.close().await.unwrap();
 }

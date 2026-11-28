@@ -1,7 +1,6 @@
 //! Stop/close ordering, deadlines, joins and deadlock rejection.
 
 use super::support::{capture, capture_worker, echo, local, vx};
-use async_trait::async_trait;
 use rstest::rstest;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use vertx_rs::{Context, Result, Verticle, Vertx, VertxError, WorkerVerticle};
 #[tokio::test]
 async fn stop_timeout_reports_error_then_cleanup_continues() {
     struct SlowStop(Option<oneshot::Receiver<()>>);
-    #[async_trait(?Send)]
     impl Verticle for SlowStop {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -28,7 +26,8 @@ async fn stop_timeout_reports_error_then_cleanup_continues() {
         .event_loop_threads(1)
         .worker_threads(2)
         .shutdown_grace(Duration::from_millis(30))
-        .build();
+        .build()
+        .unwrap();
     let (tx, rx) = oneshot::channel();
     let id = vx.deploy(|_| SlowStop(Some(rx))).await.unwrap();
     assert!(matches!(
@@ -43,7 +42,6 @@ async fn stop_timeout_reports_error_then_cleanup_continues() {
 #[tokio::test]
 async fn stop_can_execute_blocking_cleanup_during_global_close(vx: Vertx) {
     struct Cleanup;
-    #[async_trait(?Send)]
     impl Verticle for Cleanup {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -71,8 +69,6 @@ async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
         release: Option<std::sync::mpsc::Receiver<()>>,
         destroyed: Option<oneshot::Sender<()>>,
     }
-
-    #[async_trait(?Send)]
     impl Verticle for Cleanup {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -176,7 +172,7 @@ async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Ver
                 ctx.spawn_local(async move {
                     let owner = c.owner().unwrap();
                     assert!(matches!(
-                        owner.undeploy(c.deployment_id().unwrap()).await,
+                        owner.undeploy(c.deployment_id()).await,
                         Err(VertxError::WouldDeadlock)
                     ));
                     assert!(matches!(
@@ -227,7 +223,6 @@ async fn close_during_start_cancels_deploy_without_cleanup_error(vx: Vertx) {
 #[tokio::test]
 async fn stop_error_is_returned_and_resources_still_close(vx: Vertx) {
     struct BadStop;
-    #[async_trait(?Send)]
     impl Verticle for BadStop {
         async fn start(&mut self, ctx: Context) -> Result<()> {
             ctx.event_bus()
@@ -262,7 +257,6 @@ async fn concurrent_undeploy_runs_stop_exactly_once(vx: Vertx) {
         release: Option<oneshot::Receiver<()>>,
         started: Option<oneshot::Sender<()>>,
     }
-    #[async_trait(?Send)]
     impl Verticle for OnceStop {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -303,7 +297,6 @@ async fn concurrent_undeploy_runs_stop_exactly_once(vx: Vertx) {
 #[tokio::test]
 async fn cancelled_close_waiter_does_not_cancel_cleanup(vx: Vertx) {
     struct Gate(Option<oneshot::Receiver<()>>);
-    #[async_trait(?Send)]
     impl Verticle for Gate {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -330,7 +323,6 @@ async fn retained_stop_context_cannot_admit_cleanup_from_external_tasks(vx: Vert
         tx: Option<oneshot::Sender<Context>>,
         release: Option<oneshot::Receiver<()>>,
     }
-    #[async_trait(?Send)]
     impl Verticle for Retained {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -368,7 +360,8 @@ async fn saturated_worker_pool_does_not_prevent_close_timeout_or_later_cleanup()
         .event_loop_threads(1)
         .worker_threads(1)
         .shutdown_grace(Duration::from_millis(30))
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
@@ -391,7 +384,6 @@ async fn saturated_worker_pool_does_not_prevent_close_timeout_or_later_cleanup()
 #[tokio::test]
 async fn single_worker_stop_can_await_blocking_cleanup_in_the_shared_pool() {
     struct StopWorker(Option<oneshot::Sender<()>>);
-    #[async_trait]
     impl WorkerVerticle for StopWorker {
         async fn start(&mut self, _: Context) -> Result<()> {
             Ok(())
@@ -411,7 +403,8 @@ async fn single_worker_stop_can_await_blocking_cleanup_in_the_shared_pool() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (done, finished) = oneshot::channel();
     vx.deploy_worker(move |_| StopWorker(Some(done)))
         .await
@@ -425,7 +418,8 @@ async fn raw_tokio_task_on_owned_eventloop_cannot_wait_for_its_own_close() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture(&vx).await;
     let owner = vx.clone();
     ctx.spawn(async move {
@@ -462,7 +456,8 @@ async fn close_joins_every_eventloop_even_with_retained_contexts_and_task_handle
     let vx = Vertx::builder()
         .event_loop_threads(2)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let exited = Arc::new(AtomicUsize::new(0));
     let mut contexts = Vec::new();
     let mut tasks = Vec::new();
@@ -498,11 +493,13 @@ async fn eventloop_can_await_close_of_a_different_vertx_instance() {
     let first = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let second = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
-        .build();
+        .build()
+        .unwrap();
     let (_, ctx) = capture(&first).await;
     let id = ctx.deployment_id();
     let target = second.clone();
