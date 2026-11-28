@@ -3,6 +3,7 @@ use super::queue::QueueState;
 use super::route::{Registration, SubscriptionRegistration};
 use crate::context::Context;
 use crate::error::panic_error;
+use crate::scope::ResourceOwner;
 use crate::task::TracedFuture;
 use crate::{Envelope, Result, TaskHandle, VertxError};
 use futures::stream::FusedStream;
@@ -18,17 +19,18 @@ use tokio::sync::mpsc;
 
 /// A pull consumer. Drop unregisters; scope cancellation stops receiving even
 /// when messages remain buffered. Handler tasks are tracked by the owner scope.
+/// Keeping a consumer does not keep the owning executors alive.
 pub struct Consumer<T> {
     rx: mpsc::Receiver<ErasedEnvelope>,
     registration: SubscriptionRegistration,
-    owner: Option<Context>,
+    owner: Option<ResourceOwner>,
     queue: Arc<QueueState>,
     cancellation: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
     terminal: bool,
     _marker: PhantomData<T>,
 }
 impl<T: Send + 'static> Consumer<T> {
-    pub(super) fn new(registration: Registration, owner: Option<Context>) -> Self {
+    pub(super) fn new(registration: Registration, owner: Option<ResourceOwner>) -> Self {
         let Registration {
             rx,
             subscription,
@@ -65,10 +67,10 @@ impl<T: Send + 'static> Consumer<T> {
         self.registration.address()
     }
     fn handler_context(&self) -> Result<Context> {
-        let ctx = self.owner.clone().ok_or(VertxError::ContextMismatch)?;
-        if !Context::current().is_some_and(|c| ctx.same(&c)) {
-            return Err(VertxError::ContextMismatch);
-        }
+        let owner = self.owner.as_ref().ok_or(VertxError::ContextMismatch)?;
+        let ctx = Context::current()
+            .filter(|ctx| ctx.id() == owner.context_id)
+            .ok_or(VertxError::ContextMismatch)?;
         ctx.ensure_accepting_work()?;
         Ok(ctx)
     }
@@ -176,8 +178,8 @@ impl<T> Unpin for Consumer<T> {}
 impl<T> Consumer<T> {
     fn unregister(&self) {
         self.registration.unregister();
-        if let Some(ctx) = &self.owner {
-            ctx.scope().forget_resource(self.registration.id);
+        if let Some(owner) = &self.owner {
+            owner.forget_resource(self.registration.id);
         }
     }
     pub(super) fn terminate(&mut self) {
@@ -197,7 +199,7 @@ impl<T: Send + 'static> Stream for Consumer<T> {
             let error = this
                 .owner
                 .as_ref()
-                .map(|ctx| ctx.scope().terminated())
+                .map(ResourceOwner::terminated)
                 .unwrap_or(VertxError::VertxClosed);
             this.terminate();
             return Poll::Ready(Some(Err(error)));

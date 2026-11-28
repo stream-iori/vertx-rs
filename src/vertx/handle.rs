@@ -122,7 +122,7 @@ impl VertxHandle {
     /// owning scope cancels it. Polling requires a Tokio time driver.
     pub fn timer(&self, delay: Duration) -> Result<Timer> {
         let scope = self.work_scope()?;
-        drop(scope.admit()?);
+        scope.ensure_open()?;
         Timer::new(delay, scope.cancel.clone())
     }
 
@@ -130,7 +130,7 @@ impl VertxHandle {
     /// measured from this call. The period must be positive.
     pub fn periodic(&self, initial_delay: Duration, period: Duration) -> Result<Periodic> {
         let scope = self.work_scope()?;
-        drop(scope.admit()?);
+        scope.ensure_open()?;
         Periodic::new(initial_delay, period, scope.cancel.clone())
     }
 

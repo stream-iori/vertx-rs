@@ -1,12 +1,47 @@
 //! Shared fixed pool, ordered admission and non-preemptible work.
 
-use super::support::{WorkerDropProbe, capture, local, vx};
+use super::support::{WorkerDropProbe, capture, in_test_subprocess, local, vx};
 use rstest::rstest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{ExecutionInfo, ExecutorThread, ThreadingModel, Vertx, VertxError};
+
+#[tokio::test]
+async fn ordered_blocking_reentry_rejects_waiting_for_its_own_fifo_slot() {
+    if !in_test_subprocess(
+        "blocking::ordered_blocking_reentry_rejects_waiting_for_its_own_fifo_slot",
+    ) {
+        return;
+    }
+    let vertx = vx();
+    let handle = vertx.handle();
+    let result = vertx
+        .execute_blocking(move || {
+            futures::executor::block_on(handle.execute_blocking(|| panic!("nested job ran")))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(VertxError::WouldDeadlock)));
+    vertx.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn ordered_blocking_created_in_a_closure_can_be_polled_later(vx: Vertx) {
+    let handle = vx.handle();
+    let (context_id, deferred) = vx
+        .execute_blocking(move || {
+            let context_id = ExecutionInfo::current().unwrap().context_id;
+            let deferred = handle.execute_blocking(|| ExecutionInfo::current().unwrap().context_id);
+            (context_id, deferred)
+        })
+        .await
+        .unwrap();
+    assert_eq!(deferred.await.unwrap(), context_id);
+    vx.close().await.unwrap();
+}
 
 #[rstest]
 #[tokio::test]

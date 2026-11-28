@@ -1,7 +1,7 @@
 use crate::eventbus::SubscriptionRegistration;
 use crate::task::ActiveTasks;
 use crate::tcp::ListenerRegistration;
-use crate::{DeploymentId, Result, TaskAbortHandle, TaskId, VertxError};
+use crate::{ContextId, DeploymentId, Result, TaskAbortHandle, TaskId, VertxError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -14,6 +14,59 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 pub(crate) enum ScopeOwner {
     Instance,
     Deployment(DeploymentId),
+}
+
+impl ScopeOwner {
+    pub fn terminated(self) -> VertxError {
+        match self {
+            Self::Instance => VertxError::VertxClosed,
+            Self::Deployment(id) => VertxError::DeploymentTerminated(id),
+        }
+    }
+}
+
+/// Ownership metadata for a resource that may outlive its execution target.
+pub(crate) struct ResourceOwner {
+    pub context_id: ContextId,
+    scope_owner: ScopeOwner,
+    scope: Weak<WorkScope>,
+}
+
+impl ResourceOwner {
+    pub fn new(context_id: ContextId, scope: &Arc<WorkScope>) -> Self {
+        Self {
+            context_id,
+            scope_owner: scope.owner,
+            scope: Arc::downgrade(scope),
+        }
+    }
+
+    pub fn scope(&self) -> Result<Arc<WorkScope>> {
+        self.scope.upgrade().ok_or_else(|| self.terminated())
+    }
+
+    pub fn terminated(&self) -> VertxError {
+        self.scope_owner.terminated()
+    }
+
+    pub fn forget_resource(&self, id: ResourceId) {
+        if let Some(scope) = self.scope.upgrade() {
+            scope.forget_resource(id);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct InstanceAdmission(Arc<AtomicBool>);
+
+impl InstanceAdmission {
+    fn close(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -36,24 +89,33 @@ enum Phase {
     Running,
     Stopping,
 }
-pub(crate) struct ScopeState {
+struct ScopeState {
     phase: Phase,
     tasks: ActiveTasks,
     resources: HashMap<ResourceId, ResourceRegistration>,
 }
 
-impl ScopeState {
+pub(crate) struct ScopeAdmission<'a> {
+    resources: &'a mut HashMap<ResourceId, ResourceRegistration>,
+    tracker: &'a TaskTracker,
+}
+
+impl ScopeAdmission<'_> {
     pub fn register_resource(&mut self, id: ResourceId, registration: ResourceRegistration) {
         assert!(
             self.resources.insert(id, registration).is_none(),
             "duplicate resource ID"
         );
     }
+
+    pub fn track(&self) -> TaskTrackerToken {
+        self.tracker.token()
+    }
 }
 pub(crate) struct WorkScope {
     pub owner: ScopeOwner,
     pub cancel: CancellationToken,
-    instance_closing: Arc<AtomicBool>,
+    instance_admission: InstanceAdmission,
     state: Mutex<ScopeState>,
     tracker: TaskTracker,
     blocking: TaskTracker,
@@ -63,7 +125,7 @@ impl WorkScope {
         Self::new(
             ScopeOwner::Instance,
             CancellationToken::new(),
-            Arc::default(),
+            InstanceAdmission::default(),
         )
     }
 
@@ -71,14 +133,14 @@ impl WorkScope {
         Self::new(
             ScopeOwner::Deployment(id),
             self.cancel.child_token(),
-            self.instance_closing.clone(),
+            self.instance_admission.clone(),
         )
     }
 
     fn new(
         owner: ScopeOwner,
         cancel: CancellationToken,
-        instance_closing: Arc<AtomicBool>,
+        instance_admission: InstanceAdmission,
     ) -> Self {
         let phase = match owner {
             ScopeOwner::Instance => Phase::Running,
@@ -87,7 +149,7 @@ impl WorkScope {
         Self {
             owner,
             cancel,
-            instance_closing,
+            instance_admission,
             state: Mutex::new(ScopeState {
                 phase,
                 tasks: ActiveTasks::default(),
@@ -99,22 +161,19 @@ impl WorkScope {
     }
 
     pub fn close_instance_admission(&self) -> bool {
-        !self.instance_closing.swap(true, Ordering::AcqRel)
+        self.instance_admission.close()
     }
 
-    pub fn instance_closing_flag(&self) -> Arc<AtomicBool> {
-        self.instance_closing.clone()
+    pub fn instance_admission(&self) -> &InstanceAdmission {
+        &self.instance_admission
     }
 
     pub fn instance_admission_closed(&self) -> bool {
-        self.instance_closing.load(Ordering::Acquire)
+        self.instance_admission.is_closed()
     }
 
     pub fn terminated(&self) -> VertxError {
-        match self.owner {
-            ScopeOwner::Instance => VertxError::VertxClosed,
-            ScopeOwner::Deployment(id) => VertxError::DeploymentTerminated(id),
-        }
+        self.owner.terminated()
     }
 
     fn ensure_admitted(&self, phase: Phase) -> Result<()> {
@@ -127,10 +186,28 @@ impl WorkScope {
         }
     }
 
-    pub fn admit(&self) -> Result<std::sync::MutexGuard<'_, ScopeState>> {
+    fn admit(&self) -> Result<std::sync::MutexGuard<'_, ScopeState>> {
         let state = self.state.lock().unwrap();
         self.ensure_admitted(state.phase)?;
         Ok(state)
+    }
+
+    pub fn ensure_open(&self) -> Result<()> {
+        drop(self.admit()?);
+        Ok(())
+    }
+
+    // Registry probes and inserts share the stop check. Cancellation and any
+    // resource destruction that can wake tasks happen after this call returns.
+    pub fn with_admission<T>(
+        &self,
+        operation: impl FnOnce(ScopeAdmission<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut state = self.admit()?;
+        operation(ScopeAdmission {
+            resources: &mut state.resources,
+            tracker: &self.tracker,
+        })
     }
 
     pub fn register_task(self: &Arc<Self>, id: TaskId) -> Result<TaskRegistration> {
@@ -211,9 +288,6 @@ impl WorkScope {
 
     pub async fn wait_blocking(&self) {
         self.blocking.wait().await;
-    }
-    pub fn task_token(&self) -> TaskTrackerToken {
-        self.tracker.token()
     }
 }
 

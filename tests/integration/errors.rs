@@ -16,6 +16,35 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
     }
 }
 
+#[rstest]
+#[tokio::test]
+async fn exception_hook_update_after_stop_is_rejected_even_with_retained_consumer(vx: Vertx) {
+    let (ready, registered) = oneshot::channel();
+    let deployment = vx
+        .deploy(move || {
+            local(move |vertx| async move {
+                let consumer = vertx.event_bus()?.consumer::<()>("retained-hook-owner")?;
+                ready.send(consumer).ok().unwrap();
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let consumer = registered.await.unwrap();
+    deployment.stop().await.unwrap();
+
+    assert!(matches!(
+        deployment.set_exception_handler(|_| {}),
+        Err(VertxError::DeploymentTerminated(id)) if id == deployment.id()
+    ));
+    drop(consumer);
+    assert!(matches!(
+        deployment.clear_exception_handler(),
+        Err(VertxError::DeploymentTerminated(id)) if id == deployment.id()
+    ));
+    vx.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn exception_handler_destructor_can_reenter_its_slot() {
     if !in_test_subprocess("errors::exception_handler_destructor_can_reenter_its_slot") {

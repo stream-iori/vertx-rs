@@ -1,12 +1,11 @@
 use super::envelope::ErasedEnvelope;
 use super::queue::{QueueSender, QueueState};
 use crate::diagnostics::Diagnostics;
-use crate::scope::{ResourceId, WorkScope};
+use crate::scope::{InstanceAdmission, ResourceId, WorkScope};
 use crate::{ContextId, DeploymentId, Result, VertxError};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::any::TypeId;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -94,7 +93,7 @@ pub(super) struct Router {
     routes: DashMap<String, Route>,
     admission: RwLock<()>,
     pub(super) closed: CancellationToken,
-    instance_closing: Arc<AtomicBool>,
+    instance_admission: InstanceAdmission,
 }
 
 impl Router {
@@ -104,12 +103,12 @@ impl Router {
             routes: DashMap::new(),
             admission: RwLock::new(()),
             closed: scope.cancel.clone(),
-            instance_closing: scope.instance_closing_flag(),
+            instance_admission: scope.instance_admission().clone(),
         }
     }
 
     pub(super) fn ensure_open(&self) -> Result<()> {
-        if self.instance_closing.load(Ordering::Acquire) || self.closed.is_cancelled() {
+        if self.instance_admission.is_closed() || self.closed.is_cancelled() {
             Err(VertxError::VertxClosed)
         } else {
             Ok(())

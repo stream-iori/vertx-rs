@@ -3,7 +3,7 @@ use super::{Consumer, ConsumerOptions};
 use crate::Result;
 use crate::context::Context;
 use crate::diagnostics::Diagnostics;
-use crate::scope::{ResourceRegistration, WorkScope};
+use crate::scope::{ResourceOwner, ResourceRegistration, WorkScope};
 use std::sync::Arc;
 
 /// Local typed address router. Consumers registered within managed execution
@@ -54,29 +54,35 @@ impl EventBus {
     ) -> Result<Consumer<T>> {
         options.validate()?;
         self.ensure_open()?;
-        let owner = Context::current()
+        let context = Context::current()
             .filter(|ctx| Arc::ptr_eq(&ctx.instance_event_bus().router, &self.router));
-        let cancel = owner
+        let cancel = context
             .as_ref()
             .map(|ctx| ctx.scope().cancel.clone())
             .unwrap_or_else(|| self.router.closed.clone())
             .child_token();
-        let registration = {
-            let mut admission = owner.as_ref().map(|ctx| ctx.scope().admit()).transpose()?;
-            let metadata = owner.as_ref().map(|ctx| SubscriptionOwner {
-                context_id: ctx.id(),
-                deployment_id: ctx.deployment_id(),
-            });
-            let registration =
-                self.router
-                    .register(address, kind, metadata, cancel, options.capacity())?;
-            if let Some(admission) = &mut admission {
-                admission.register_resource(
-                    registration.subscription.id,
-                    ResourceRegistration::Subscription(registration.subscription.clone()),
-                );
+        let metadata = context.as_ref().map(|ctx| SubscriptionOwner {
+            context_id: ctx.id(),
+            deployment_id: ctx.deployment_id(),
+        });
+        let register = || {
+            self.router
+                .register(address, kind, metadata, cancel, options.capacity())
+        };
+        let (registration, owner) = match context {
+            Some(ctx) => {
+                let scope = ctx.scope();
+                let registration = scope.with_admission(|mut admission| {
+                    let registration = register()?;
+                    admission.register_resource(
+                        registration.subscription.id,
+                        ResourceRegistration::Subscription(registration.subscription.clone()),
+                    );
+                    Ok(registration)
+                })?;
+                (registration, Some(ResourceOwner::new(ctx.id(), scope)))
             }
-            registration
+            None => (register()?, None),
         };
         let consumer = Consumer::new(registration, owner);
         // A global close can cancel before it acquires the router's admission lock.

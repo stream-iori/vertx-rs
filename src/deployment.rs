@@ -58,20 +58,24 @@ impl Deployment {
     }
 
     /// Sets the exception hook for this deployment.
+    /// Returns `DeploymentTerminated` once the deployment has sealed its hook.
     pub fn set_exception_handler<F>(&self, handler: F) -> Result<()>
     where
         F: Fn(&VertxError) + Send + Sync + 'static,
     {
-        let ctx = self.context()?;
-        ctx.set_exception_handler(handler);
-        Ok(())
+        self.context()?
+            .set_exception_handler(handler)
+            .then_some(())
+            .ok_or(VertxError::DeploymentTerminated(self.id))
     }
 
     /// Clears this deployment's exception hook, restoring the instance fallback.
+    /// Returns `DeploymentTerminated` once the deployment has sealed its hook.
     pub fn clear_exception_handler(&self) -> Result<()> {
-        let ctx = self.context()?;
-        ctx.clear_exception_handler();
-        Ok(())
+        self.context()?
+            .clear_exception_handler()
+            .then_some(())
+            .ok_or(VertxError::DeploymentTerminated(self.id))
     }
 
     /// Requests stopping without waiting. Repeated calls are harmless.

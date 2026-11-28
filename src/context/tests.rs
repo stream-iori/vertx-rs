@@ -5,6 +5,31 @@ use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
+#[tokio::test]
+async fn deployment_rejects_hook_updates_after_sealing_with_live_context() {
+    let vertx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let id = DeploymentId::next();
+    let scope = Arc::new(DeploymentScope::new(id, &vertx.inner.lifetime.scope));
+    let ctx = Context::new_worker(&vertx.inner, scope);
+    let deployment = ctx.deployment().unwrap();
+    deployment.set_exception_handler(|_| {}).unwrap();
+    ctx.seal_exception_handler().unwrap();
+
+    assert!(matches!(
+        deployment.set_exception_handler(|_| {}),
+        Err(VertxError::DeploymentTerminated(owner)) if owner == id
+    ));
+    assert!(matches!(
+        deployment.clear_exception_handler(),
+        Err(VertxError::DeploymentTerminated(owner)) if owner == id
+    ));
+    vertx.close().await.unwrap();
+}
+
 #[rstest::rstest]
 #[case::normal_return(false)]
 #[case::unwind(true)]

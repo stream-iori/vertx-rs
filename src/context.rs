@@ -207,30 +207,30 @@ impl Context {
         Arc::ptr_eq(&self.data, &other.data)
     }
     pub(crate) fn ensure_accepting_work(&self) -> Result<()> {
-        drop(self.scope().admit()?);
-        Ok(())
+        self.scope().ensure_open()
+    }
+    pub(crate) fn is_on_event_loop(&self) -> bool {
+        self.event_loop_id()
+            .is_some_and(|id| self.data.executors.event_loops.check_thread(id))
     }
     pub(crate) fn ensure_current_event_loop_context(&self) -> Result<()> {
         self.ensure_accepting_work()?;
-        if let Some(id) = self.event_loop_id()
-            && self.data.executors.event_loops.check_thread(id)
-            && Self::current().is_some_and(|c| self.same(&c))
-        {
+        if self.is_on_event_loop() && Self::current().is_some_and(|current| self.same(&current)) {
             return Ok(());
         }
         Err(VertxError::ContextMismatch)
     }
     /// Replaces this Context's hook for managed task and lifecycle failures.
-    /// The hook may change its own registration. A stopped Context discards it.
-    pub fn set_exception_handler<F>(&self, f: F)
+    /// Returns whether the exception slot accepted the update.
+    pub(crate) fn set_exception_handler<F>(&self, f: F) -> bool
     where
         F: Fn(&VertxError) + Send + Sync + 'static,
     {
-        self.data.exception_handler.set(f);
+        self.data.exception_handler.set(f)
     }
     /// Restores fallback to the owning instance's exception hook.
-    pub fn clear_exception_handler(&self) {
-        self.data.exception_handler.clear();
+    pub(crate) fn clear_exception_handler(&self) -> bool {
+        self.data.exception_handler.clear()
     }
     pub(crate) fn seal_exception_handler(&self) -> Result<()> {
         self.data.exception_handler.seal()

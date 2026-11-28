@@ -1,4 +1,4 @@
-use super::support::{capture, local, vx};
+use super::support::{capture, local, report_on_thread_exit, vx};
 use rstest::rstest;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -147,4 +147,34 @@ async fn retaining_weak_handles_does_not_keep_pending_runtime_tasks_alive() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn retained_consumer_allows_event_loop_to_exit_after_last_owner_drops() {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let (report, exited) = oneshot::channel();
+    let handle = vx.handle();
+    let mut consumer = vx
+        .spawn(async move {
+            report_on_thread_exit(report);
+            handle.event_bus()?.consumer::<()>("retained")
+        })
+        .unwrap()
+        .await
+        .unwrap();
+
+    drop(vx);
+    tokio::time::timeout(Duration::from_secs(3), exited)
+        .await
+        .expect("retained Consumer held the EventLoop alive")
+        .unwrap();
+    assert!(matches!(
+        consumer.recv().await,
+        Err(VertxError::VertxClosed)
+    ));
+    assert!(consumer.recv().await.unwrap().is_none());
 }

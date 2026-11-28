@@ -1,7 +1,9 @@
 use super::Context;
 use crate::diagnostics::{TaskRecord, TaskStage};
 use crate::error::panic_error;
-use crate::{Result, TaskId, VertxError};
+use crate::{ContextId, Result, TaskId, VertxError};
+use std::cell::Cell;
+use std::mem::DropGuard;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 use tokio::sync::OwnedMutexGuard;
@@ -10,6 +12,10 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 enum BlockingOrder {
     Ordered,
     Unordered,
+}
+
+thread_local! {
+    static ORDERED_CONTEXT: Cell<Option<ContextId>> = const { Cell::new(None) };
 }
 
 impl Context {
@@ -44,6 +50,9 @@ impl Context {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        if matches!(order, BlockingOrder::Ordered) && ORDERED_CONTEXT.get() == Some(self.id()) {
+            return Err(VertxError::WouldDeadlock);
+        }
         let mut task = BlockingTask::admit(self)?;
         let order = task.wait_for_order(order).await?;
         task.record.stage(TaskStage::BlockingQueued);
@@ -149,7 +158,12 @@ impl BlockingTask {
         );
 
         // Keep tracking and FIFO ownership until the closure and diagnostics are finished.
+        let ordered = order.is_some();
         let _tracking_and_order = (scope_token, order);
+        let _ordered_context = ordered.then(|| {
+            let previous = ORDERED_CONTEXT.replace(Some(ctx.id()));
+            DropGuard::new(previous, |previous| ORDERED_CONTEXT.set(previous))
+        });
         let mut blocking_context = ctx.clone();
         blocking_context.stopping = false;
         let _context = blocking_context.enter();

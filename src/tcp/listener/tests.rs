@@ -97,23 +97,20 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
         owner: scope.owner,
     };
     scope
-        .admit()
-        .unwrap()
-        .register_resource(id, ResourceRegistration::Listener(registration));
-    registry.state.lock().unwrap().entries.insert(
-        addr,
-        Slot::Open(OpenListener {
-            bound: bound.clone(),
-            members: HashMap::from([(
-                scope.owner,
-                Member {
-                    id,
-                    tracked: scope.task_token(),
-                },
-            )]),
-            budget: None,
-        }),
-    );
+        .with_admission(|mut admission| {
+            let tracked = admission.track();
+            admission.register_resource(id, ResourceRegistration::Listener(registration));
+            registry.state.lock().unwrap().entries.insert(
+                addr,
+                Slot::Open(OpenListener {
+                    bound: bound.clone(),
+                    members: HashMap::from([(scope.owner, Member { id, tracked })]),
+                    budget: None,
+                }),
+            );
+            Ok(())
+        })
+        .unwrap();
 
     scope.request_stop();
     scope.unregister_resources();

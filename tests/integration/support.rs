@@ -45,6 +45,29 @@ pub(super) fn in_test_subprocess(name: &str) -> bool {
     }
 }
 
+pub(super) fn report_on_thread_exit(report: oneshot::Sender<()>) {
+    struct ThreadExit(Option<oneshot::Sender<()>>);
+    impl Drop for ThreadExit {
+        fn drop(&mut self) {
+            self.0
+                .take()
+                .expect("one exit signal per thread")
+                .send(())
+                .ok();
+        }
+    }
+    thread_local! {
+        static EXIT: std::cell::RefCell<Option<ThreadExit>> = const { std::cell::RefCell::new(None) };
+    }
+    EXIT.with(|slot| {
+        assert!(
+            slot.borrow_mut()
+                .replace(ThreadExit(Some(report)))
+                .is_none()
+        )
+    });
+}
+
 pub(super) struct Local<F>(Option<F>);
 
 pub(super) fn local<F, Fut>(f: F) -> Local<F>

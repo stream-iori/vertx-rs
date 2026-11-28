@@ -1,4 +1,4 @@
-use super::support::{local, worker};
+use super::support::{local, report_on_thread_exit, worker};
 use rstest::rstest;
 use std::cell::RefCell;
 use std::future::{Future, pending, poll_fn};
@@ -356,6 +356,35 @@ async fn undeploying_first_member_wakes_it_and_keeps_the_listener() {
 
 fn retain(incoming: TcpIncoming) {
     RETAINED.with(|slot| assert!(slot.borrow_mut().replace(incoming).is_none()));
+}
+
+#[tokio::test]
+async fn thread_local_listener_allows_event_loop_to_exit_after_last_owner_drops() {
+    let vx = instance(1);
+    let (report, exited) = oneshot::channel();
+    let (ready, bound) = oneshot::channel();
+    let deployment = vx
+        .deploy(move || {
+            local(move |vertx| async move {
+                report_on_thread_exit(report);
+                let incoming = vertx.listen_tcp(EPHEMERAL).await?;
+                let addr = incoming.local_addr();
+                retain(incoming);
+                ready.send(addr).unwrap();
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let addr = bound.await.unwrap();
+    drop(vx);
+
+    tokio::time::timeout(TIMEOUT, exited)
+        .await
+        .expect("thread-local TcpIncoming held the EventLoop alive")
+        .unwrap();
+    deployment.wait_stopped().await.unwrap();
+    drop(std::net::TcpListener::bind(addr).expect("the registered port should be released"));
 }
 
 #[tokio::test]

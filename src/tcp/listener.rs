@@ -1,5 +1,7 @@
 use crate::context::Context;
-use crate::scope::{ResourceId, ResourceRegistration, ScopeOwner};
+use crate::scope::{
+    InstanceAdmission, ResourceId, ResourceOwner, ResourceRegistration, ScopeOwner, WorkScope,
+};
 use crate::{Result, VertxError};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -21,6 +23,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 ///
 /// Dropping it unregisters this scope from the address. An accepted
 /// stream belongs to its caller and can be owned by a managed task.
+/// Keeping this handle does not keep the owning executors alive.
 ///
 /// ```compile_fail,E0277
 /// use vertx_rs::TcpIncoming;
@@ -29,7 +32,9 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 /// require_send::<TcpIncoming>();
 /// ```
 pub struct TcpIncoming {
-    ctx: Context,
+    owner: ResourceOwner,
+    instance_admission: InstanceAdmission,
+    cancel: CancellationToken,
     registration: ListenerRegistration,
     turn: Arc<AsyncMutex<()>>,
     _local: PhantomData<Rc<()>>,
@@ -94,31 +99,80 @@ impl TcpIncoming {
     /// call gives up its position in line. The registration can accept again.
     /// If nobody is waiting, connections stay in the OS backlog.
     pub async fn accept(&mut self) -> Result<(TcpStream, SocketAddr)> {
-        self.ctx.ensure_current_event_loop_context()?;
-        let registry = self.ctx.tcp_listeners();
+        self.scope()?.ensure_open()?;
+        self.check_context()?;
         let accept = async {
             let _turn = self.turn.lock().await;
             let accepted = poll_fn(|cx| {
                 // Keep the listener alive only while this poll can use it.
-                registry
-                    .registered_listener(&self.ctx, &self.registration)?
-                    .poll_accept(cx)
+                self.registered_listener()?.poll_accept(cx)
             })
             .await?;
             // The OS may have accepted a connection while shutdown closed admission.
-            registry.registered_listener(&self.ctx, &self.registration)?;
+            self.registered_listener()?;
             Ok(accepted)
         };
         tokio::select! {
             biased;
-            _ = self.ctx.scope().cancel.cancelled() => Err(stopped(&self.ctx)),
+            _ = self.cancel.cancelled() => Err(self.stopped()),
             accepted = accept => accepted,
         }
     }
 
+    fn scope(&self) -> Result<Arc<WorkScope>> {
+        if self.instance_admission.is_closed() {
+            return Err(VertxError::VertxClosed);
+        }
+        self.owner.scope()
+    }
+
+    fn check_context(&self) -> Result<()> {
+        if Context::current()
+            .is_some_and(|ctx| ctx.id() == self.owner.context_id && ctx.is_on_event_loop())
+        {
+            return Ok(());
+        }
+        Err(VertxError::ContextMismatch)
+    }
+
+    fn stopped(&self) -> VertxError {
+        if self.instance_admission.is_closed() {
+            VertxError::VertxClosed
+        } else {
+            self.owner.terminated()
+        }
+    }
+
+    fn registered_listener(&self) -> Result<Arc<BoundListener>> {
+        let scope = self.scope()?;
+        let registration = &self.registration;
+        let registry = registration
+            .registry
+            .upgrade()
+            .ok_or_else(|| self.stopped())?;
+        scope.with_admission(|_| {
+            self.check_context()?;
+            let state = registry.lock().unwrap();
+            if state.closed {
+                return Err(VertxError::VertxClosed);
+            }
+            match state.entries.get(&registration.addr) {
+                Some(Slot::Open(open))
+                    if open
+                        .members
+                        .get(&registration.owner)
+                        .is_some_and(|member| member.id == registration.id) =>
+                {
+                    Ok(open.bound.clone())
+                }
+                _ => Err(self.owner.terminated()),
+            }
+        })
+    }
+
     pub(super) fn unregister(&self) -> Option<CancellationToken> {
         let done = self.registration.unregister();
-        self.ctx.scope().forget_resource(self.registration.id);
+        self.owner.forget_resource(self.registration.id);
         done
     }
 }
@@ -295,7 +349,9 @@ impl TcpListeners {
                     budget,
                 } => {
                     let incoming = TcpIncoming {
-                        ctx: ctx.clone(),
+                        owner: ResourceOwner::new(ctx.id(), ctx.scope()),
+                        instance_admission: ctx.scope().instance_admission().clone(),
+                        cancel: ctx.scope().cancel.clone(),
                         registration,
                         turn,
                         _local: PhantomData,
@@ -313,107 +369,84 @@ impl TcpListeners {
         ctx: &Context,
         addr: SocketAddr,
         mode: ListenMode,
-        socket: Option<TcpListener>,
+        mut socket: Option<TcpListener>,
     ) -> Result<Registration> {
         ctx.ensure_current_event_loop_context()?;
         let scope = ctx.scope();
-        let mut admission = scope.admit()?;
-        let mut state = self.state.lock().unwrap();
-        if state.closed {
-            return Err(VertxError::VertxClosed);
-        }
-        state.budgets.retain(|_, budget| budget.strong_count() != 0);
-        let mut budget = state.budgets.get(&addr).and_then(Weak::upgrade);
-        let limit = mode.connection_limit();
-        if let Some(retained) = &budget
-            && Some(retained.limit) != limit
-        {
-            return Err(incompatible(addr));
-        }
-        let registration = ListenerRegistration {
-            registry: Arc::downgrade(&self.state),
-            addr,
-            owner: scope.owner,
-            id: ResourceId::next(),
-        };
-        let new_member = || Member {
-            id: registration.id,
-            tracked: scope.task_token(),
-        };
-        let turn = match state.entries.entry(addr) {
-            Entry::Occupied(entry) => match entry.into_mut() {
-                Slot::Open(open) => {
-                    if open.budget.as_ref().map(|budget| budget.limit) != limit {
-                        return Err(incompatible(addr));
-                    }
-                    let Entry::Vacant(member) = open.members.entry(scope.owner) else {
-                        return Err(VertxError::InvalidOptions(format!(
-                            "scope already listens on {addr}"
-                        )));
-                    };
-                    member.insert(new_member());
-                    open.bound.turn.clone()
-                }
-                Slot::Closing { done, .. } => return Ok(Registration::Closing(done.clone())),
-            },
-            Entry::Vacant(entry) => {
-                let Some(socket) = socket else {
-                    return Ok(Registration::Unbound);
-                };
-                if budget.is_none() {
-                    budget = limit.map(PortBudget::new).map(Arc::new);
-                }
-                let turn = Arc::new(AsyncMutex::new(()));
-                let bound = Arc::new(BoundListener {
-                    addr,
-                    socket: Some(socket),
-                    turn: turn.clone(),
-                    registry: Arc::downgrade(&self.state),
-                });
-                entry.insert(Slot::Open(OpenListener {
-                    bound,
-                    members: HashMap::from([(scope.owner, new_member())]),
-                    budget: budget.clone(),
-                }));
-                if let Some(budget) = &budget {
-                    state.budgets.insert(addr, Arc::downgrade(budget));
-                }
-                turn
+        scope.with_admission(|mut admission| {
+            let mut state = self.state.lock().unwrap();
+            if state.closed {
+                return Err(VertxError::VertxClosed);
             }
-        };
-        admission.register_resource(
-            registration.id,
-            ResourceRegistration::Listener(registration.clone()),
-        );
-        Ok(Registration::Ready {
-            registration,
-            turn,
-            budget,
-        })
-    }
-
-    fn registered_listener(
-        &self,
-        ctx: &Context,
-        registration: &ListenerRegistration,
-    ) -> Result<Arc<BoundListener>> {
-        ctx.ensure_current_event_loop_context()?;
-        let _admission = ctx.scope().admit()?;
-        let state = self.state.lock().unwrap();
-        if state.closed {
-            return Err(VertxError::VertxClosed);
-        }
-        match state.entries.get(&registration.addr) {
-            Some(Slot::Open(open))
-                if open
-                    .members
-                    .get(&registration.owner)
-                    .is_some_and(|member| member.id == registration.id) =>
+            state.budgets.retain(|_, budget| budget.strong_count() != 0);
+            let mut budget = state.budgets.get(&addr).and_then(Weak::upgrade);
+            let limit = mode.connection_limit();
+            if let Some(retained) = &budget
+                && Some(retained.limit) != limit
             {
-                Ok(open.bound.clone())
+                return Err(incompatible(addr));
             }
-            _ => Err(ctx.scope().terminated()),
-        }
+            let registration = ListenerRegistration {
+                registry: Arc::downgrade(&self.state),
+                addr,
+                owner: scope.owner,
+                id: ResourceId::next(),
+            };
+            let new_member = || Member {
+                id: registration.id,
+                tracked: admission.track(),
+            };
+            let turn = match state.entries.entry(addr) {
+                Entry::Occupied(entry) => match entry.into_mut() {
+                    Slot::Open(open) => {
+                        if open.budget.as_ref().map(|budget| budget.limit) != limit {
+                            return Err(incompatible(addr));
+                        }
+                        let Entry::Vacant(member) = open.members.entry(scope.owner) else {
+                            return Err(VertxError::InvalidOptions(format!(
+                                "scope already listens on {addr}"
+                            )));
+                        };
+                        member.insert(new_member());
+                        open.bound.turn.clone()
+                    }
+                    Slot::Closing { done, .. } => return Ok(Registration::Closing(done.clone())),
+                },
+                Entry::Vacant(entry) => {
+                    let Some(socket) = socket.take() else {
+                        return Ok(Registration::Unbound);
+                    };
+                    if budget.is_none() {
+                        budget = limit.map(PortBudget::new).map(Arc::new);
+                    }
+                    let turn = Arc::new(AsyncMutex::new(()));
+                    let bound = Arc::new(BoundListener {
+                        addr,
+                        socket: Some(socket),
+                        turn: turn.clone(),
+                        registry: Arc::downgrade(&self.state),
+                    });
+                    entry.insert(Slot::Open(OpenListener {
+                        bound,
+                        members: HashMap::from([(scope.owner, new_member())]),
+                        budget: budget.clone(),
+                    }));
+                    if let Some(budget) = &budget {
+                        state.budgets.insert(addr, Arc::downgrade(budget));
+                    }
+                    turn
+                }
+            };
+            admission.register_resource(
+                registration.id,
+                ResourceRegistration::Listener(registration.clone()),
+            );
+            Ok(Registration::Ready {
+                registration,
+                turn,
+                budget,
+            })
+        })
     }
 
     pub(crate) fn close_admission(&self) {
