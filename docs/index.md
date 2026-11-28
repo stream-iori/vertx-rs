@@ -1,13 +1,13 @@
 # vertx-rs 0.3 设计文档索引
 
 目标：用 Rust Future、固定 OS Worker 线程池和 Tokio IO 驱动实现 Vert.x 5 的**单进程执行核心**。
-范围包括 Verticle、Context、Worker、EventBus、Stream/Sink 传输、Timer、部署及异步关闭。
+范围包括 Verticle、Context、Worker、EventBus、Stream/Sink 传输、共享 TCP 监听和受管服务、Timer、部署及异步关闭。
 
 ## 主题导航
 
 | 文档 | 阅读用途 |
 |---|---|
-| [执行模型与 Context](execution-model.md) | 线程亲和性、Context 隔离、EventLoop 派发及初始化 |
+| [执行模型与 Context](execution-model.md) | 线程亲和性、Context 隔离、EventLoop 派发、共享 TCP 监听及初始化 |
 | [生命周期与关闭](lifecycle.md) | start/stop、受管任务、部署、撤销与关闭 |
 | [EventBus](eventbus.md) | 消息 API、消费者归属及路由竞态 |
 | [Stream、Sink 与背压传输](streams.md) | Consumer Stream、MessageSink、pipe 与背压 |
@@ -29,6 +29,7 @@
 | 部署、任务与关闭 | [生命周期](lifecycle.md) |
 | 路由、消费者与消息队列 | [EventBus](eventbus.md) |
 | Stream、Sink 与 pipe | [背压传输](streams.md) |
+| TCP 监听、连接限额与 HTTP 接入 | [共享 TCP 监听](execution-model.md#共享-tcp-监听)、[网络示例](examples.md#tcp-与-http-示例) |
 | Timer、blocking 与构建配置 | [Timer 与配置](timers-and-config.md)、[执行模型](execution-model.md) |
 | 错误、日志与诊断 | [错误与可观测性](diagnostics.md) |
 

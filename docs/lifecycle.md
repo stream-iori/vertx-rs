@@ -48,20 +48,30 @@ Tracker token 在用户 Future 及其状态析构完成后才释放，覆盖未�
 
 ## 撤销与关闭
 
-1. 关闭部署准入，拒绝新任务、订阅、定时器及普通阻塞操作。
-2. 注销订阅并取消 scope token；Consumer 不再读取缓冲消息。
+1. 关闭部署准入，拒绝新任务、订阅、TCP 监听、定时器及普通阻塞操作。
+2. 取消 scope token 并注销消息订阅和 TCP 监听注册。Consumer 停止读取缓冲消息，等待中的 `accept()` 返回部署终止或实例关闭错误。
 3. 给子任务半个 shutdown_grace 协作退出，随后 abort 剩余异步任务，并等待实际析构完成。
 4. 等待已经开始的 blocking 操作结束，执行 stop。stop 中可以执行清理所需的 blocking 操作。
 5. 等待清理期间产生的 blocking 操作结束，完成部署并释放记录。
 
+丢弃 `TcpIncoming` 也会注销注册。最后一个注册注销时释放监听 socket，部署的清理完成通知晚于此释放。
+已接收的 `TcpStream` 归调用者所有。将 socket 交给 `ctx.spawn_local` 启动的受管任务，任务结束或撤销时，任务独占的连接随之释放。
+
+`TcpServer::shutdown(grace)` 停止单个服务注册的接收，并通知已有连接收尾。首个调用确定期限。
+超时会请求中止剩余连接任务，`wait_closed()` 等待实际析构。取消关闭等待或丢弃服务句柄不会改变该服务的生命周期。
+持有同一 Context 的任务等待本服务关闭会返回 `WouldDeadlock`。
+对于需要 EventBus 的在途 HTTP 请求，从部署外启动同一地址上各个服务的 `shutdown(grace)`，等它们清理后再调用 `Vertx::close()`。
+Axum 适配器在这一阶段通知 Hyper 完成在途响应。若某个服务返回 `ShutdownTimeout`，可用该句柄的 `wait_closed()` 继续等连接析构。
+直接撤销部署或关闭实例时，服务和连接走普通受管任务取消流程。
+
 undeploy 调用使用一个 shutdown_grace deadline 覆盖上述过程，默认 1 秒。
 超时返回 ShutdownTimeout，后台收尾继续。**abort 不能抢占不让出执行权的同步代码，也不能中断已开始的 blocking 闭包。**
 
-close 是幂等异步操作。协调任务在 EventLoop 上执行：关闭全局准入、消费者和定时器，撤销全部部署，
+close 是幂等异步操作。协调任务在 EventLoop 上执行：关闭全局准入、消费者和定时器，撤销全部部署并释放监听端口，
 等待 blocking 操作，排空 Worker 任务并等待固定线程退出、join，再关闭 EventLoop 派发准入并请求停止。
 业务清理期间 EventLoop 继续驱动命令、wake、Timer 和取消；入队检查与关闭派发准入使用同一个锁。
 EventLoop 退出时在所属线程取消剩余命令、销毁 LocalSet 和 runtime，最后清除物理线程身份。
-关闭末尾最多创建一个临时回收线程，join 全部 EventLoop 后才发布最终结果；运行期间没有新增常驻回收线程。
+关闭末尾最多创建一个临时回收线程，join 全部 EventLoop 后才发布最终结果。
 Worker 与 EventLoop 都不等待回收自身；join 或回收线程创建失败返回 CleanupFailed，不能误报成功。
 显式 close 成功表示所有 Worker 和 EventLoop OS 线程已退出并完成 join。
 排空时拒绝新业务，但继续接受已有任务的必要 wake 和取消调度。

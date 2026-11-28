@@ -3,12 +3,16 @@ name = "vertx-rs"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.100.0"
-resolver = "3"
 description = "Rust + Tokio port of Vert.x core: EventLoop-affine Verticle + WorkerVerticle + EventBus"
 license = "Apache-2.0"
 
+[workspace]
+resolver = "3"
+members = ["adapters/axum"]
+default-members = ["."]
+
 [dependencies]
-tokio = { version = "1.54.0", features = ["rt", "sync", "macros", "time"] }
+tokio = { version = "1.54.0", features = ["rt", "sync", "macros", "time", "net"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 dashmap = "6.2.1"
 async-trait = "0.1.92"
@@ -56,3 +60,7 @@ path = "examples/deferred_reply.rs"
 [[example]]
 name = "error_handling"
 path = "examples/error_handling.rs"
+
+[[example]]
+name = "tcp_shared_listener"
+path = "examples/tcp_shared_listener.rs"

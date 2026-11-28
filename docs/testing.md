@@ -13,6 +13,8 @@
 - Worker 与 blocking 使用同一组实际 ThreadId；Pending 让出线程、跨线程恢复及 wake 合并不丢通知。
 - Worker 内真实异步 IO、Timer、timeout 可用；取消析构和析构 panic 不破坏线程池或 Context。
 - EventLoop 同线程派发不内联；跨线程早到取消、运行中取消及关闭入队竞争不遗失任务结果。
+- 共享 TCP 监听验证同端口分流、等待取消和端口重绑。受管 TCP 服务验证端口级连接额度、排空超时和连接析构。
+- Axum 适配测试校验 HTTP handler 在 await 前后保持 Context 和线程，排空期间在途请求仍能使用 EventBus。
 - 初始化部分失败回收已创建线程；close 成功时全部 EventLoop 已 join，保留 Context、任务句柄或 Waker 不阻止退出。
 - start/stop 错误、panic、取消、关闭、批量回滚和自身撤销均有回归覆盖。
 - undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
@@ -83,9 +85,16 @@ fixture 只消除重复创建，时序、消息、断言和清理保留在测试
 ```sh
 cargo test --test integration -- --list
 cargo test --test integration streams::
+cargo test --test integration tcp::
+cargo test --test integration tcp_service::
+cargo test -p vertx-rs-axum --test service
 cargo test --test integration pipe_preserves_primary_and_cleanup_failures::case_04_read_and_close_errors
 cargo test --lib eventloop::tests::cancellation::
 ```
+
+网络示例分别用 `cargo run --example tcp_shared_listener` 和
+`cargo run -p vertx-rs-axum --example axum_http1` 实际验证。
+[示例说明](examples.md#tcp-与-http-示例)
 
 运行时动态生成独立用例可参考 [libtest-mimic](https://docs.rs/libtest-mimic/latest/libtest_mimic/)，需要自定义 harness，且不支持标准输出捕获。
 当前用例在编译期可枚举，保留标准 harness 能继续直接使用现有 cargo/IDE 测试发现和日志捕获。

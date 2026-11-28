@@ -32,6 +32,13 @@ pub enum VertxError {
     TimerCancelled,
     #[error("invalid options: {0}")]
     InvalidOptions(String),
+    #[error("TCP {operation} on {addr} failed: {message}")]
+    TcpIo {
+        operation: &'static str,
+        addr: std::net::SocketAddr,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
     #[error("verticle start failed: {0}")]
     StartFailed(String),
     #[error("task panicked: {0}")]
@@ -114,6 +121,7 @@ impl VertxError {
             Self::ShutdownTimeout(_) => "shutdown_timeout",
             Self::TimerCancelled => "timer_cancelled",
             Self::InvalidOptions(_) => "invalid_options",
+            Self::TcpIo { .. } => "tcp_io",
             Self::StartFailed(_) => "start_failed",
             Self::Panic(_) => "panic",
             Self::TaskCancelled => "task_cancelled",

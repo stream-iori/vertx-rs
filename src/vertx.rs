@@ -23,6 +23,7 @@ pub(crate) struct VertxInner {
 }
 impl Drop for VertxInner {
     fn drop(&mut self) {
+        self.shared.tcp.close_admission();
         self.shared.cancel.cancel();
         for scope in self.deployments.get_mut().unwrap().values() {
             scope.request_stop();

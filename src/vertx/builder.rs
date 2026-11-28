@@ -119,6 +119,7 @@ impl VertxBuilder {
             let shared = Arc::new(ContextShared {
                 diagnostics,
                 event_bus,
+                tcp: crate::tcp::TcpListeners::default(),
                 event_loops: Arc::new(event_loops),
                 workers: Arc::new(workers),
                 vertx: weak.clone(),

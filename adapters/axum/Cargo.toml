@@ -1,0 +1,18 @@
+[package]
+name = "vertx-rs-axum"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.100.0"
+license = "Apache-2.0"
+description = "Axum HTTP/1.1 adapter for vertx-rs managed TCP"
+
+[dependencies]
+vertx-rs = { path = "../..", version = "0.3.0" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "service"] }
+tokio = { version = "1.54.0", features = ["macros"] }
+
+[dev-dependencies]
+async-trait = "0.1.92"
+tokio = { version = "1.54.0", features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }

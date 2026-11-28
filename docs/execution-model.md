@@ -79,6 +79,42 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - 普通依赖不启用 Tokio rt-multi-thread；tokio-util 继续用于 CancellationToken、TaskTracker 等工具。
 - 本轮只验证派发结构与执行语义，不提供未经测量的性能提升数字。
 
+## 共享 TCP 监听
+
+同一 Vertx 实例对同一个 `SocketAddr` 只绑定一次。普通 Verticle 用
+`ctx.listen_tcp(addr).await` 注册，用 `incoming.accept().await` 领取连接。
+端口 `0` 每次申请新地址，其他部署用 `incoming.local_addr()` 返回的地址加入。
+同一部署在同一地址重复注册返回 `InvalidOptions`。
+
+| 入口 | 适用场景 | 谁持有连接 |
+|---|---|---|
+| `Context::listen_tcp` | 需要自己控制何时 `accept()`、如何派发连接 | 应用拿到原生 `TcpStream`，可交给受管任务 |
+| `Context::serve_tcp` | 需要统一的连接限额、关闭信号和服务句柄 | 框架为每条连接启动受管任务，处理函数借用 `TcpConnection` |
+| `vertx_rs_axum::serve_axum` | 已有 Axum Router，想让 HTTP handler 在 Verticle 上运行 | TCP 任务持有连接，Hyper 驱动 HTTP/1.1，Axum 执行路由 |
+
+```text
+共享 TcpListener → FIFO 等待队列 → 最早等待的 EventLoop → 原生 TcpStream
+```
+
+- 等待者轮流独占一次接收。暂时忙的 Verticle 在下一次 `accept()` 时重新排队。没人等时，连接留在操作系统的监听队列。
+- 首次绑定的 EventLoop 驱动监听 socket。领取连接的 EventLoop 驱动已接收的 socket。停止首个注册的部署后，仍注册的 Verticle 可以继续接收。
+- 受管监听要求所属的普通 Verticle Context 和实际 EventLoop 线程。活跃的 Worker 或其他 Context 调用返回 `ContextMismatch`。接收器为 `!Send`，Worker 可直接使用 Tokio 网络 API。
+- 取消一次 `accept()` 会释放等待位置，接收器仍可再次接收。绑定和接收的系统错误通过 `TcpIo` 返回，包含操作、地址及错误类别。
+
+[可运行示例](../examples/tcp_shared_listener.rs) · [撤销与关闭](lifecycle.md#撤销与关闭)
+
+### 受管 TCP 服务
+
+`Context::serve_tcp` 为每条连接启动受管任务。处理函数通过 `TcpConnection` 借用
+异步 I/O，可读对端地址和服务关闭信号，socket 由任务持有。它只在所属普通 Verticle 上运行。
+
+- 同一实例的同一绑定地址共用一个连接上限，默认 1024。服务先拿到许可，再等 `accept()`，许可一直保留到 socket 析构。容量耗尽时，新连接留在系统监听队列。
+- 受管监听调用 `listen(128)` 设置系统监听队列，请求的队列长度还受操作系统限制。`TcpServerOptions::max_connections` 控制框架的连接许可。
+- 同地址的服务必须设置相同上限。原始 `listen_tcp` 和 `serve_tcp` 在同地址互斥，冲突返回 `InvalidOptions`。最后一份注册退出就释放监听 socket，旧连接仍占用该地址的预算，使用相同上限的服务可重新绑定并复用预算。
+- 受管服务沿用同一监听器的 FIFO 等待顺序。领取连接的 EventLoop 负责该连接的 I/O 和处理任务。Axum 适配 crate 为请求提供 `ConnectInfo<SocketAddr>`，路由和中间件在该任务中运行。
+
+[网络示例与运行命令](examples.md#tcp-与-http-示例) · [服务关闭](lifecycle.md#撤销与关闭)
+
 ## 相关主题
 
 [生命周期与关闭](lifecycle.md)、[原生 Worker 调度与 Future 组合](worker-and-futures.md)。

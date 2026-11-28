@@ -12,6 +12,8 @@
 | send/publish/request/reply/fail | 提供；send 的有界背压和 pull Consumer 是 Rust 扩展 |
 | Consumer 注册时点 | consumer 调用立即注册，支持 recv；与 Java 在 handler 注册后生效有差异 |
 | ReadStream / WriteStream / Pipe | 使用 futures::Stream / Sink 和 pipe_to 表达拉取、背压、结束及失败；无需另造 handler/pause/fetch 门面 |
+| TCP 共享监听 | 同实例内多部署共享同一绑定地址。普通 Verticle 按等待顺序领取原生 Tokio TCP 连接 |
+| 受管 TCP 服务 | 同地址连接上限和服务级排空。HTTP/1.1 由独立 Axum 适配 crate 提供 |
 | Timer / Periodic | Future / tick 拉模型；保留创建时间起点与取消语义 |
 | 多实例 | 返回 Vec<DeploymentId>，失败时回滚本批 |
 | Future/Promise | Rust Future、Result、oneshot；不重复实现 Java 类型 |
@@ -20,7 +22,7 @@
 | 外部 Context | current() 返回 None，不自动创建外部 Context |
 | SharedData | 使用 std/Tokio 共享原语；不提供框架门面 |
 
-本轮不包含 HTTP/TCP/WebSocket/FileSystem/DNS 流适配、公开 reserve、字节预算、批量传输、集群 EventBus、Codec、命名 WorkerExecutor、
+本轮不包含 TCP 客户端门面、TCP/WebSocket/FileSystem/DNS 流适配、公开 reserve、字节预算、批量传输、集群 EventBus、Codec、命名 WorkerExecutor、
 Java 虚拟线程、动态部署、旧式按 ID 取消 Timer 和 metrics 服务端点。
 
 官方语义依据：[Context](https://vertx.io/docs/apidocs/io/vertx/core/Context.html)、

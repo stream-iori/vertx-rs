@@ -2,10 +2,10 @@
 
 [返回文档索引](index.md)
 
-九个示例可独立运行，无需外部服务，均通过 `try_build()` 创建实例，业务阶段最多等待 5 秒，
+核心示例可独立运行，无需外部服务，均通过 `try_build()` 创建实例，业务阶段最多等待 5 秒，
 最后显式 `close().await`；业务和关闭同时失败时，通过 `LifecycleFailed` 保留两者。
-三个综合示例使用两个 EventLoop 和两个 Worker，六个专题示例使用一个 EventLoop 和两个 Worker。
-九个示例共用 `support/mod.rs` 中的日志、超时和关闭处理。
+三个综合示例使用两个 EventLoop 和两个 Worker，共享 TCP 示例使用两个 EventLoop 和一个 Worker。
+核心示例共用 `support/mod.rs` 中的日志、超时和关闭处理。
 成功关闭后，共用代码会检查部署、任务、消费者、队列及 blocking 活跃计数归零。
 
 ## 选择示例
@@ -34,6 +34,12 @@
 | [graceful_shutdown](../examples/graceful_shutdown.rs) | close 超时后继续清理并再次等待 | cancellation_token、stop、execute_blocking、close |
 | [error_handling](../examples/error_handling.rs) | 业务失败、异常及 panic 隔离 | fail、set_exception_handler、clear_exception_handler |
 
+### TCP 与 HTTP 示例
+
+| 示例 | 场景 | 重点 API |
+|---|---|---|
+| [tcp_shared_listener](../examples/tcp_shared_listener.rs) | 两个 EventLoop 共用一个 TCP 端口并回显 | listen_tcp、local_addr、accept、spawn_local |
+| [axum_http1](../adapters/axum/examples/axum_http1.rs) | 两个 EventLoop 共用一个 HTTP/1.1 端口，路由返回执行它的 EventLoop ID | serve_axum、ConnectInfo、TcpServer::shutdown |
 
 ## 运行方式
 
@@ -49,6 +55,13 @@ cargo run --example external_dispatch
 cargo run --example graceful_shutdown
 cargo run --example deferred_reply
 cargo run --example error_handling
+cargo run --example tcp_shared_listener
+```
+
+独立的 Axum 适配 crate 提供共享端口的 HTTP/1.1 示例。
+
+```sh
+cargo run -p vertx-rs-axum --example axum_http1
 ```
 
 需要内部日志时，可以指定级别和输出格式：
@@ -210,6 +223,30 @@ Context hook 优先于全局 hook，不是两个 hook 都执行。handler 返回
 
 默认 Rust panic hook 仍可能在 stderr 打印 `expected handler panic`，框架也会记录 ERROR 日志；
 这些都是预期演示，最终程序应以退出码 0 结束。没有安装全局吞 panic 的 hook，也没有关闭诊断来隐藏失败。
+
+## tcp_shared_listener：手动接收 TCP 连接
+
+第一个普通 Verticle 绑定 `127.0.0.1:0`，第二个用返回的实际地址加入。两个 Verticle 各用一个 `spawn_local`
+任务接收一条连接并回显一个字节。示例内置客户端，向同一端口发送 `41` 和 `42`，并核对回显。
+预期输出同一个本地地址和两个不同的 `EventLoopId`，端口及处理顺序由实际调度决定。
+
+## axum_http1：在受管任务中运行 Axum Router
+
+两个普通 Verticle 通过 `serve_axum` 共享监听地址。内置客户端发起 HTTP/1.1 请求，
+路由读取 `ConnectInfo<SocketAddr>` 获取对端地址，检查 yield 前后的 EventLoop，并用 EventLoop ID 作为响应。
+预期看到同一个地址分别返回两个不同的 `EventLoopId`。示例先并行等待两个服务的 `shutdown()`，再调用 `vx.close()`。
+
+自定义连接上限时，在 Verticle 的 `start` 中调用 `serve_axum_with_options`，例如：
+
+```rust
+let options = TcpServerOptions {
+    max_connections: std::num::NonZeroUsize::new(256).unwrap(),
+};
+let server = vertx_rs_axum::serve_axum_with_options(&ctx, addr, router, options).await?;
+```
+
+共享这个地址的 Verticle 必须使用相同的上限。常驻服务应把返回的 `TcpServer` 交给部署外的控制任务，用于等待关闭。
+[连接限额与线程归属](execution-model.md#受管-tcp-服务) · [关闭顺序](lifecycle.md#撤销与关闭)
 
 ## 共享状态
 

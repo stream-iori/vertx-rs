@@ -11,6 +11,7 @@ mod eventbus;
 mod eventloop;
 mod streams;
 mod task;
+mod tcp;
 mod threading_model;
 mod timer;
 mod verticle;
@@ -32,6 +33,7 @@ pub use eventbus::{
 pub use eventloop::EventLoopId;
 pub use streams::{PipeOptions, pipe_to, pipe_to_with};
 pub use task::{TaskAbortHandle, TaskHandle, TaskId};
+pub use tcp::{TcpConnection, TcpIncoming, TcpServer, TcpServerOptions};
 pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};
 pub use verticle::{Verticle, WorkerVerticle};

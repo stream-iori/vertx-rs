@@ -24,6 +24,10 @@ mod shutdown;
 mod streams;
 #[path = "integration/support.rs"]
 mod support;
+#[path = "integration/tcp.rs"]
+mod tcp;
+#[path = "integration/tcp_service.rs"]
+mod tcp_service;
 #[path = "integration/timers.rs"]
 mod timers;
 #[path = "integration/tracing_propagation.rs"]

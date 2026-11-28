@@ -32,6 +32,7 @@ impl Vertx {
         // Cancellation and task submission can wake code that reenters Vertx.
         let shared = &self.inner.shared;
         shared.diagnostics.close_stage(CloseStage::Deployments);
+        shared.tcp.close_admission();
         shared.cancel.cancel();
         shared.event_bus.close();
         for scope in &scopes {

@@ -153,6 +153,7 @@ impl<'a> Lifecycle<'a> {
             .inner
             .event_bus
             .unregister_deployment(scope.deployment);
+        self.ctx.inner.tcp.unregister_deployment(scope.deployment);
         scope.drain_tasks(self.ctx.inner.shutdown_grace).await;
         scope.wait_blocking().await;
     }

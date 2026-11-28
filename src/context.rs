@@ -37,6 +37,7 @@ pub(crate) type ExceptionHandler = Arc<dyn Fn(&VertxError) + Send + Sync>;
 pub(crate) struct ContextShared {
     pub diagnostics: Arc<Diagnostics>,
     pub event_bus: EventBus,
+    pub tcp: crate::tcp::TcpListeners,
     pub event_loops: Arc<EventLoopPool>,
     pub workers: Arc<WorkerPool>,
     pub vertx: Weak<VertxInner>,
