@@ -52,7 +52,8 @@ impl VertxBuilder {
     }
     /// Creates an instance, joining startup threads before returning a failure.
     ///
-    /// Zero thread counts or shutdown grace return [`VertxError::InvalidOptions`].
+    /// Zero thread counts, zero shutdown grace, and thread counts whose pool
+    /// storage cannot be reserved return [`VertxError::InvalidOptions`].
     /// Runtime/thread creation errors return [`VertxError::Other`] with the failed
     /// stage and underlying error text. Rollback errors are retained in
     /// [`VertxError::LifecycleFailed`]. No business work runs during rollback.
@@ -131,7 +132,8 @@ impl VertxBuilder {
 #[cfg(test)]
 mod tests {
     use crate::eventloop::EventLoopPool;
-    use crate::{Vertx, VertxError};
+    use crate::worker_pool::WorkerPool;
+    use crate::{Result, Vertx, VertxError};
     use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -168,12 +170,47 @@ mod tests {
     }
 
     #[test]
+    fn oversized_event_loop_pool_is_rejected_before_starting_threads() {
+        let result = Vertx::builder()
+            .event_loop_threads(usize::MAX)
+            .build_with_pools(
+                |count, instance| {
+                    EventLoopPool::with_runtime_factory(count, instance, |_| {
+                        panic!("oversized pool must not start event loops")
+                    })
+                },
+                |_, _| panic!("oversized EventLoop pool must not start workers"),
+            );
+        assert!(
+            matches!(result, Err(VertxError::InvalidOptions(message)) if message.contains("EventLoop"))
+        );
+    }
+
+    #[test]
     fn worker_initialization_failure_joins_event_loops_before_returning() {
+        let error = build_with_worker_failure(1, |_, _| {
+            Err(VertxError::Other("injected worker pool failure".into()))
+        });
+        assert!(
+            matches!(error, VertxError::Other(message) if message == "injected worker pool failure")
+        );
+    }
+
+    #[test]
+    fn oversized_worker_pool_joins_event_loops_before_returning() {
+        let error = build_with_worker_failure(usize::MAX, WorkerPool::new);
+        assert!(matches!(error, VertxError::InvalidOptions(message) if message.contains("Worker")));
+    }
+
+    fn build_with_worker_failure(
+        worker_threads: usize,
+        start_workers: impl FnOnce(usize, u64) -> Result<WorkerPool>,
+    ) -> VertxError {
         let exited = Arc::new(AtomicUsize::new(0));
         let probe = exited.clone();
-        let result = Vertx::builder()
+        let error = Vertx::builder()
             .event_loop_threads(2)
-            .worker_threads(1)
+            .worker_threads(worker_threads)
             .build_with_pools(
                 move |count, instance| {
                     EventLoopPool::with_runtime_factory(count, instance, move |_| {
@@ -183,15 +220,15 @@ mod tests {
                             .build()
                     })
                 },
-                |_, _| Err(VertxError::Other("injected worker pool failure".into())),
-            );
-        assert!(
-            matches!(result, Err(VertxError::Other(message)) if message == "injected worker pool failure")
-        );
+                start_workers,
+            )
+            .err()
+            .expect("initializing workers must fail");
         assert_eq!(
             exited.load(Ordering::SeqCst),
             2,
             "build must join startup threads before returning"
         );
+        error
     }
 }

@@ -85,7 +85,7 @@ impl Vertx {
 
     /// Creates an instance using default pool sizes and shutdown grace.
     /// Returns a construction error after joining any threads created during startup.
-    pub fn new() -> Result<Self> {
+    pub fn try_new() -> Result<Self> {
         Self::builder().build()
     }
     /// Starts configuration without creating threads.

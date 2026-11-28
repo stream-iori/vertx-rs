@@ -41,11 +41,18 @@ impl EventLoopPool {
     where
         F: Fn(usize) -> std::io::Result<Runtime> + Send + Sync + 'static,
     {
-        let runtime_factory = Arc::new(runtime_factory);
         assert!(size > 0, "event loop pool size must be > 0");
+        let reserve_error = |error| {
+            VertxError::InvalidOptions(format!("cannot reserve {size} EventLoop slots: {error}"))
+        };
+        let mut loops = Vec::new();
+        loops.try_reserve_exact(size).map_err(reserve_error)?;
+        let mut handles = Vec::new();
+        handles.try_reserve_exact(size).map_err(reserve_error)?;
+        let runtime_factory = Arc::new(runtime_factory);
         let mut pool = Self {
-            loops: Vec::with_capacity(size),
-            handles: Mutex::new(Vec::with_capacity(size)),
+            loops,
+            handles: Mutex::new(handles),
             instance,
             rr: AtomicUsize::new(0),
         };

@@ -23,9 +23,12 @@ pub(crate) struct WorkerPool {
 impl WorkerPool {
     pub fn new(threads: usize, instance: u64) -> Result<Self> {
         assert!(threads > 0, "worker thread count must be > 0");
+        let mut handles = Vec::new();
+        handles.try_reserve_exact(threads).map_err(|error| {
+            VertxError::InvalidOptions(format!("cannot reserve {threads} Worker slots: {error}"))
+        })?;
         let scheduler = Arc::new(Scheduler::new(instance));
         let exited = Arc::new(Notify::new());
-        let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let worker = scheduler.clone();
             let exit = exited.clone();
