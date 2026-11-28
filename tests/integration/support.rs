@@ -99,7 +99,7 @@ pub(super) async fn echo(vx: &Vertx, address: &'static str) -> vertx_rs::Deploym
         local(move |ctx| async move {
             ctx.event_bus()
                 .consumer::<String>(address)?
-                .handler(|env| async move {
+                .handler(async |env| {
                     let body = env.body().clone();
                     env.reply(body)
                 })

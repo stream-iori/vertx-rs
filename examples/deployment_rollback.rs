@@ -19,7 +19,7 @@ impl Verticle for Instance {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
             .consumer::<()>("batch")?
-            .handler(|_| async { Ok(()) })?;
+            .handler(async |_| Ok(()))?;
         if self.fail {
             return Err(VertxError::StartFailed(format!(
                 "instance {} rejected configuration",

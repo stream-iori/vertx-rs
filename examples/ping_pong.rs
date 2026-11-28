@@ -34,30 +34,27 @@ impl Verticle for Pinger {
         })?;
         ctx.event_bus()
             .consumer::<String>("ping")?
-            .handler(move |env| {
-                let (ctx, count) = (ctx.clone(), count.clone());
-                async move {
-                    assert_eq!(std::thread::current().id(), thread);
-                    assert_eq!(Context::current().unwrap().id(), ctx.id());
-                    if env.body() == "fail" {
-                        return env.fail(400, "invalid ping");
-                    }
-                    if env.body() == "slow" {
-                        ctx.timer(Duration::from_millis(40))?.await?;
-                        // 请求方已超时，迟到回复是可预期的 ReplyClosed。
-                        assert!(matches!(
-                            env.reply("late".to_owned()),
-                            Err(VertxError::ReplyClosed)
-                        ));
-                        return Ok(());
-                    }
-                    assert_eq!(env.headers().get("caller"), Some("example"));
-                    count.set(count.get() + 1);
-                    env.reply_with(
-                        format!("pong#{}", count.get()),
-                        DeliveryOptions::new().header("served-by", ctx.id().to_string()),
-                    )
+            .handler(async move |env| {
+                assert_eq!(std::thread::current().id(), thread);
+                assert_eq!(Context::current().unwrap().id(), ctx.id());
+                if env.body() == "fail" {
+                    return env.fail(400, "invalid ping");
                 }
+                if env.body() == "slow" {
+                    ctx.timer(Duration::from_millis(40))?.await?;
+                    // 请求方已超时，迟到回复是可预期的 ReplyClosed。
+                    assert!(matches!(
+                        env.reply("late".to_owned()),
+                        Err(VertxError::ReplyClosed)
+                    ));
+                    return Ok(());
+                }
+                assert_eq!(env.headers().get("caller"), Some("example"));
+                count.set(count.get() + 1);
+                env.reply_with(
+                    format!("pong#{}", count.get()),
+                    DeliveryOptions::new().header("served-by", ctx.id().to_string()),
+                )
             })
     }
     async fn stop(&mut self, ctx: Context) -> Result<()> {

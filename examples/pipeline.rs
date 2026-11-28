@@ -43,18 +43,15 @@ impl Verticle for Hasher {
         let salt = self.salt;
         ctx.event_bus()
             .consumer_with::<u64>("hash", ConsumerOptions::new().with_capacity(1))?
-            .handler(move |env| {
-                let ctx = ctx.clone();
-                async move {
-                    let seed = env.into_body();
-                    // 两个 Future 同时等待：有序与无序 blocking 都进同一个固定 Worker 池。
-                    let (ordered, unordered) = futures::try_join!(
-                        ctx.execute_blocking(move || checksum(seed ^ salt)),
-                        ctx.execute_blocking_unordered(move || checksum(seed ^ salt)),
-                    )?;
-                    assert_eq!(ordered, unordered);
-                    ctx.event_bus().send("sink", (seed, ordered)).await
-                }
+            .handler(async move |env| {
+                let seed = env.into_body();
+                // 两个 Future 同时等待：有序与无序 blocking 都进同一个固定 Worker 池。
+                let (ordered, unordered) = futures::try_join!(
+                    ctx.execute_blocking(move || checksum(seed ^ salt)),
+                    ctx.execute_blocking_unordered(move || checksum(seed ^ salt)),
+                )?;
+                assert_eq!(ordered, unordered);
+                ctx.event_bus().send("sink", (seed, ordered)).await
             })
     }
 }

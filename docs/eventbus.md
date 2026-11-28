@@ -39,7 +39,8 @@ Headers 按插入顺序保存，键大小写敏感且可重复。`get` 返回第
 - Context::event_bus 注册始终绑定该 Context。
 - Vertx::event_bus 在框架外注册为 unbound；在本实例的 Context 中注册时自动绑定当前 Context。
 - 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
-- handler 接受本地 !Send 闭包；handler_worker 要求 Send 闭包及 Future。都校验调用 Context。
+- `handler` 在所属 EventLoop 逐条等待异步闭包完成。用 `async move |env|` 把状态交给回调，同一个回调可反复调用，也可以跨 `.await` 可变借用自己持有的 `!Send` 状态。
+- `handler_worker` 使用 `FnMut -> Future`，闭包和返回的 Future 都要求 `Send`。两个入口都校验调用 Context。
 - EventBus 路由表拥有订阅和队列。绑定消费者在部署作用域登记地址和注册 ID，生命周期可以按登记准确注销。
 - 绑定部署时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
 - 撤销部署只处理属于它的登记。关闭 EventBus 清除所有路由，包括框架外的注册。发送始终按地址查表。

@@ -44,7 +44,7 @@ fn main() {
 E: FnOnce(usize, u64) -> Result<EventLoopPool>,
 ```
 
-两个参数分别是线程数和 Vertx 实例 ID。构建器最多调用一次 `event_loops(el, instance)`，一次就创建整个池。池再按线程数启动各个 EventLoop。[构建器与调用点](../src/vertx.rs#L639) · [测试中的工厂](../src/vertx.rs#L733)
+两个参数分别是线程数和 Vertx 实例 ID。构建器最多调用一次 `event_loops(loop_count, instance)`，一次就创建整个池。池再按线程数启动各个 EventLoop。 [构建器与调用点](../src/vertx/builder.rs#L74) · [测试中的工厂](../src/vertx/builder.rs#L173)
 
 测试把一个共享的 `probe` 交给池内部的初始化闭包。下面是这个所有权关系的可运行简化例子：
 
@@ -73,3 +73,19 @@ fn main() {
     // once_factory(); // 工厂已被消费
 }
 ```
+
+## EventBus 什么时候用 AsyncFnMut
+
+`Consumer::handler` 用 `AsyncFnMut` 接收本地异步闭包。每条消息处理完才接收下一条，所以同一个回调可以把自己持有的状态可变借给当前 Future。
+
+```rust
+let mut count = 0u64;
+ctx.event_bus().consumer::<()>("count")?.handler(async move |env| {
+    let count = &mut count;
+    tokio::task::yield_now().await;
+    *count += 1;
+    env.reply(*count)
+})?;
+```
+
+`handler_worker` 用 `FnMut(Envelope<T>) -> Fut` 表达两条独立约束，闭包本身和每次调用返回的 `Fut` 都必须是 `Send`。 [EventBus 文档](../docs/eventbus.md#归属与竞态)

@@ -17,14 +17,16 @@ async fn rc_refcell_shared_state_across_handlers(vx: Vertx) {
             let a = values.clone();
             ctx.event_bus()
                 .consumer::<u32>("put")?
-                .handler(move |env| {
+                .handler(async move |env| {
                     a.borrow_mut().push(*env.body());
-                    async move { env.reply(()) }
+                    env.reply(())
                 })?;
-            ctx.event_bus().consumer::<()>("get")?.handler(move |env| {
-                let n = values.borrow().len();
-                async move { env.reply(n) }
-            })
+            ctx.event_bus()
+                .consumer::<()>("get")?
+                .handler(async move |env| {
+                    let n = values.borrow().len();
+                    env.reply(n)
+                })
         })
     })
     .await
@@ -46,14 +48,16 @@ async fn rc_cell_shared_scalar_across_handlers(vx: Vertx) {
             let a = value.clone();
             ctx.event_bus()
                 .consumer::<u32>("put")?
-                .handler(move |env| {
+                .handler(async move |env| {
                     a.set(*env.body());
-                    async move { env.reply(()) }
+                    env.reply(())
                 })?;
-            ctx.event_bus().consumer::<()>("get")?.handler(move |env| {
-                let n = value.get();
-                async move { env.reply(n) }
-            })
+            ctx.event_bus()
+                .consumer::<()>("get")?
+                .handler(async move |env| {
+                    let n = value.get();
+                    env.reply(n)
+                })
         })
     })
     .await
@@ -76,9 +80,9 @@ async fn arc_atomic_counter_shared_across_verticles(vx: Vertx) {
             local(move |ctx| async move {
                 ctx.event_bus()
                     .consumer::<()>("count")?
-                    .handler(move |env| {
+                    .handler(async move |env| {
                         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
-                        async move { env.reply(n) }
+                        env.reply(n)
                     })
             })
         })
@@ -107,9 +111,9 @@ async fn arc_immutable_snapshot_shared_across_verticles(vx: Vertx) {
             local(move |ctx| async move {
                 ctx.event_bus()
                     .consumer::<()>("snapshot")?
-                    .handler(move |env| {
+                    .handler(async move |env| {
                         let values = (*snapshot).clone();
-                        async move { env.reply(values) }
+                        env.reply(values)
                     })
             })
         })

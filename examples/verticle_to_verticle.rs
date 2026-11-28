@@ -26,7 +26,7 @@ impl Verticle for Upper {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
             .consumer::<String>("upper")?
-            .handler(|env| async move {
+            .handler(async |env| {
                 let response = env.body().to_uppercase();
                 allow_late_reply(env.reply(response))
             })
@@ -37,7 +37,7 @@ impl Verticle for Reject {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
             .consumer::<String>("reject")?
-            .handler(|env| async move { allow_late_reply(env.fail(503, "service unavailable")) })
+            .handler(async |env| allow_late_reply(env.fail(503, "service unavailable")))
     }
 }
 struct Caller {
@@ -46,9 +46,8 @@ struct Caller {
 impl Verticle for Caller {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let bus = ctx.event_bus();
-        bus.consumer::<String>("caller")?.handler(move |env| {
-            let bus = bus.clone();
-            async move {
+        bus.consumer::<String>("caller")?
+            .handler(async move |env| {
                 let candidates = ["reject", "upper"].into_iter().map(|address| {
                     bus.request_with::<_, String>(
                         address,
@@ -60,8 +59,7 @@ impl Verticle for Caller {
                 let (response, remaining) = select_ok(candidates).await?;
                 drop(remaining);
                 env.reply(response)
-            }
-        })?;
+            })?;
         self.context
             .take()
             .expect("start is called once")

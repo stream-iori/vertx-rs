@@ -308,14 +308,11 @@ async fn handler_destructor_uses_message_dispatch_even_when_consumer_has_another
             let id = ctx.id();
             ctx.event_bus()
                 .consumer::<()>("drop-trace")?
-                .handler(move |_| {
-                    let send = send.take();
-                    async move {
-                        let _probe = DropProbe(id);
-                        send.unwrap().send(()).ok();
-                        futures::future::pending::<()>().await;
-                        Ok(())
-                    }
+                .handler(async move |_| {
+                    let _probe = DropProbe(id);
+                    send.take().unwrap().send(()).ok();
+                    futures::future::pending::<()>().await;
+                    Ok(())
                 })
         })
     })
@@ -346,7 +343,7 @@ async fn message_span_names_receiving_context_separately_from_sender_ancestry(vx
             send.send(id).ok();
             ctx.event_bus()
                 .consumer::<()>("trace-hop")?
-                .handler(move |env| async move {
+                .handler(async move |env| {
                     assert_eq!(Context::current().unwrap().id(), id);
                     tracing::info!("receiver execution probe");
                     env.reply(())

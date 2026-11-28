@@ -89,7 +89,7 @@ async fn exception_handler_receives_handler_errors(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<()>("error")?
-                .handler(|_| async { Err(VertxError::Other("expected".into())) })
+                .handler(async |_| Err(VertxError::Other("expected".into())))
         })
     })
     .await
@@ -203,7 +203,7 @@ async fn context_exception_handler_can_clear_itself_without_deadlock(vx: Vertx) 
             });
             ctx.event_bus()
                 .consumer::<()>("fail")?
-                .handler(|_| async { Err(VertxError::Other("error".into())) })
+                .handler(async |_| Err(VertxError::Other("error".into())))
         })
     })
     .await

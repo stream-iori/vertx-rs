@@ -1,11 +1,15 @@
-use super::envelope::ErasedEnvelope;
+use super::envelope::{ErasedEnvelope, MessageTrace};
 use super::queue::QueueState;
 use super::route::{Registration, SubscriptionRegistration};
+use crate::error::panic_error;
+use crate::task::TracedFuture;
 use crate::{Context, Envelope, Result, VertxError};
 use futures::stream::FusedStream;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::ops::AsyncFnMut;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -67,7 +71,8 @@ impl<T: Send + 'static> Consumer<T> {
         ctx.ensure_alive()?;
         Ok(ctx)
     }
-    /// Attach a non-Send handler on its owning EventLoop.
+    /// Attach an async handler on its owning EventLoop. Messages are processed
+    /// one at a time, so the handler can borrow its captured state across await.
     ///
     /// ```
     /// # use vertx_rs::{Context, Result, Verticle};
@@ -75,20 +80,26 @@ impl<T: Send + 'static> Consumer<T> {
     /// # impl Verticle for Example {
     /// # async fn start(&mut self, ctx: Context) -> Result<()> {
     /// let mut count = 0u64;
-    /// ctx.event_bus().consumer::<()>("count")?.handler(move |env| {
-    ///     count += 1;
-    ///     async move { env.reply(count) }
+    /// ctx.event_bus().consumer::<()>("count")?.handler(async move |env| {
+    ///     let count = &mut count;
+    ///     tokio::task::yield_now().await;
+    ///     *count += 1;
+    ///     env.reply(*count)
     /// })?;
     /// # Ok(()) } }
     /// ```
-    pub fn handler<F, Fut>(self, handler: F) -> Result<()>
-    where
-        F: FnMut(Envelope<T>) -> Fut + 'static,
-        Fut: Future<Output = Result<()>> + 'static,
-    {
+    pub fn handler(
+        mut self,
+        mut handler: impl AsyncFnMut(Envelope<T>) -> Result<()> + 'static,
+    ) -> Result<()> {
         let ctx = self.handler_context()?;
         ctx.check_local()?;
-        ctx.spawn_local(self.dispatch_messages(ctx.clone(), handler))?;
+        ctx.clone().spawn_local(async move {
+            while let Some(env) = self.next_for_handler(&ctx).await {
+                dispatch_message(&ctx, env.trace.clone(), async { handler(env).await }).await;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
     /// Worker counterpart; the closure and its future must be Send.
@@ -105,7 +116,19 @@ impl<T: Send + 'static> Consumer<T> {
     ///     }
     /// }
     /// ```
-    pub fn handler_worker<F, Fut>(self, handler: F) -> Result<()>
+    ///
+    /// ```compile_fail,E0277
+    /// use vertx_rs::{Consumer, Result};
+    ///
+    /// fn register(consumer: Consumer<()>) -> Result<()> {
+    ///     consumer.handler_worker(|env| async move {
+    ///         let value = std::rc::Rc::new(1u32);
+    ///         tokio::task::yield_now().await;
+    ///         env.reply(*value)
+    ///     })
+    /// }
+    /// ```
+    pub fn handler_worker<F, Fut>(mut self, mut handler: F) -> Result<()>
     where
         F: FnMut(Envelope<T>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -114,36 +137,35 @@ impl<T: Send + 'static> Consumer<T> {
         if !ctx.is_worker() {
             return Err(VertxError::ContextMismatch);
         }
-        ctx.spawn(self.dispatch_messages(ctx.clone(), handler))?;
+        ctx.clone().spawn(async move {
+            while let Some(env) = self.next_for_handler(&ctx).await {
+                // Defer the closure call to the traced poll as it can panic.
+                dispatch_message(&ctx, env.trace.clone(), async { handler(env).await }).await;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
-    // Concrete captures determine Send: local handlers remain free to use !Send
-    // state while Worker handlers are checked by Context::spawn.
-    async fn dispatch_messages<F, Fut>(mut self, ctx: Context, mut handler: F) -> Result<()>
-    where
-        F: FnMut(Envelope<T>) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        while let Some(env) = self.next_for_handler(&ctx).await {
-            let trace = env.trace.clone();
-            let handler_span = trace.handler_span(&ctx);
-            // Catch each message separately so one panic does not kill the consumer.
-            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                crate::task::TracedFuture::new(
-                    async { handler(env).await },
-                    trace.dispatch.clone(),
-                    handler_span.clone(),
-                ),
-            ))
-            .await
-            .unwrap_or_else(|error| Err(crate::error::panic_error(error)));
-            if let Err(error) = result {
-                tracing::dispatcher::with_default(&trace.dispatch, || {
-                    handler_span.in_scope(|| ctx.report_error(&error))
-                });
-            }
-        }
-        Ok(())
+}
+
+async fn dispatch_message(
+    ctx: &Context,
+    trace: MessageTrace,
+    future: impl Future<Output = Result<()>>,
+) {
+    let span = trace.handler_span(ctx);
+    let result = AssertUnwindSafe(TracedFuture::new(
+        future,
+        trace.dispatch.clone(),
+        span.clone(),
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|error| Err(panic_error(error)));
+    if let Err(error) = result {
+        tracing::dispatcher::with_default(&trace.dispatch, || {
+            span.in_scope(|| ctx.report_error(&error))
+        });
     }
 }
 // T is only a type marker; no pinned T lives in this struct. The cancellation

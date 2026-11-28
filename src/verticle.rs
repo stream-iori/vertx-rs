@@ -10,13 +10,10 @@ use std::future::{Future, ready};
 /// impl Verticle for Service {
 ///     async fn start(&mut self, ctx: Context) -> Result<()> {
 ///         let prefix = self.0.clone();
-///         ctx.event_bus().consumer::<String>("greet")?.handler(move |message| {
-///             let prefix = prefix.clone();
-///             async move {
-///                 tokio::task::yield_now().await;
-///                 let greeting = format!("{prefix} {}", message.body());
-///                 message.reply(greeting)
-///             }
+///         ctx.event_bus().consumer::<String>("greet")?.handler(async move |message| {
+///             tokio::task::yield_now().await;
+///             let greeting = format!("{prefix} {}", message.body());
+///             message.reply(greeting)
 ///         })
 ///     }
 /// }

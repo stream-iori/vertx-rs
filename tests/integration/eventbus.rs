@@ -2,11 +2,12 @@
 
 use super::support::{capture, echo, local, vx};
 use rstest::rstest;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{DeliveryOptions, RequestOptions, Vertx, VertxError};
+use vertx_rs::{Context, DeliveryOptions, RequestOptions, Vertx, VertxError};
 
 #[rstest]
 #[tokio::test]
@@ -15,12 +16,9 @@ async fn verticles_communicate_through_their_bound_buses(vx: Vertx) {
     vx.deploy(|_| {
         local(|ctx| async move {
             let bus = ctx.event_bus();
-            bus.consumer::<String>("caller")?.handler(move |env| {
-                let bus = bus.clone();
-                async move {
-                    let response: String = bus.request("upstream", env.body().clone()).await?;
-                    env.reply(response)
-                }
+            bus.consumer::<String>("caller")?.handler(async move |env| {
+                let response: String = bus.request("upstream", env.body().clone()).await?;
+                env.reply(response)
             })
         })
     })
@@ -198,17 +196,14 @@ async fn message_passing_between_handlers(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<u32>("double")?
-                .handler(|env| async move {
+                .handler(async |env| {
                     let n = *env.body() * 2;
                     env.reply(n)
                 })?;
             let bus = ctx.event_bus();
-            bus.consumer::<u32>("forward")?.handler(move |env| {
-                let bus = bus.clone();
-                async move {
-                    let n: u32 = bus.request("double", *env.body()).await?;
-                    env.reply(n)
-                }
+            bus.consumer::<u32>("forward")?.handler(async move |env| {
+                let n: u32 = bus.request("double", *env.body()).await?;
+                env.reply(n)
             })
         })
     })
@@ -231,7 +226,7 @@ async fn delivery_options_headers_round_trip(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<()>("headers")?
-                .handler(|env| async move {
+                .handler(async |env| {
                     assert_eq!(
                         env.headers().get_all("tag").collect::<Vec<_>>(),
                         vec!["a", "b"]
@@ -289,7 +284,7 @@ async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<()>("business")?
-                .handler(|env| async { env.fail(409, "conflict") })
+                .handler(async |env| env.fail(409, "conflict"))
         })
     })
     .await
@@ -377,37 +372,37 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
         .build()
         .unwrap();
     let (entered, started) = oneshot::channel();
-    let mut entered = Some(entered);
     let (release, wait) = oneshot::channel();
-    let mut wait = Some(wait);
     let (done, finished) = oneshot::channel();
-    let mut done = Some(done);
-    let order = Arc::new(Mutex::new(Vec::new()));
-    let recorded = order.clone();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let observed = seen.clone();
     vx.deploy(move |_| {
         local(move |ctx| async move {
+            let mut first = Some((entered, wait));
+            let mut done = Some(done);
+            let mut history = Vec::<Rc<u8>>::new();
+            let context_id = ctx.id();
+            let thread = std::thread::current().id();
             ctx.event_bus()
                 .consumer::<u8>("serial-future")?
-                .handler(move |env| {
-                    let wait = if *env.body() == 1 { wait.take() } else { None };
-                    let entered = entered.take();
-                    let done = if *env.body() == 2 { done.take() } else { None };
-                    let order = recorded.clone();
-                    async move {
-                        let value = *env.body();
-                        order.lock().unwrap().push(value);
-                        if let Some(entered) = entered {
-                            entered.send(()).ok();
-                        }
-                        if let Some(wait) = wait {
-                            wait.await.unwrap();
-                        }
-                        if let Some(done) = done {
-                            done.send(()).ok();
-                            Ok(())
-                        } else {
-                            env.reply(value)
-                        }
+                .handler(async move |env| {
+                    assert_eq!(Context::current().unwrap().id(), context_id);
+                    assert_eq!(std::thread::current().id(), thread);
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let history = &mut history;
+                    history.push(Rc::new(*env.body()));
+                    if let Some((entered, wait)) = first.take() {
+                        entered.send(()).unwrap();
+                        wait.await.unwrap();
+                    }
+                    assert_eq!(Context::current().unwrap().id(), context_id);
+                    assert_eq!(std::thread::current().id(), thread);
+                    if *env.body() == 1 {
+                        env.reply(**history.last().unwrap())
+                    } else {
+                        let values = history.iter().map(|value| **value).collect::<Vec<_>>();
+                        done.take().unwrap().send(values).unwrap();
+                        Ok(())
                     }
                 })
         })
@@ -422,11 +417,10 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
     bus.send("serial-future", 2u8).await.unwrap();
     let (_, ctx) = capture(&vx).await;
     ctx.spawn(async { Ok(()) }).unwrap().await.unwrap();
-    assert_eq!(*order.lock().unwrap(), vec![1]);
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
     release.send(()).unwrap();
     assert_eq!(first.await.unwrap().unwrap(), 1);
-    finished.await.unwrap();
-    assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    assert_eq!(finished.await.unwrap(), [1, 2]);
     vx.close().await.unwrap();
 }
 

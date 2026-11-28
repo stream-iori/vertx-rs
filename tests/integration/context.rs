@@ -62,17 +62,14 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
             let (samples, count) = (self.samples.clone(), self.non_send.clone());
             ctx.event_bus()
                 .consumer::<()>("affinity")?
-                .handler(move |env| {
-                    let (samples, count) = (samples.clone(), count.clone());
-                    async move {
-                        samples.lock().unwrap().push(std::thread::current().id());
-                        tokio::task::yield_now().await;
-                        let ctx = Context::current().unwrap();
-                        ctx.execute_blocking(|| 42).await?;
-                        samples.lock().unwrap().push(std::thread::current().id());
-                        count.set(count.get() + 1);
-                        env.reply(count.get())
-                    }
+                .handler(async move |env| {
+                    samples.lock().unwrap().push(std::thread::current().id());
+                    tokio::task::yield_now().await;
+                    let ctx = Context::current().unwrap();
+                    ctx.execute_blocking(|| 42).await?;
+                    samples.lock().unwrap().push(std::thread::current().id());
+                    count.set(count.get() + 1);
+                    env.reply(count.get())
                 })
         }
         async fn stop(&mut self, _: Context) -> Result<()> {
@@ -120,11 +117,13 @@ async fn verticle_can_hold_non_send_state_directly(vx: Vertx) {
     vx.deploy(|_| {
         local(|ctx| async move {
             let count = Cell::new(0u64);
-            ctx.event_bus().consumer::<()>("inc")?.handler(move |env| {
-                count.set(count.get() + 1);
-                let n = count.get();
-                async move { env.reply(n) }
-            })
+            ctx.event_bus()
+                .consumer::<()>("inc")?
+                .handler(async move |env| {
+                    count.set(count.get() + 1);
+                    let n = count.get();
+                    env.reply(n)
+                })
         })
     })
     .await
@@ -219,7 +218,7 @@ async fn two_contexts_on_one_event_loop_never_leak_identity() {
                 let id = ctx.deployment_id();
                 ctx.event_bus()
                     .consumer::<()>(address)?
-                    .handler(move |env| async move {
+                    .handler(async move |env| {
                         for _ in 0..100 {
                             tokio::task::yield_now().await;
                             assert_eq!(Context::current().unwrap().deployment_id(), id);
@@ -280,7 +279,7 @@ async fn spawn_local_rejects_other_context_even_on_same_thread() {
                 other
                     .event_bus()
                     .consumer::<()>("wrong")?
-                    .handler(|_| async { Ok(()) }),
+                    .handler(async |_| { Ok(()) }),
                 Err(VertxError::ContextMismatch)
             ));
             let id = ctx.deployment_id();

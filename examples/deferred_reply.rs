@@ -15,29 +15,26 @@ impl Verticle for Transformer {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
             .consumer::<String>("transform")?
-            .handler(move |env| {
-                let ctx = ctx.clone();
-                async move {
-                    let (body, headers, reply) = env.into_parts();
-                    let reply = reply
-                        .ok_or_else(|| VertxError::Other("transform requires a request".into()))?;
-                    // Headers/reply 不会自动转发，应用明确选择需要返回的关联字段。
-                    let correlation = headers
-                        .get("correlation-id")
-                        .map(str::to_owned)
-                        .ok_or_else(|| VertxError::Other("missing correlation-id".into()))?;
-                    let task_ctx = ctx.clone();
-                    ctx.spawn_local(async move {
-                        let response = task_ctx
-                            .execute_blocking_unordered(move || transform(&body))
-                            .await?;
-                        reply.reply_with(
-                            response,
-                            DeliveryOptions::new().header("correlation-id", correlation),
-                        )
-                    })?;
-                    Ok(())
-                }
+            .handler(async move |env| {
+                let (body, headers, reply) = env.into_parts();
+                let reply = reply
+                    .ok_or_else(|| VertxError::Other("transform requires a request".into()))?;
+                // Headers/reply 不会自动转发，应用明确选择需要返回的关联字段。
+                let correlation = headers
+                    .get("correlation-id")
+                    .map(str::to_owned)
+                    .ok_or_else(|| VertxError::Other("missing correlation-id".into()))?;
+                let task_ctx = ctx.clone();
+                ctx.spawn_local(async move {
+                    let response = task_ctx
+                        .execute_blocking_unordered(move || transform(&body))
+                        .await?;
+                    reply.reply_with(
+                        response,
+                        DeliveryOptions::new().header("correlation-id", correlation),
+                    )
+                })?;
+                Ok(())
             })
     }
 }

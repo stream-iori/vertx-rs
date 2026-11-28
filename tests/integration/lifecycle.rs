@@ -268,9 +268,9 @@ async fn deploy_with_instances_and_typed_config(vx: Vertx) {
                 local(move |ctx| async move {
                     ctx.event_bus()
                         .consumer::<String>("configured")?
-                        .handler(move |env| {
+                        .handler(async move |env| {
                             let body = format!("{}:{}", cfg, env.body());
-                            async move { env.reply(body) }
+                            env.reply(body)
                         })
                 })
             },
@@ -301,7 +301,7 @@ async fn start_failure_and_factory_panic_clean_resources(vx: Vertx) {
             local(|ctx| async move {
                 ctx.event_bus()
                     .consumer::<()>("failed")?
-                    .handler(|_| async { Ok(()) })?;
+                    .handler(async |_| Ok(()))?;
                 Err(VertxError::StartFailed("expected".into()))
             })
         })
@@ -400,7 +400,7 @@ async fn cancellation_of_pending_deploy_cleans_startup(vx: Vertx) {
             local(move |ctx| async move {
                 ctx.event_bus()
                     .consumer::<()>("startup")?
-                    .handler(|_| async { Ok(()) })?;
+                    .handler(async |_| Ok(()))?;
                 tx.send(ctx).ok();
                 std::future::pending::<Result<()>>().await
             })
@@ -429,7 +429,7 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
                     }
                     ctx.event_bus()
                         .consumer::<()>("group")?
-                        .handler(|_| async { Ok(()) })
+                        .handler(async |_| Ok(()))
                 })
             },
             DeploymentOptions::new().instances(NonZeroUsize::new(3).unwrap()),
@@ -461,15 +461,14 @@ async fn undeploy_waits_for_inflight_handler_to_be_dropped(vx: Vertx) {
         .deploy(move |_| {
             local(move |ctx| async move {
                 let mut start = Some(started_tx);
-                ctx.event_bus().consumer::<()>("hang")?.handler(move |_| {
-                    let start = start.take().unwrap();
-                    let guard = OnDrop(d.clone());
-                    async move {
-                        let _guard = guard;
+                ctx.event_bus()
+                    .consumer::<()>("hang")?
+                    .handler(async move |_| {
+                        let start = start.take().unwrap();
+                        let _guard = OnDrop(d.clone());
                         start.send(()).ok();
                         std::future::pending::<Result<()>>().await
-                    }
-                })
+                    })
             })
         })
         .await
@@ -517,7 +516,7 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
                 local(move |ctx| async move {
                     ctx.event_bus()
                         .consumer::<()>("cancel-group")?
-                        .handler(|_| async { Ok(()) })?;
+                        .handler(async |_| Ok(()))?;
                     if n == 1 {
                         signal.lock().unwrap().take().unwrap().send(()).ok();
                         std::future::pending::<()>().await;

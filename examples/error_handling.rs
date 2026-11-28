@@ -25,13 +25,11 @@ impl Verticle for Service {
         });
         ctx.event_bus()
             .consumer::<Command>("service")?
-            .handler(|env| async move {
-                match env.body() {
-                    Command::Reject => env.fail(409, "business rejected"),
-                    Command::Error => Err(VertxError::Other("handler error".into())),
-                    Command::Panic => panic!("expected handler panic"),
-                    Command::Health => env.reply("healthy".to_owned()),
-                }
+            .handler(async |env| match env.body() {
+                Command::Reject => env.fail(409, "business rejected"),
+                Command::Error => Err(VertxError::Other("handler error".into())),
+                Command::Panic => panic!("expected handler panic"),
+                Command::Health => env.reply("healthy".to_owned()),
             })?;
         self.ready
             .take()
