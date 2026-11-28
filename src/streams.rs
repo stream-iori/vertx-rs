@@ -2,6 +2,7 @@
 //! are created here; use Context::spawn_local/spawn to manage the transfer.
 use crate::{Result, VertxError};
 use futures::{Sink, Stream};
+use std::future::poll_fn;
 use std::pin::pin;
 
 /// Normal EOF always flushes. By default both success and failure also close
@@ -56,9 +57,9 @@ where
     let mut sink = pin!(sink);
     let mut outcome = async {
         let mut batch = 0;
-        while let Some(item) = futures::future::poll_fn(|cx| source.as_mut().poll_next(cx)).await {
+        while let Some(item) = poll_fn(|cx| source.as_mut().poll_next(cx)).await {
             let item = item?;
-            futures::future::poll_fn(|cx| sink.as_mut().poll_ready(cx)).await?;
+            poll_fn(|cx| sink.as_mut().poll_ready(cx)).await?;
             sink.as_mut().start_send(item)?;
             batch += 1;
             if batch == 64 {
@@ -66,7 +67,7 @@ where
                 // Even always-ready custom streams/sinks must yield to other
                 // Context tasks. This does not require a particular executor.
                 let mut yielded = false;
-                futures::future::poll_fn(|cx| {
+                poll_fn(|cx| {
                     if yielded {
                         std::task::Poll::Ready(())
                     } else {
@@ -79,7 +80,7 @@ where
             }
         }
         tracing::trace!(stage = "flush", "pipe stage");
-        futures::future::poll_fn(|cx| sink.as_mut().poll_flush(cx)).await
+        poll_fn(|cx| sink.as_mut().poll_flush(cx)).await
     }
     .await;
     let close = if outcome.is_ok() {
@@ -89,7 +90,7 @@ where
     };
     if close {
         tracing::trace!(stage = "close", "pipe stage");
-        if let Err(error) = futures::future::poll_fn(|cx| sink.as_mut().poll_close(cx)).await {
+        if let Err(error) = poll_fn(|cx| sink.as_mut().poll_close(cx)).await {
             crate::error::retain_failure(&mut outcome, error);
         }
     }

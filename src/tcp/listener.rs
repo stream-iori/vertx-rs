@@ -432,14 +432,10 @@ impl ListenerRegistration {
                     _ => None,
                 };
             };
-            let member = open.members.get(&self.deployment)?;
-            if member.id != self.id {
-                return None;
-            }
-            let member = open
-                .members
-                .remove(&self.deployment)
-                .expect("member remains registered");
+            let member = match open.members.entry(self.deployment) {
+                Entry::Occupied(entry) if entry.get().id == self.id => entry.remove(),
+                _ => return None,
+            };
             if open.members.is_empty() {
                 let done = CancellationToken::new();
                 let closing = Slot::Closing {
