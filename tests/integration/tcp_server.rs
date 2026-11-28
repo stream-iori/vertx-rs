@@ -209,6 +209,7 @@ async fn timeout_cancels_connections_even_after_shutdown_waiter_is_dropped() {
         })
         .await;
     }
+    server.request_shutdown(GRACE).unwrap();
     tokio::time::timeout(DEADLINE, server.wait_closed())
         .await
         .unwrap()
@@ -218,6 +219,132 @@ async fn timeout_cancels_connections_even_after_shutdown_waiter_is_dropped() {
     );
     assert!(dropped.load(Ordering::SeqCst));
     assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn owning_context_can_request_shutdown_and_an_external_waiter_observes_drain() {
+    let vx = instance();
+    let entered = Arc::new(Semaphore::new(0));
+    let draining = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let (deployment, server) = start(&vx, ephemeral(), options(1), {
+        let entered = entered.clone();
+        let draining = draining.clone();
+        let release = release.clone();
+        move || {
+            async move |mut connection: TcpConnection<'_>| {
+                entered.add_permits(1);
+                connection.shutdown_token().cancelled().await;
+                draining.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                connection.write_u8(42).await.unwrap();
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        server.request_shutdown(Duration::MAX),
+        Err(VertxError::InvalidOptions(_))
+    ));
+    let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
+    tokio::time::timeout(DEADLINE, entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    let owned = server.clone();
+    deployment
+        .spawn(async move {
+            owned.request_shutdown(GRACE)?;
+            assert!(matches!(
+                owned.wait_closed().await,
+                Err(VertxError::WouldDeadlock)
+            ));
+            Ok(())
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    tokio::time::timeout(DEADLINE, draining.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let closed = server.wait_closed();
+    tokio::pin!(closed);
+    assert!(futures::poll!(&mut closed).is_pending());
+
+    release.add_permits(1);
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, client.read_u8())
+            .await
+            .unwrap()
+            .unwrap(),
+        42
+    );
+    tokio::time::timeout(DEADLINE, closed)
+        .await
+        .unwrap()
+        .unwrap();
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_shutdown_timeout_leaves_connection_abort_on_the_event_loop() {
+    let vx = instance();
+    let entered = Arc::new(Semaphore::new(0));
+    let (deployment, server) = start(&vx, ephemeral(), options(1), {
+        let entered = entered.clone();
+        move || {
+            async move |_: TcpConnection<'_>| {
+                entered.add_permits(1);
+                pending().await
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
+    tokio::time::timeout(DEADLINE, entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let (paused, blocking) = oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let owner = deployment
+        .spawn(async move {
+            paused.send(()).ok();
+            resume.recv().ok();
+            Ok(())
+        })
+        .unwrap();
+    tokio::time::timeout(DEADLINE, blocking)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(DEADLINE, server.shutdown(Duration::ZERO)).await;
+    release.send(()).unwrap();
+    assert!(matches!(result.unwrap(), Err(VertxError::ShutdownTimeout(grace)) if grace.is_zero()));
+    owner.await.unwrap();
+
+    tokio::time::timeout(DEADLINE, server.wait_closed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, client.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    drop(std::net::TcpListener::bind(server.local_addr()).unwrap());
     vx.close().await.unwrap();
 }
 

@@ -2,12 +2,13 @@ use super::listener::{PortBudget, PortPermit, TcpIncoming, listen_managed};
 use crate::context::Context;
 use crate::task::ActiveTasks;
 use crate::{ContextId, Result, TaskAbortHandle, TaskId, VertxError};
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFn;
 use std::pin::Pin;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
@@ -116,42 +117,42 @@ impl TcpServer {
         self.control.addr
     }
 
-    /// Stops this registration and signals its connections to drain. The first
-    /// shutdown call sets the deadline. Cancelling a waiter leaves cleanup running.
+    /// Stops accepting and asks in-flight connections to finish without waiting.
+    /// The first successful request sets the drain deadline. This can be called
+    /// in the service's owning Context. Await cleanup with [`Self::wait_closed`]
+    /// from another Context or from outside the runtime.
+    ///
+    /// Returns [`VertxError::InvalidOptions`] if the initial deadline cannot be
+    /// represented. A zero grace requests immediate cancellation of remaining work.
+    pub fn request_shutdown(&self, grace: Duration) -> Result<()> {
+        self.control.request_shutdown(grace).map(|_| ())
+    }
+
+    /// Requests shutdown and waits until the drain deadline set by the first
+    /// successful request. Cancelling a waiter leaves cleanup running.
     /// A timeout requests abort; use [`Self::wait_closed`] to await actual cleanup.
+    /// The owning Context may use [`Self::request_shutdown`] instead of waiting.
     pub async fn shutdown(&self, grace: Duration) -> Result<()> {
         self.check_waiter()?;
-        let drain = {
-            let mut state = self.control.state.lock().unwrap();
-            if let Some(drain) = state.drain {
-                drain
-            } else {
-                let deadline = Instant::now().checked_add(grace).ok_or_else(|| {
-                    VertxError::InvalidOptions("TCP shutdown deadline is out of range".into())
-                })?;
-                let drain = Drain { deadline, grace };
-                state.drain = Some(drain);
-                drain
-            }
-        };
-        self.control.stop.cancel();
+        let drain = self.control.request_shutdown(grace)?;
         match tokio::time::timeout_at(drain.deadline, self.wait_closed()).await {
             Ok(outcome) => {
                 outcome?;
-                if self.control.state.lock().unwrap().forced {
+                if self.control.force.is_cancelled() {
                     Err(VertxError::ShutdownTimeout(drain.grace))
                 } else {
                     Ok(())
                 }
             }
             Err(_) => {
-                self.control.abort_connections();
+                self.control.force.cancel();
                 Err(VertxError::ShutdownTimeout(drain.grace))
             }
         }
     }
 
     /// Waits for the listener registration and the connections to be cleaned up.
+    /// Waiting in the owning Context returns [`VertxError::WouldDeadlock`].
     pub async fn wait_closed(&self) -> Result<()> {
         self.check_waiter()?;
         let mut result = self.control.done.subscribe();
@@ -180,7 +181,7 @@ impl Context {
     ///
     /// The async handler may capture non-Send state and borrows each connection.
     /// Services on the same address share a single limit and must use identical
-    /// options. The deployment tracks the service and every connection task.
+    /// options. The owning scope tracks the service and every connection task.
     pub(crate) async fn serve_tcp<F>(
         &self,
         addr: SocketAddr,
@@ -194,17 +195,19 @@ impl Context {
         let control = Arc::new(Control {
             addr: incoming.local_addr(),
             owner: self.id(),
-            state: Mutex::default(),
+            drain: OnceLock::new(),
             stop: CancellationToken::new(),
+            force: CancellationToken::new(),
             done: watch::channel(None).0,
         });
         let task = ServerTask {
             incoming: Some(incoming),
             handler: Rc::new(handler),
             connections: TaskTracker::new(),
-            completion: Arc::new(Completion {
+            state: Rc::new(ServerState {
                 control: control.clone(),
-                outcome: Mutex::new(Ok(())),
+                children: RefCell::default(),
+                outcome: RefCell::new(Ok(())),
             }),
         };
         self.spawn_local(run_server(self.clone(), task, budget))?;
@@ -216,18 +219,18 @@ struct ConnectionPermit {
     _port: PortPermit,
     _tracked: TaskTrackerToken,
     registration: Option<ConnectionRegistration>,
-    _completion: Arc<Completion>,
+    _state: Rc<ServerState>,
 }
 
 struct ConnectionRegistration {
-    control: Weak<Control>,
+    state: Weak<ServerState>,
     id: TaskId,
 }
 
 impl Drop for ConnectionRegistration {
     fn drop(&mut self) {
-        if let Some(control) = self.control.upgrade() {
-            let handle = control.state.lock().unwrap().children.remove(self.id);
+        if let Some(state) = self.state.upgrade() {
+            let handle = state.children.borrow_mut().remove(self.id);
             drop(handle);
         }
     }
@@ -236,16 +239,10 @@ impl Drop for ConnectionRegistration {
 struct Control {
     owner: ContextId,
     addr: SocketAddr,
-    state: Mutex<State>,
+    drain: OnceLock<Drain>,
     stop: CancellationToken,
+    force: CancellationToken,
     done: watch::Sender<Option<Result<()>>>,
-}
-
-#[derive(Default)]
-struct State {
-    drain: Option<Drain>,
-    forced: bool,
-    children: ActiveTasks,
 }
 
 #[derive(Clone, Copy)]
@@ -255,47 +252,62 @@ struct Drain {
 }
 
 impl Control {
-    fn register(self: &Arc<Self>, id: TaskId) -> Option<ConnectionRegistration> {
-        let mut state = self.state.lock().unwrap();
-        if state.drain.is_some() || state.forced {
+    fn request_shutdown(&self, grace: Duration) -> Result<Drain> {
+        let drain = match self.drain.get() {
+            Some(drain) => *drain,
+            None => {
+                let deadline = Instant::now().checked_add(grace).ok_or_else(|| {
+                    VertxError::InvalidOptions("TCP shutdown deadline is out of range".into())
+                })?;
+                *self.drain.get_or_init(|| Drain { deadline, grace })
+            }
+        };
+        self.stop.cancel();
+        Ok(drain)
+    }
+}
+
+// The accept loop and connection tasks run on this server's EventLoop. A
+// cross-thread shutdown can signal the loop through Control.
+struct ServerState {
+    control: Arc<Control>,
+    children: RefCell<ActiveTasks>,
+    outcome: RefCell<Result<()>>,
+}
+
+impl ServerState {
+    fn register(self: &Rc<Self>, id: TaskId) -> Option<ConnectionRegistration> {
+        if self.control.stop.is_cancelled() || self.control.drain.get().is_some() {
             return None;
         }
-        state.children.register(id);
+        self.children.borrow_mut().register(id);
         Some(ConnectionRegistration {
-            control: Arc::downgrade(self),
+            state: Rc::downgrade(self),
             id,
         })
     }
 
     fn attach(&self, id: TaskId, task: TaskAbortHandle) {
-        let abort = self.state.lock().unwrap().children.attach(id, &task);
+        let abort = self.children.borrow_mut().attach(id, &task);
         if abort {
             task.abort();
         }
     }
 
     fn abort_connections(&self) {
-        let children = {
-            let mut state = self.state.lock().unwrap();
-            state.forced = true;
-            state.children.take_abort_handles()
-        };
+        self.control.force.cancel();
+        let children = self.children.borrow_mut().take_abort_handles();
         for child in children {
             child.abort();
         }
     }
 }
 
-struct Completion {
-    control: Arc<Control>,
-    outcome: Mutex<Result<()>>,
-}
-
-impl Drop for Completion {
+impl Drop for ServerState {
     fn drop(&mut self) {
         self.control
             .done
-            .send_replace(Some(self.outcome.get_mut().unwrap().clone()));
+            .send_replace(Some(self.outcome.get_mut().clone()));
     }
 }
 
@@ -303,7 +315,7 @@ struct ServerTask<F> {
     incoming: Option<TcpIncoming>,
     handler: Rc<F>,
     connections: TaskTracker,
-    completion: Arc<Completion>,
+    state: Rc<ServerState>,
 }
 
 struct ConnectionTask<F> {
@@ -341,10 +353,10 @@ where
         Err(error) if ctx.is_expected_cancellation(&error) => Ok(()),
         outcome => outcome,
     };
-    *task.completion.outcome.lock().unwrap() = outcome.clone();
+    *task.state.outcome.borrow_mut() = outcome.clone();
 
     let listener_closed = task.incoming.take().unwrap().unregister();
-    let control = &task.completion.control;
+    let control = &task.state.control;
     control.stop.cancel();
     task.connections.close();
     let cleaned = async {
@@ -354,16 +366,16 @@ where
         task.connections.wait().await;
     };
     let mut cleaned = std::pin::pin!(cleaned);
-    let drain = control.state.lock().unwrap().drain;
-    if let Some(drain) = drain {
+    if let Some(drain) = control.drain.get() {
         tokio::select! {
             biased;
             _ = cleaned.as_mut() => return outcome,
+            _ = control.force.cancelled() => {}
             _ = ctx.scope().cancel.cancelled() => {}
             _ = tokio::time::sleep_until(drain.deadline) => {}
         }
     }
-    control.abort_connections();
+    task.state.abort_connections();
     cleaned.await;
     outcome
 }
@@ -376,7 +388,7 @@ async fn accept_connections<F>(
 where
     F: for<'a> AsyncFn(TcpConnection<'a>) -> Result<()> + 'static,
 {
-    let control = &task.completion.control;
+    let control = &task.state.control;
     let incoming = task.incoming.as_mut().unwrap();
     loop {
         let accepted = tokio::select! {
@@ -388,7 +400,7 @@ where
                     _port: budget.acquire().await,
                     _tracked: task.connections.token(),
                     registration: None,
-                    _completion: task.completion.clone(),
+                    _state: task.state.clone(),
                 };
                 let (socket, peer) = incoming.accept().await?;
                 Ok(Accepted { socket, peer, _permit: permit })
@@ -407,11 +419,11 @@ where
         };
         // Commit admission before handing the connection to a managed task.
         let id = TaskId::next();
-        let Some(registration) = control.register(id) else {
+        let Some(registration) = task.state.register(id) else {
             return Ok(());
         };
         accepted._permit.registration = Some(registration);
-        let task = ctx.spawn_local_with_id(
+        let connection = ctx.spawn_local_with_id(
             id,
             handle(ConnectionTask {
                 handler: task.handler.clone(),
@@ -419,6 +431,6 @@ where
                 stop: control.stop.child_token(),
             }),
         )?;
-        control.attach(id, task.abort_handle());
+        task.state.attach(id, connection.abort_handle());
     }
 }
