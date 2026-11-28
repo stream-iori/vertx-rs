@@ -15,6 +15,7 @@ use crate::{TaskHandle, TaskId};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::DropGuard;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -30,8 +31,11 @@ thread_local! {
     static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) };
     static THREAD: Cell<Option<ThreadIdentity>> = const { Cell::new(None) };
 }
-pub(crate) fn set_thread(identity: Option<ThreadIdentity>) {
-    THREAD.with(|t| t.set(identity));
+pub(crate) fn enter_thread(identity: ThreadIdentity) -> impl Drop {
+    let previous = THREAD.replace(Some(identity));
+    DropGuard::new((previous, PhantomData::<Rc<()>>), |(previous, _)| {
+        THREAD.set(previous);
+    })
 }
 pub(crate) fn thread_identity() -> Option<ThreadIdentity> {
     THREAD.with(Cell::get)

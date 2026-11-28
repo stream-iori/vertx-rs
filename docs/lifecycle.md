@@ -28,7 +28,8 @@ Starting → start 成功 → Running → 请求撤销 → Stopping → Stopped
 - 部署记录在启动之前登记；取消 deploy Future 会触发撤销，后台继续清理。
 - start 返回 Err 或启动中收到本部署取消时，仍尝试 stop。factory 或 start panic 时跳过用户 stop，继续框架清理。其他部署的终止错误按失败处理。
 - 生命周期隔离回调构造 Future、poll 和析构阶段的 panic。stop 的每个阶段都恢复清理用 Context，stop 最多执行一次。清理继续执行并保留首次失败和后续错误。
-- deploy_with 保留 Vec<DeploymentId> 返回形态；中途失败或调用被取消，撤销本批先前实例。
+- `deploy_with` 成功时返回各实例的 ID。中途失败时先向本批所有已启动实例发出停止请求，再按部署顺序等待清理。返回的 `DeploymentFailed` 同时包含启动错误和回滚错误。
+- 取消等待会请求停止本批已启动的实例和仍在启动的实例，后台继续清理。
 - 各实例的 factory 通过 `Arc<C>` 共用类型化配置。实例数用 `NonZeroUsize` 表示，默认 1。
 
 ## 受管任务

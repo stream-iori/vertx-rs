@@ -1,10 +1,30 @@
-use super::{Context, ContextId, TaskResult};
+use super::{Context, ContextId, TaskResult, ThreadIdentity, enter_thread, thread_identity};
 use crate::deployment::DeploymentScope;
 use crate::{DeploymentId, EventLoopId, Result, Vertx, VertxError};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio_util::sync::CancellationToken;
+
+#[rstest::rstest]
+#[case::normal_return(false)]
+#[case::unwind(true)]
+fn thread_identity_is_restored_on_exit(#[case] unwind: bool) {
+    assert!(thread_identity().is_none());
+    let event_loop = ThreadIdentity::EventLoop(1, EventLoopId(0));
+    let worker = ThreadIdentity::Worker(2);
+    {
+        let _event_loop = enter_thread(event_loop);
+        let result = std::panic::catch_unwind(|| {
+            let _worker = enter_thread(worker);
+            assert!(thread_identity() == Some(worker));
+            assert!(!unwind, "test unwind");
+        });
+        assert_eq!(result.is_err(), unwind);
+        assert!(thread_identity() == Some(event_loop));
+    }
+    assert!(thread_identity().is_none());
+}
 
 #[tokio::test]
 async fn context_restored_when_send_future_moves_between_os_threads() {

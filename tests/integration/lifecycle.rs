@@ -417,26 +417,53 @@ async fn cancellation_of_pending_deploy_cleans_startup(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
+    struct Instance {
+        index: usize,
+        second_stopping: Arc<tokio::sync::Notify>,
+    }
+    impl Verticle for Instance {
+        async fn start(&mut self, ctx: Context) -> Result<()> {
+            if self.index == 2 {
+                return Err(VertxError::StartFailed("third instance".into()));
+            }
+            ctx.event_bus()
+                .consumer::<()>("group")?
+                .handler(async |_| Ok(()))
+        }
+
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            match self.index {
+                0 => self.second_stopping.notified().await,
+                1 => {
+                    self.second_stopping.notify_one();
+                    return Err(VertxError::Other("second instance cleanup".into()));
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
     let count = Arc::new(AtomicUsize::new(0));
-    let c = count.clone();
+    let created = count.clone();
+    let second_stopping = Arc::new(tokio::sync::Notify::new());
     let result = vx
         .deploy_with(
-            move |_, _: Arc<()>| {
-                let n = c.fetch_add(1, Ordering::SeqCst);
-                local(move |ctx| async move {
-                    if n == 1 {
-                        return Err(VertxError::StartFailed("second instance".into()));
-                    }
-                    ctx.event_bus()
-                        .consumer::<()>("group")?
-                        .handler(async |_| Ok(()))
-                })
+            move |_, _: Arc<()>| Instance {
+                index: created.fetch_add(1, Ordering::SeqCst),
+                second_stopping: second_stopping.clone(),
             },
-            DeploymentOptions::new().instances(NonZeroUsize::new(3).unwrap()),
+            DeploymentOptions::new().instances(NonZeroUsize::new(4).unwrap()),
         )
         .await;
-    assert!(matches!(result, Err(VertxError::DeploymentFailed { .. })));
-    assert_eq!(count.load(Ordering::SeqCst), 2);
+    let Err(VertxError::DeploymentFailed { cause, rollback }) = result else {
+        panic!("expected startup and rollback errors, got {result:?}");
+    };
+    assert!(matches!(*cause, VertxError::StartFailed(message) if message == "third instance"));
+    assert!(
+        matches!(rollback.as_slice(), [VertxError::Other(message)] if message == "second instance cleanup")
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
     assert!(matches!(
         vx.event_bus().try_send("group", ()),
         Err(VertxError::NoConsumer(_))
@@ -504,33 +531,65 @@ async fn worker_failed_start_waits_for_its_resource_cleanup(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) {
-    let created = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = oneshot::channel();
-    let signal = Arc::new(Mutex::new(Some(tx)));
+    struct Instance {
+        index: usize,
+        pending: Option<oneshot::Sender<()>>,
+        stopped: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+    impl Verticle for Instance {
+        async fn start(&mut self, ctx: Context) -> Result<()> {
+            ctx.event_bus()
+                .consumer::<()>("cancel-group")?
+                .handler(async |_| Ok(()))?;
+            if let Some(pending) = self.pending.take() {
+                pending.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn stop(&mut self, _: Context) -> Result<()> {
+            self.stopped.send(self.index).unwrap();
+            Ok(())
+        }
+    }
+
+    let created = AtomicUsize::new(0);
+    let (pending, started) = oneshot::channel();
+    let pending = Mutex::new(Some(pending));
+    let (stopped, mut exits) = tokio::sync::mpsc::unbounded_channel();
     let v = vx.clone();
     let future = tokio::spawn(async move {
         v.deploy_with(
             move |_, _: Arc<()>| {
-                let n = created.fetch_add(1, Ordering::SeqCst);
-                let signal = signal.clone();
-                local(move |ctx| async move {
-                    ctx.event_bus()
-                        .consumer::<()>("cancel-group")?
-                        .handler(async |_| Ok(()))?;
-                    if n == 1 {
-                        signal.lock().unwrap().take().unwrap().send(()).ok();
-                        std::future::pending::<()>().await;
-                    }
-                    Ok(())
-                })
+                let index = created.fetch_add(1, Ordering::SeqCst);
+                Instance {
+                    index,
+                    pending: if index == 1 {
+                        pending.lock().unwrap().take()
+                    } else {
+                        None
+                    },
+                    stopped: stopped.clone(),
+                }
             },
             DeploymentOptions::new().instances(NonZeroUsize::new(3).unwrap()),
         )
         .await
     });
-    rx.await.unwrap();
+    started.await.unwrap();
     future.abort();
     assert!(future.await.unwrap_err().is_cancelled());
-    // Both the pending instance and the already-ready instance must stop.
+    let mut stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        [exits.recv().await.unwrap(), exits.recv().await.unwrap()]
+    })
+    .await
+    .unwrap();
+    stopped.sort_unstable();
+    assert_eq!(stopped, [0, 1]);
+    assert!(matches!(
+        vx.event_bus().try_send("cancel-group", ()),
+        Err(VertxError::NoConsumer(_))
+    ));
     vx.close().await.unwrap();
 }

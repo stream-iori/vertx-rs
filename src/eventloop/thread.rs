@@ -1,6 +1,6 @@
 use super::EventLoopId;
 use super::task::Command;
-use crate::context::{ThreadIdentity, set_thread};
+use crate::context::{ThreadIdentity, enter_thread};
 use std::io;
 use std::sync::Mutex;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -62,8 +62,7 @@ fn run(
     receiver: UnboundedReceiver<Box<dyn Command>>,
     stopped: CancellationToken,
 ) {
-    set_thread(Some(ThreadIdentity::EventLoop(instance, id)));
-    let _identity = ThreadIdentityGuard;
+    let _identity = enter_thread(ThreadIdentity::EventLoop(instance, id));
     let mut receiver = receiver;
     let runtime = match runtime_factory() {
         Ok(runtime) => runtime,
@@ -106,13 +105,5 @@ async fn run_commands(
     // Undispatched commands are cancelled on their owning thread.
     while let Ok(command) = receiver.try_recv() {
         drop(command);
-    }
-}
-
-struct ThreadIdentityGuard;
-
-impl Drop for ThreadIdentityGuard {
-    fn drop(&mut self) {
-        set_thread(None);
     }
 }

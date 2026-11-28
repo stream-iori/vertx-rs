@@ -1,5 +1,5 @@
 use super::task::Task;
-use crate::context::{ThreadIdentity, set_thread};
+use crate::context::{ThreadIdentity, enter_thread};
 use crate::error::panic_error;
 use crate::{Result, VertxError};
 use std::collections::{HashMap, VecDeque};
@@ -87,7 +87,7 @@ impl Scheduler {
     }
 
     pub(super) fn run(&self) {
-        set_thread(Some(ThreadIdentity::Worker(self.instance)));
+        let _identity = enter_thread(ThreadIdentity::Worker(self.instance));
         while let Some(dispatch) = self.next_dispatch() {
             match dispatch {
                 Dispatch::Context(id) => self.run_lane(id),
@@ -98,7 +98,6 @@ impl Scheduler {
                 }
             }
         }
-        set_thread(None);
     }
 
     fn next_dispatch(&self) -> Option<Dispatch> {

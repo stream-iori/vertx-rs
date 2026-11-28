@@ -6,8 +6,8 @@ use crate::{
     Context, DeploymentId, DeploymentOptions, Result, TaskHandle, Verticle, VertxError,
     WorkerVerticle,
 };
+use std::mem::DropGuard;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 impl Vertx {
@@ -65,18 +65,29 @@ impl Vertx {
         let factory = Arc::new(factory);
         let config = options.shared_config();
         let mut ids = Vec::new();
-        let mut rollback = Rollback::default();
+        let mut rollback = DropGuard::new(Vec::<Arc<DeploymentScope>>::new(), |scopes| {
+            request_stop_all(&scopes);
+        });
         for _ in 0..options.instances_count().get() {
             let (factory, config) = (factory.clone(), config.clone());
             match self.deploy(move |ctx| factory(ctx, config)).await {
                 Ok(id) => {
                     if let Some(scope) = self.deployment_scope(id) {
-                        rollback.scopes.push(scope);
+                        rollback.push(scope);
                     }
                     ids.push(id);
                 }
                 Err(cause) => {
-                    let failures = rollback.wait(self.inner.lifetime.shutdown_grace).await;
+                    request_stop_all(&rollback);
+                    let mut failures = Vec::new();
+                    for scope in DropGuard::dismiss(rollback) {
+                        if let Err(error) = scope
+                            .wait_with_grace(self.inner.lifetime.shutdown_grace)
+                            .await
+                        {
+                            failures.push(error);
+                        }
+                    }
                     return Err(VertxError::DeploymentFailed {
                         cause: Box::new(cause),
                         rollback: failures,
@@ -84,7 +95,7 @@ impl Vertx {
                 }
             }
         }
-        rollback.scopes.clear();
+        drop(DropGuard::dismiss(rollback));
         Ok(ids)
     }
 
@@ -181,33 +192,9 @@ impl Drop for PendingDeployment {
     }
 }
 
-#[derive(Default)]
-struct Rollback {
-    scopes: Vec<Arc<DeploymentScope>>,
-}
-
-impl Rollback {
-    fn request_stop(&self) {
-        for scope in &self.scopes {
-            scope.request_stop();
-        }
-    }
-
-    async fn wait(&self, grace: Duration) -> Vec<VertxError> {
-        self.request_stop();
-        let mut errors = Vec::new();
-        for scope in &self.scopes {
-            if let Err(error) = scope.wait_with_grace(grace).await {
-                errors.push(error);
-            }
-        }
-        errors
-    }
-}
-
-impl Drop for Rollback {
-    fn drop(&mut self) {
-        self.request_stop();
+fn request_stop_all(scopes: &[Arc<DeploymentScope>]) {
+    for scope in scopes {
+        scope.request_stop();
     }
 }
 
