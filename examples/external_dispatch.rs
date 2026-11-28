@@ -9,12 +9,12 @@ struct Service {
     ready: Option<oneshot::Sender<(ExecutionInfo, ThreadId)>>,
 }
 impl Verticle for Service {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         self.ready
             .take()
             .expect("start called once")
             .send((
-                ctx.current_execution().expect("managed start"),
+                vertx.current_execution().expect("managed start"),
                 std::thread::current().id(),
             ))
             .map_err(|_| VertxError::ReplyClosed)

@@ -31,8 +31,8 @@ fn allow_late_reply(result: Result<()>) -> Result<()> {
 }
 struct Upper;
 impl Verticle for Upper {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        UPPER.consumer(&ctx.event_bus()?)?.handler(async |env| {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        UPPER.consumer(&vertx.event_bus()?)?.handler(async |env| {
             let response = env.body().to_uppercase();
             allow_late_reply(env.reply(response))
         })?;
@@ -41,9 +41,9 @@ impl Verticle for Upper {
 }
 struct Reject;
 impl Verticle for Reject {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         REJECT
-            .consumer(&ctx.event_bus()?)?
+            .consumer(&vertx.event_bus()?)?
             .handler(async |env| allow_late_reply(env.fail(503, "service unavailable")))?;
         Ok(())
     }
@@ -52,8 +52,8 @@ struct Caller {
     ready: Option<oneshot::Sender<TaskHandle<()>>>,
 }
 impl Verticle for Caller {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        let bus = ctx.event_bus()?;
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        let bus = vertx.event_bus()?;
         let handler = CALLER.consumer(&bus)?.handler(async move |env| {
             let candidates = [&REJECT, &UPPER].into_iter().map(|address| {
                 address

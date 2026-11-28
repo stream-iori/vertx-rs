@@ -8,9 +8,9 @@ use std::future::{Future, ready};
 /// use vertx_rs::{VertxHandle, Result, Verticle};
 /// struct Service(std::rc::Rc<String>);
 /// impl Verticle for Service {
-///     async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+///     async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
 ///         let prefix = self.0.clone();
-///         ctx.event_bus()?.consumer::<String>("greet")?.handler(async move |message| {
+///         vertx.event_bus()?.consumer::<String>("greet")?.handler(async move |message| {
 ///             tokio::task::yield_now().await;
 ///             let greeting = format!("{prefix} {}", message.body());
 ///             message.reply(greeting)
@@ -21,10 +21,10 @@ use std::future::{Future, ready};
 /// ```
 pub trait Verticle: 'static {
     /// Initializes the deployment. Successful return makes it ready.
-    fn start(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>>;
+    fn start(&mut self, vertx: VertxHandle) -> impl Future<Output = Result<()>>;
 
     /// Releases application resources after managed work has drained.
-    fn stop(&mut self, _ctx: VertxHandle) -> impl Future<Output = Result<()>> {
+    fn stop(&mut self, _vertx: VertxHandle) -> impl Future<Output = Result<()>> {
         ready(Ok(()))
     }
 }
@@ -45,10 +45,10 @@ pub trait Verticle: 'static {
 /// ```
 pub trait WorkerVerticle: Send + 'static {
     /// Initializes the deployment on the Worker pool. The future must be `Send`.
-    fn start(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>> + Send;
+    fn start(&mut self, vertx: VertxHandle) -> impl Future<Output = Result<()>> + Send;
 
     /// Releases application resources after managed work has drained.
-    fn stop(&mut self, _ctx: VertxHandle) -> impl Future<Output = Result<()>> + Send {
+    fn stop(&mut self, _vertx: VertxHandle) -> impl Future<Output = Result<()>> + Send {
         ready(Ok(()))
     }
 }

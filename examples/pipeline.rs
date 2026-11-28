@@ -17,11 +17,11 @@ use vertx_rs::{
 };
 struct Source;
 impl Verticle for Source {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        let bus = ctx.event_bus()?;
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        let bus = vertx.event_bus()?;
         // Finite source: EOF flushes and closes only this address-bound adapter.
         let source = futures::stream::iter((1..=5u64).map(Ok));
-        let handle = ctx.spawn_local(pipe_to(source, bus.sink("hash")?))?;
+        let handle = vertx.spawn_local(pipe_to(source, bus.sink("hash")?))?;
         println!("source task={}", handle.id()); // 丢弃句柄只分离等待者，部署继续管理任务。
         Ok(())
     }
@@ -39,19 +39,20 @@ struct Hasher {
     salt: u64,
 }
 impl Verticle for Hasher {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         let salt = self.salt;
-        ctx.event_bus()?
+        vertx
+            .event_bus()?
             .consumer_with::<u64>("hash", ConsumerOptions::new().with_capacity(1))?
             .handler(async move |env| {
                 let seed = env.into_body();
                 // 两个 Future 同时等待：有序与无序 blocking 都进同一个固定 Worker 池。
                 let (ordered, unordered) = futures::try_join!(
-                    ctx.execute_blocking(move || checksum(seed ^ salt)),
-                    ctx.execute_blocking_unordered(move || checksum(seed ^ salt)),
+                    vertx.execute_blocking(move || checksum(seed ^ salt)),
+                    vertx.execute_blocking_unordered(move || checksum(seed ^ salt)),
                 )?;
                 assert_eq!(ordered, unordered);
-                ctx.event_bus()?.send("sink", (seed, ordered)).await
+                vertx.event_bus()?.send("sink", (seed, ordered)).await
             })?;
         Ok(())
     }
@@ -60,12 +61,12 @@ struct Sink {
     done: Option<oneshot::Sender<Vec<(u64, u64)>>>,
 }
 impl WorkerVerticle for Sink {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         let done = self.done.take().expect("start is called once");
-        let consumer = ctx
+        let consumer = vertx
             .event_bus()?
             .consumer_with::<(u64, u64)>("sink", ConsumerOptions::new().with_capacity(1))?;
-        ctx.spawn(async move {
+        vertx.spawn(async move {
             // EventBus has no natural EOF: take(5) defines this operation's end.
             // Only one-way bodies are collected; headers/reply are not forwarded.
             let results = consumer

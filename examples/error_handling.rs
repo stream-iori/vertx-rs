@@ -14,8 +14,9 @@ enum Command {
 }
 struct Service;
 impl Verticle for Service {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        ctx.event_bus()?
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        vertx
+            .event_bus()?
             .consumer::<Command>("service")?
             .handler(async |env| match env.body() {
                 Command::Reject => env.fail(409, "business rejected"),

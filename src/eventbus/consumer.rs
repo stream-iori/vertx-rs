@@ -80,9 +80,9 @@ impl<T: Send + 'static> Consumer<T> {
     /// # use vertx_rs::{VertxHandle, Result, Verticle};
     /// # struct Example;
     /// # impl Verticle for Example {
-    /// # async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    /// # async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
     /// let mut count = 0u64;
-    /// ctx.event_bus()?.consumer::<()>("count")?.handler(async move |env| {
+    /// vertx.event_bus()?.consumer::<()>("count")?.handler(async move |env| {
     ///     let count = &mut count;
     ///     tokio::task::yield_now().await;
     ///     *count += 1;
@@ -110,8 +110,8 @@ impl<T: Send + 'static> Consumer<T> {
     /// use vertx_rs::{VertxHandle, Result, WorkerVerticle};
     /// struct Worker;
     /// impl WorkerVerticle for Worker {
-    ///     async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-    ///         ctx.event_bus()?.consumer::<u32>("worker")?.handler_worker(|env| async move {
+    ///     async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+    ///         vertx.event_bus()?.consumer::<u32>("worker")?.handler_worker(|env| async move {
     ///             let answer = *env.body() * 2;
     ///             env.reply(answer)
     ///         })?;

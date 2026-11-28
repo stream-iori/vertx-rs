@@ -17,11 +17,11 @@ struct Service {
     stop_count: Arc<AtomicUsize>,
 }
 impl Verticle for Service {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         let cancelled = self.cancelled.take().expect("start called once");
         let task_started = self.task_started.take().expect("start called once");
-        let stopping = ctx.stopping()?;
-        ctx.spawn_local(async move {
+        let stopping = vertx.stopping()?;
+        vertx.spawn_local(async move {
             task_started.send(()).map_err(|_| VertxError::ReplyClosed)?;
             stopping.await;
             cancelled.send(()).map_err(|_| VertxError::ReplyClosed)?;
@@ -29,11 +29,11 @@ impl Verticle for Service {
         })?;
         Ok(())
     }
-    async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn stop(&mut self, vertx: VertxHandle) -> Result<()> {
         self.stop_count.fetch_add(1, Ordering::SeqCst);
         let release = self.release.take().expect("stop called once");
         let started = self.blocking_started.take().expect("stop called once");
-        let value = ctx
+        let value = vertx
             .execute_blocking(move || {
                 assert!(matches!(
                     ExecutionInfo::current().map(|info| info.thread),

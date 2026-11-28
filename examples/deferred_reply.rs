@@ -17,9 +17,9 @@ fn transform(body: &str) -> String {
 }
 struct Transformer;
 impl Verticle for Transformer {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         TRANSFORM
-            .consumer(&ctx.event_bus()?)?
+            .consumer(&vertx.event_bus()?)?
             .handler(async move |env| {
                 let (body, headers, reply) = env.into_parts();
                 // Headers/reply 不会自动转发，应用明确选择需要返回的关联字段。
@@ -27,9 +27,9 @@ impl Verticle for Transformer {
                     .get("correlation-id")
                     .map(str::to_owned)
                     .ok_or_else(|| VertxError::Other("missing correlation-id".into()))?;
-                let task_ctx = ctx.clone();
-                ctx.spawn_local(async move {
-                    let response = task_ctx
+                let task_vertx = vertx.clone();
+                vertx.spawn_local(async move {
+                    let response = task_vertx
                         .execute_blocking_unordered(move || transform(&body))
                         .await?;
                     reply.reply_with(

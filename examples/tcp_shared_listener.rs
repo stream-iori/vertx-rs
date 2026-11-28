@@ -18,12 +18,12 @@ struct Echo {
     served: Option<oneshot::Sender<EventLoopId>>,
 }
 impl Verticle for Echo {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        let mut incoming = ctx.listen_tcp(self.addr).await?;
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        let mut incoming = vertx.listen_tcp(self.addr).await?;
         let addr = incoming.local_addr();
         let served = self.served.take().expect("start called once");
         // start 完成监听注册，后续接收和读写由部署的受管任务负责。
-        let task = ctx.spawn_local(async move {
+        let task = vertx.spawn_local(async move {
             let (mut socket, peer) = incoming.accept().await?;
             let mut byte = [0];
             socket.read_exact(&mut byte).await.map_err(io_error)?;

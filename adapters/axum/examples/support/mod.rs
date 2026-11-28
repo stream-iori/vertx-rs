@@ -17,17 +17,17 @@ struct Http {
     ready: Option<oneshot::Sender<(TcpServer, ExecutionInfo)>>,
 }
 impl Verticle for Http {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         let server = match self.options {
             Some(options) => {
-                serve_axum_with_options(&ctx, self.addr, self.router.clone(), options).await?
+                serve_axum_with_options(&vertx, self.addr, self.router.clone(), options).await?
             }
-            None => serve_axum(&ctx, self.addr, self.router.clone()).await?,
+            None => serve_axum(&vertx, self.addr, self.router.clone()).await?,
         };
         self.ready
             .take()
             .unwrap()
-            .send((server, ctx.current_execution().expect("managed start")))
+            .send((server, vertx.current_execution().expect("managed start")))
             .map_err(|_| VertxError::ReplyClosed)
     }
 }

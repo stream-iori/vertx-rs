@@ -19,14 +19,14 @@ struct Pinger {
     count: Rc<Cell<u64>>,
 }
 impl Verticle for Pinger {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
         let count = self.count.clone();
         let thread = std::thread::current().id();
-        let id = ctx.current_execution().expect("managed start").context_id;
+        let id = vertx.current_execution().expect("managed start").context_id;
         println!("start {id} on {thread:?}");
-        let heartbeat_bus = ctx.event_bus()?;
-        let mut timer = ctx.periodic(Duration::ZERO, Duration::from_millis(10))?;
-        ctx.spawn_local(async move {
+        let heartbeat_bus = vertx.event_bus()?;
+        let mut timer = vertx.periodic(Duration::ZERO, Duration::from_millis(10))?;
+        vertx.spawn_local(async move {
             for tick in 1..=3u32 {
                 timer.tick().await?;
                 heartbeat_bus.publish("heartbeat", tick)?;
@@ -36,7 +36,8 @@ impl Verticle for Pinger {
             println!("heartbeat timer cancelled after 3 ticks");
             Ok(())
         })?;
-        ctx.event_bus()?
+        vertx
+            .event_bus()?
             .consumer::<String>("ping")?
             .handler(async move |env| {
                 assert_eq!(std::thread::current().id(), thread);
@@ -45,7 +46,7 @@ impl Verticle for Pinger {
                     return env.fail(400, "invalid ping");
                 }
                 if env.body() == "slow" {
-                    ctx.timer(Duration::from_millis(40))?.await?;
+                    vertx.timer(Duration::from_millis(40))?.await?;
                     // 请求方已超时，迟到回复是可预期的 ReplyClosed。
                     assert!(matches!(
                         env.reply("late".to_owned()),
@@ -62,10 +63,10 @@ impl Verticle for Pinger {
             })?;
         Ok(())
     }
-    async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
+    async fn stop(&mut self, vertx: VertxHandle) -> Result<()> {
         println!(
             "stop {} on {:?}, count={}",
-            ctx.current_execution().expect("managed stop").context_id,
+            vertx.current_execution().expect("managed stop").context_id,
             std::thread::current().id(),
             self.count.get()
         );

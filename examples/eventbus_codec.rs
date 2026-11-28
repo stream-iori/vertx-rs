@@ -16,8 +16,9 @@ fn decode(bytes: &[u8]) -> Option<u32> {
 
 struct Double;
 impl Verticle for Double {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        ctx.event_bus()?
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        vertx
+            .event_bus()?
             .consumer::<Vec<u8>>(ADDRESS)?
             .handler(async |request| {
                 let Some(value) = decode(request.body()) else {

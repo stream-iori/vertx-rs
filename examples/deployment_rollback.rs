@@ -16,8 +16,9 @@ struct Instance {
     stopped: Arc<Mutex<Vec<usize>>>,
 }
 impl Verticle for Instance {
-    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
-        ctx.event_bus()?
+    async fn start(&mut self, vertx: VertxHandle) -> Result<()> {
+        vertx
+            .event_bus()?
             .consumer::<()>("batch")?
             .handler(async |_| Ok(()))?;
         if self.fail {
