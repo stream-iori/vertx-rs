@@ -47,15 +47,15 @@ struct ContextData {
     services: Arc<InstanceServices>,
     lifetime: Arc<InstanceLifetime>,
     scope: Arc<DeploymentScope>,
-    owner: Weak<VertxInner>,
-    ordered: Arc<Mutex<()>>,
+    vertx: Weak<VertxInner>,
+    blocking_order_lock: Arc<Mutex<()>>,
     exception_handler: ExceptionSlot,
 }
 enum Target {
     EventLoop(EventLoopId),
     Worker {
         driver: tokio::runtime::Handle,
-        execution: std::sync::Mutex<()>,
+        execution_gate: std::sync::Mutex<()>,
     },
 }
 /// Logical execution context. Its kind is independent of the physical thread
@@ -79,17 +79,17 @@ impl Context {
     pub fn id(&self) -> ContextId {
         self.data.id
     }
-    fn new(target: Target, owner: &Arc<VertxInner>, scope: Arc<DeploymentScope>) -> Self {
+    fn new(target: Target, vertx: &Arc<VertxInner>, scope: Arc<DeploymentScope>) -> Self {
         Self {
             data: Arc::new(ContextData {
                 id: ContextId(NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed)),
                 target,
-                executors: owner.executors.clone(),
-                services: owner.services.clone(),
-                lifetime: owner.lifetime.clone(),
+                executors: vertx.executors.clone(),
+                services: vertx.services.clone(),
+                lifetime: vertx.lifetime.clone(),
                 scope,
-                owner: Arc::downgrade(owner),
-                ordered: Arc::new(Mutex::new(())),
+                vertx: Arc::downgrade(vertx),
+                blocking_order_lock: Arc::new(Mutex::new(())),
                 exception_handler: ExceptionSlot::default(),
             }),
             stopping: false,
@@ -97,19 +97,19 @@ impl Context {
     }
     pub(crate) fn new_event_loop(
         id: EventLoopId,
-        owner: &Arc<VertxInner>,
+        vertx: &Arc<VertxInner>,
         scope: Arc<DeploymentScope>,
     ) -> Self {
-        Self::new(Target::EventLoop(id), owner, scope)
+        Self::new(Target::EventLoop(id), vertx, scope)
     }
-    pub(crate) fn new_worker(owner: &Arc<VertxInner>, scope: Arc<DeploymentScope>) -> Self {
-        let loops = &owner.executors.event_loops;
+    pub(crate) fn new_worker(vertx: &Arc<VertxInner>, scope: Arc<DeploymentScope>) -> Self {
+        let loops = &vertx.executors.event_loops;
         Self::new(
             Target::Worker {
                 driver: loops.driver(loops.pick()),
-                execution: std::sync::Mutex::new(()),
+                execution_gate: std::sync::Mutex::new(()),
             },
-            owner,
+            vertx,
             scope,
         )
     }
@@ -128,11 +128,11 @@ impl Context {
     pub(crate) fn shutdown_grace(&self) -> std::time::Duration {
         self.data.lifetime.shutdown_grace
     }
-    pub(crate) fn instance_closed(&self) -> bool {
+    pub(crate) fn instance_admission_closed(&self) -> bool {
         self.data.lifetime.cancel.is_cancelled()
     }
-    pub(crate) fn belongs_to(&self, owner: &Arc<VertxInner>) -> bool {
-        std::ptr::eq(self.data.owner.as_ptr(), Arc::as_ptr(owner))
+    pub(crate) fn belongs_to(&self, vertx: &Arc<VertxInner>) -> bool {
+        std::ptr::eq(self.data.vertx.as_ptr(), Arc::as_ptr(vertx))
     }
     pub(crate) fn for_stop(&self) -> Self {
         let mut c = self.clone();
@@ -168,8 +168,8 @@ impl Context {
         self.scope().deployment
     }
     /// Returns the owning instance if a Vertx handle or its close coordinator is alive.
-    pub fn owner(&self) -> Option<Vertx> {
-        self.data.owner.upgrade().map(Vertx::from_inner)
+    pub fn vertx(&self) -> Option<Vertx> {
+        self.data.vertx.upgrade().map(Vertx::from_inner)
     }
     /// Returns the logical Context for this synchronous poll or blocking operation.
     /// Outside managed execution, including raw Tokio tasks, returns `None`.
@@ -189,8 +189,8 @@ impl Context {
         thread_identity().is_some()
     }
     /// Reports whether this deployment currently admits ordinary work.
-    pub fn is_alive(&self) -> bool {
-        self.ensure_alive().is_ok()
+    pub fn accepts_work(&self) -> bool {
+        self.ensure_accepting_work().is_ok()
     }
     /// Returns the deployment cancellation token. Cancelling it requests shutdown;
     /// it cannot interrupt a running synchronous poll or blocking closure.
@@ -204,15 +204,15 @@ impl Context {
     pub(crate) fn same(&self, other: &Context) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
     }
-    pub(crate) fn ensure_alive(&self) -> Result<()> {
-        if self.instance_closed() {
+    pub(crate) fn ensure_accepting_work(&self) -> Result<()> {
+        if self.instance_admission_closed() {
             return Err(VertxError::VertxClosed);
         }
         drop(self.scope().admit()?);
         Ok(())
     }
-    pub(crate) fn check_local(&self) -> Result<()> {
-        self.ensure_alive()?;
+    pub(crate) fn ensure_current_event_loop_context(&self) -> Result<()> {
+        self.ensure_accepting_work()?;
         if let Some(id) = self.event_loop_id()
             && self.data.executors.event_loops.check_thread(id)
             && Self::current().is_some_and(|c| self.same(&c))
@@ -280,7 +280,7 @@ impl Context {
     pub(crate) fn is_expected_cancellation(&self, error: &VertxError) -> bool {
         matches!(error, VertxError::TaskCancelled)
             || matches!(error, VertxError::DeploymentTerminated(id) if *id == self.scope().deployment && self.scope().cancel.is_cancelled())
-            || matches!(error, VertxError::VertxClosed if self.instance_closed())
+            || matches!(error, VertxError::VertxClosed if self.instance_admission_closed())
     }
     /// Spawn a managed non-Send task. Must be called in this exact Context.
     /// Dropping the returned TaskHandle detaches the caller, not the scope.
@@ -299,7 +299,7 @@ impl Context {
     where
         F: Future<Output = Result<()>> + 'static,
     {
-        self.check_local()?;
+        self.ensure_current_event_loop_context()?;
         let registration = self.scope().register_task(id)?;
         let frame = self.frame(id);
         let task = self.clone().track_future(frame, registration, future);
@@ -325,7 +325,7 @@ impl Context {
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
-        self.ensure_alive()?;
+        self.ensure_accepting_work()?;
         let id = TaskId::next();
         let registration = self.scope().register_task(id)?;
         let frame = self.frame(id);
@@ -365,7 +365,7 @@ impl Context {
     /// Use this inside the deployment instead of awaiting its own undeploy.
     /// A scope that no longer admits work returns `DeploymentTerminated`.
     pub fn request_undeploy(&self) -> Result<()> {
-        self.ensure_alive()?;
+        self.ensure_accepting_work()?;
         self.scope().request_stop();
         Ok(())
     }

@@ -112,7 +112,7 @@ impl BlockingTask {
                 _ = ctx.scope().cancel.cancelled(), if !ctx.stopping => {
                     return Err(VertxError::DeploymentTerminated(ctx.scope().deployment));
                 }
-                guard = ctx.data.ordered.clone().lock_owned() => guard,
+                guard = ctx.data.blocking_order_lock.clone().lock_owned() => guard,
             })
         } else {
             None

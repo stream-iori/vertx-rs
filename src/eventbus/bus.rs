@@ -12,19 +12,19 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct EventBus {
     router: Arc<Router>,
-    owner: Option<Context>,
+    bound_context: Option<Context>,
 }
 impl EventBus {
     pub(crate) fn new(cancel: CancellationToken, diagnostics: Arc<Diagnostics>) -> Self {
         Self {
             router: Arc::new(Router::new(cancel, diagnostics)),
-            owner: None,
+            bound_context: None,
         }
     }
     pub(crate) fn bound(&self, ctx: Context) -> Self {
         Self {
             router: self.router.clone(),
-            owner: Some(ctx),
+            bound_context: Some(ctx),
         }
     }
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -53,7 +53,7 @@ impl EventBus {
     ) -> Result<Consumer<T>> {
         options.validate()?;
         self.ensure_open()?;
-        let owner = self.owner.clone().or_else(|| {
+        let owner = self.bound_context.clone().or_else(|| {
             Context::current()
                 .filter(|ctx| Arc::ptr_eq(&ctx.instance_event_bus().router, &self.router))
         });
@@ -65,8 +65,8 @@ impl EventBus {
         let registration = {
             let mut admission = owner.as_ref().map(|ctx| ctx.scope().admit()).transpose()?;
             let metadata = owner.as_ref().map(|ctx| SubscriptionOwner {
-                context: ctx.id(),
-                deployment: ctx.scope().deployment,
+                context_id: ctx.id(),
+                deployment_id: ctx.deployment_id(),
             });
             let registration =
                 self.router

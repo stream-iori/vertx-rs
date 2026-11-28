@@ -160,13 +160,13 @@ impl<'a> Lifecycle<'a> {
     async fn start<F: Future<Output = Result<()>>>(&self, start: impl FnOnce() -> F) -> Startup {
         let scope = self.ctx.scope();
         match invoke(self.ctx, start, Some(&scope.cancel)).await {
-            CallbackOutcome::Returned(Ok(())) if scope.running() => Startup::Started,
+            CallbackOutcome::Returned(Ok(())) if scope.try_mark_running() => Startup::Started,
             CallbackOutcome::Returned(Ok(())) | CallbackOutcome::Cancelled => {
                 Startup::Cancelled(VertxError::DeploymentTerminated(scope.deployment))
             }
             CallbackOutcome::Returned(Err(error)) => {
                 if matches!(error, VertxError::DeploymentTerminated(id) if id == scope.deployment && scope.cancel.is_cancelled())
-                    || matches!(error, VertxError::VertxClosed if self.ctx.instance_closed())
+                    || matches!(error, VertxError::VertxClosed if self.ctx.instance_admission_closed())
                 {
                     Startup::Cancelled(error)
                 } else {
@@ -257,8 +257,8 @@ impl<'a> Lifecycle<'a> {
             retain_failure(&mut outcome, error);
         }
         ctx.diagnostics().deployment(id, DeploymentStage::Stopped);
-        if let Some(owner) = ctx.owner() {
-            owner.inner.forget_deployment(id);
+        if let Some(vertx) = ctx.vertx() {
+            vertx.inner.forget_deployment(id);
         }
         ctx.scope().finish(outcome.clone());
         if let Some(ready) = ready {

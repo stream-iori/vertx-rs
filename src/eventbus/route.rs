@@ -65,8 +65,8 @@ impl SubscriptionRegistration {
 }
 
 pub(super) struct SubscriptionOwner {
-    pub context: ContextId,
-    pub deployment: DeploymentId,
+    pub context_id: ContextId,
+    pub deployment_id: DeploymentId,
 }
 
 pub(super) struct Router {
@@ -113,8 +113,8 @@ impl Router {
             id.0,
             address,
             capacity,
-            owner.as_ref().map(|owner| owner.context),
-            owner.map(|owner| owner.deployment),
+            owner.as_ref().map(|owner| owner.context_id),
+            owner.map(|owner| owner.deployment_id),
         );
         let (sender, rx) =
             QueueSender::channel(address, capacity, self.closed.clone(), cancel, stats);

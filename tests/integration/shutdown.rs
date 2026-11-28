@@ -170,13 +170,13 @@ async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Ver
             local(move |ctx| async move {
                 let c = ctx.clone();
                 ctx.spawn_local(async move {
-                    let owner = c.owner().unwrap();
+                    let vertx = c.vertx().unwrap();
                     assert!(matches!(
-                        owner.undeploy(c.deployment_id()).await,
+                        vertx.undeploy(c.deployment_id()).await,
                         Err(VertxError::WouldDeadlock)
                     ));
                     assert!(matches!(
-                        owner.close().await,
+                        vertx.close().await,
                         Err(VertxError::WouldDeadlock)
                     ));
                     c.request_undeploy()?;
@@ -238,7 +238,7 @@ async fn stop_error_is_returned_and_resources_still_close(vx: Vertx) {
         vx.close().await,
         Err(VertxError::CleanupFailed(_))
     ));
-    assert!(vx.is_closed());
+    assert!(vx.is_admission_closed());
     assert!(matches!(
         vx.event_bus().try_send("bad-stop", ()),
         Err(VertxError::VertxClosed)
@@ -313,7 +313,7 @@ async fn cancelled_close_waiter_does_not_cancel_cleanup(vx: Vertx) {
     drop(close);
     tx.send(()).unwrap();
     vx.close().await.unwrap();
-    assert!(vx.is_closed());
+    assert!(vx.is_admission_closed());
 }
 
 #[rstest]
@@ -438,7 +438,7 @@ async fn raw_tokio_task_on_owned_eventloop_cannot_wait_for_its_own_close() {
     .unwrap()
     .await
     .unwrap();
-    assert!(!vx.is_closed());
+    assert!(!vx.is_admission_closed());
     vx.close().await.unwrap();
 }
 
@@ -511,7 +511,7 @@ async fn eventloop_can_await_close_of_a_different_vertx_instance() {
     .unwrap()
     .await
     .unwrap();
-    assert!(second.is_closed());
-    assert!(!first.is_closed());
+    assert!(second.is_admission_closed());
+    assert!(!first.is_admission_closed());
     first.close().await.unwrap();
 }

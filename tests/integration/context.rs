@@ -149,7 +149,7 @@ async fn context_introspection_event_loop_full(vx: Vertx) {
     let (id, ctx) = capture(&vx).await;
     assert_eq!(ctx.threading_model(), ThreadingModel::EventLoop);
     assert_eq!(ctx.deployment_id(), id);
-    assert!(ctx.owner().is_some());
+    assert!(ctx.vertx().is_some());
     assert!(ctx.event_loop_id().is_some());
     vx.close().await.unwrap();
 }

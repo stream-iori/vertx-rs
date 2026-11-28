@@ -145,7 +145,7 @@ async fn out_of_range_deadlines_leave_the_scope_usable(vx: Vertx) {
             Err(VertxError::InvalidOptions(_))
         ));
     }
-    assert!(ctx.is_alive());
+    assert!(ctx.accepts_work());
     ctx.timer(Duration::ZERO).unwrap().await.unwrap();
     vx.undeploy(id).await.unwrap();
     vx.close().await.unwrap();

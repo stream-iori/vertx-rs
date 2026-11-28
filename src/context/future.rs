@@ -196,8 +196,8 @@ fn with_execution<T>(
             );
             None
         }
-        Target::Worker { execution, .. } => Some(
-            execution
+        Target::Worker { execution_gate, .. } => Some(
+            execution_gate
                 .lock()
                 .expect("Worker execution gate poisoned by an internal failure"),
         ),

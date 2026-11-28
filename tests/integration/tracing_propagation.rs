@@ -29,7 +29,7 @@ async fn span_creation_can_reenter_deployment_admission() {
             if attributes.metadata().name() == "context_task"
                 && let Some(ctx) = Context::current()
             {
-                assert!(ctx.is_alive());
+                assert!(ctx.accepts_work());
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }

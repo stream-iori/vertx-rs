@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Default)]
 struct Lane {
-    tasks: VecDeque<Arc<Task>>,
+    ready_tasks: VecDeque<Arc<Task>>,
     scheduled: bool,
 }
 
@@ -21,7 +21,7 @@ enum Dispatch {
 struct State {
     ready: VecDeque<Dispatch>,
     lanes: HashMap<u64, Lane>,
-    tasks: HashMap<TaskId, Arc<Task>>,
+    live_tasks: HashMap<TaskId, Arc<Task>>,
     closing: bool,
 }
 
@@ -46,7 +46,7 @@ impl Scheduler {
             if state.closing {
                 return Err(VertxError::VertxClosed);
             }
-            state.tasks.insert(task.id, task.clone());
+            state.live_tasks.insert(task.id, task.clone());
         }
         task.schedule();
         Ok(())
@@ -67,7 +67,7 @@ impl Scheduler {
         let mut state = self.state.lock().unwrap();
         let id = task.lane;
         let lane = state.lanes.entry(id).or_default();
-        lane.tasks.push_back(task);
+        lane.ready_tasks.push_back(task);
         if !lane.scheduled {
             lane.scheduled = true;
             state.ready.push_back(Dispatch::Context(id));
@@ -76,7 +76,7 @@ impl Scheduler {
     }
 
     pub(super) fn task_finished(&self, id: TaskId) {
-        let task = self.state.lock().unwrap().tasks.remove(&id);
+        let task = self.state.lock().unwrap().live_tasks.remove(&id);
         drop(task);
         self.available.notify_all();
     }
@@ -106,7 +106,7 @@ impl Scheduler {
             if let Some(dispatch) = state.ready.pop_front() {
                 return Some(dispatch);
             }
-            if state.closing && state.tasks.is_empty() {
+            if state.closing && state.live_tasks.is_empty() {
                 return None;
             }
             state = self.available.wait(state).unwrap();
@@ -121,14 +121,14 @@ impl Scheduler {
             .lanes
             .get_mut(&id)
             .expect("scheduled lane exists")
-            .tasks
+            .ready_tasks
             .pop_front()
             .expect("scheduled lane owns ready work");
         // Keep the lane scheduled until this poll or user destructor returns.
         task.run(self);
 
         let mut state = self.state.lock().unwrap();
-        if state.lanes[&id].tasks.is_empty() {
+        if state.lanes[&id].ready_tasks.is_empty() {
             state.lanes.remove(&id);
         } else {
             state.ready.push_back(Dispatch::Context(id));

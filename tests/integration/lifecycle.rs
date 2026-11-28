@@ -411,7 +411,7 @@ async fn cancellation_of_pending_deploy_cleans_startup(vx: Vertx) {
     deploy.abort();
     assert!(deploy.await.unwrap_err().is_cancelled());
     vx.close().await.unwrap();
-    assert!(!ctx.is_alive());
+    assert!(!ctx.accepts_work());
 }
 
 #[rstest]

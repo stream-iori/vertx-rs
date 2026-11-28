@@ -75,7 +75,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     assert!(matches!(first, Err(VertxError::ShutdownTimeout(_))));
     saw_cancel.await.map_err(|_| VertxError::ReplyClosed)?;
     started.await.map_err(|_| VertxError::ReplyClosed)?;
-    assert!(vx.is_closed());
+    assert!(vx.is_admission_closed());
     assert!(matches!(
         vx.event_bus().send("new-work", ()).await,
         Err(VertxError::VertxClosed)

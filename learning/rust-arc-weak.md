@@ -13,20 +13,18 @@
 ## vertx-rs 的例子
 
 ```text
-VertxInner ── Arc ──→ ContextShared
-    ↑                       │
-    └──────── Weak ─────────┘
+Context ── Arc ──→ ContextData ── Weak ──→ VertxInner
 ```
 
-- `VertxInner` 通过 `Arc<ContextShared>` 持有实例级资源，各个 `Context` 也能共享这些资源。
-- `ContextShared` 保存 `Weak<VertxInner>`。构建时，`Arc::new_cyclic()` 把这个弱引用交给初始化闭包，供它写入 `ContextShared`。
-- `Context::owner()` 需要实例句柄时才调用 `upgrade()`。即使某个 `Context` 还持有 `ContextShared`，这个回指也不会延长 `VertxInner` 的生命周期。
+- `VertxInner` 和 `ContextData` 通过 `Arc` 共用执行器、实例服务和关闭状态。
+- 创建 `ContextData` 时，用 `Arc::downgrade()` 保存对 `VertxInner` 的弱引用。
+- `Context::vertx()` 需要实例句柄时才调用 `upgrade()`。单独保留 `Context` 不会延长 `VertxInner` 的生命周期。
 
-[共享字段](../src/context.rs#L38) · [获取 owner](../src/context.rs#L143) · [构建实例](../src/vertx.rs#L674)
+[共享字段](../src/context.rs#L43) · [获取 Vertx 句柄](../src/context.rs#L171) · [构建实例](../src/vertx/builder.rs#L106)
 
 ## Vertx 的 #[derive(Clone)]
 
-`#[derive(Clone)]` 让编译器为 `Vertx` 生成 `Clone` 实现，依次克隆它的每个字段。目前唯一的字段是 `inner: Arc<VertxInner>`，所以生成的行为等价于下面的手写实现。[Vertx 定义](../src/vertx.rs#L32)
+`#[derive(Clone)]` 让编译器为 `Vertx` 生成 `Clone` 实现，依次克隆它的每个字段。目前唯一的字段是 `inner: Arc<VertxInner>`，所以生成的行为等价于下面的手写实现。 [Vertx 定义](../src/vertx.rs#L71)
 
 ```rust
 impl Clone for Vertx {

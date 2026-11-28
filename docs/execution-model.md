@@ -33,6 +33,7 @@ Vertx
 ContextGuard 不可 Send，也不跨 await 保存。Future 取消时，在所属执行环境中设置 Context 后析构用户状态。
 Worker 的 Context 就绪队列每次派发一个 poll；Pending 后释放执行权，析构也与普通 poll 互斥。
 同 Context 的其他任务可以在该 Future 等待期间执行；同消费者仍等待当前消息 Future 完成再取下一条。
+`Context::vertx()` 尝试取得所属的 Vertx 句柄，实例已析构时返回 None。
 
 ```text
 poll(A): CURRENT=A → poll user A → restore

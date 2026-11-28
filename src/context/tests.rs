@@ -156,7 +156,8 @@ async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] wor
     task.abort();
     assert!(matches!(task.await, Err(VertxError::Panic(_))));
     if let super::Target::Worker {
-        execution: gate, ..
+        execution_gate: gate,
+        ..
     } = &ctx.data.target
     {
         assert!(

@@ -66,7 +66,7 @@ async fn open_tcp(
     addr: SocketAddr,
     mode: ListenMode,
 ) -> Result<(TcpIncoming, Option<Arc<PortBudget>>)> {
-    ctx.check_local()?;
+    ctx.ensure_current_event_loop_context()?;
     if let ListenMode::Managed(limit) = mode
         && limit.get() > Semaphore::MAX_PERMITS
     {
@@ -93,7 +93,7 @@ impl TcpIncoming {
     /// call gives up its position in line. The registration can accept again.
     /// If nobody is waiting, connections stay in the OS backlog.
     pub async fn accept(&mut self) -> Result<(TcpStream, SocketAddr)> {
-        self.ctx.check_local()?;
+        self.ctx.ensure_current_event_loop_context()?;
         let registry = self.ctx.tcp_listeners();
         let accept = async {
             let _turn = self.turn.lock().await;
@@ -266,7 +266,7 @@ impl TcpListeners {
     ) -> Result<(TcpIncoming, Option<Arc<PortBudget>>)> {
         loop {
             let binding = self.binding.lock().await;
-            ctx.check_local()?;
+            ctx.ensure_current_event_loop_context()?;
             let registration = if requested.port() == 0 {
                 Registration::Unbound
             } else {
@@ -314,7 +314,7 @@ impl TcpListeners {
         mode: ListenMode,
         socket: Option<TcpListener>,
     ) -> Result<Registration> {
-        ctx.check_local()?;
+        ctx.ensure_current_event_loop_context()?;
         let scope = ctx.scope();
         let mut admission = scope.admit()?;
         let mut state = self.state.lock().unwrap();
@@ -396,7 +396,7 @@ impl TcpListeners {
         ctx: &Context,
         registration: &ListenerRegistration,
     ) -> Result<Arc<BoundListener>> {
-        ctx.check_local()?;
+        ctx.ensure_current_event_loop_context()?;
         let _admission = ctx.scope().admit()?;
         let state = self.state.lock().unwrap();
         if state.closed {
@@ -471,7 +471,7 @@ fn bind_managed(addr: SocketAddr) -> io::Result<TcpListener> {
 }
 
 fn stopped(ctx: &Context) -> VertxError {
-    if ctx.instance_closed() {
+    if ctx.instance_admission_closed() {
         VertxError::VertxClosed
     } else {
         VertxError::DeploymentTerminated(ctx.scope().deployment)

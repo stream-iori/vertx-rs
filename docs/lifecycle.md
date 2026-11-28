@@ -51,6 +51,8 @@ is_finished 和等待结果都晚于用户 Future 析构。保留取消句柄或
 跟踪令牌和任务登记在用户 Future 析构后释放，覆盖未首次 poll 就被 abort 的情况。
 普通任务错误报告给异常 handler；Consumer 按消息捕获错误及 panic，随后继续接收。
 
+`Context::accepts_work()` 查询部署此刻是否接收普通工作。提交时仍会重新校验准入。
+
 ## 撤销与关闭
 
 1. 关闭部署准入，拒绝新任务、订阅、TCP 监听、定时器及普通阻塞操作。
@@ -79,7 +81,7 @@ EventLoop 退出时在所属线程取消剩余命令、销毁 LocalSet 和 runti
 关闭末尾最多创建一个临时回收线程，join 全部 EventLoop 后才发布最终结果。
 Worker 与 EventLoop 都不等待回收自身；join 或回收线程创建失败返回 CleanupFailed，不能误报成功。
 显式 close 成功表示所有 Worker 和 EventLoop OS 线程已退出并完成 join。
-排空时拒绝新业务，但继续接受已有任务的必要 wake 和取消调度。
+`Vertx::is_admission_closed()` 在关闭准入后即返回 true。后台排空期间，已有任务仍可被唤醒或取消。
 取消 close 的等待 Future 不会取消后台清理；超时后实例仍拒绝新工作，可再次等待 close。
 stop 及异常 hook 析构失败通过 `CleanupFailed` 保留。仅启动取消时按正常关闭处理。
 同部署任务调用等待自身的 undeploy，或本实例 Context 内调用 close，返回 WouldDeadlock。

@@ -143,7 +143,7 @@ impl DeploymentScope {
             Err(VertxError::DeploymentTerminated(self.deployment))
         }
     }
-    pub fn running(&self) -> bool {
+    pub fn try_mark_running(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.phase == Phase::Starting && !self.cancel.is_cancelled() {
             state.phase = Phase::Running;

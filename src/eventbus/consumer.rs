@@ -68,7 +68,7 @@ impl<T: Send + 'static> Consumer<T> {
         if !Context::current().is_some_and(|c| ctx.same(&c)) {
             return Err(VertxError::ContextMismatch);
         }
-        ctx.ensure_alive()?;
+        ctx.ensure_accepting_work()?;
         Ok(ctx)
     }
     /// Attach an async handler on its owning EventLoop. Messages are processed
@@ -93,7 +93,7 @@ impl<T: Send + 'static> Consumer<T> {
         mut handler: impl AsyncFnMut(Envelope<T>) -> Result<()> + 'static,
     ) -> Result<()> {
         let ctx = self.handler_context()?;
-        ctx.check_local()?;
+        ctx.ensure_current_event_loop_context()?;
         ctx.clone().spawn_local(async move {
             while let Some(env) = self.next_for_handler(&ctx).await {
                 dispatch_message(&ctx, env.trace.clone(), async { handler(env).await }).await;

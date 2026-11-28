@@ -120,7 +120,7 @@ impl Vertx {
     /// Returns whether business admission has closed.
     /// Cleanup and thread joins may still be in progress. Await [`Self::close`]
     /// to confirm that all executor threads have exited.
-    pub fn is_closed(&self) -> bool {
+    pub fn is_admission_closed(&self) -> bool {
         self.inner.lifetime.cancel.is_cancelled()
     }
     /// Creates a timer with an absolute deadline starting now.
@@ -138,7 +138,7 @@ impl Vertx {
         crate::Periodic::new(init, period, self.inner.lifetime.cancel.clone())
     }
     fn ensure_open(&self) -> Result<()> {
-        if self.is_closed() {
+        if self.is_admission_closed() {
             Err(VertxError::VertxClosed)
         } else {
             Ok(())
