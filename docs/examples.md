@@ -32,7 +32,7 @@
 |---|---|---|
 | [deployment_rollback](../examples/deployment_rollback.rs) | 第二个实例启动失败，整批回滚 | deploy_with、stop、DeploymentFailed |
 | [external_dispatch](../examples/external_dispatch.rs) | 外部 OS 线程派发实例级任务和指定部署的任务 | VertxHandle::spawn、Deployment::spawn、current_execution |
-| [graceful_shutdown](../examples/graceful_shutdown.rs) | close 超时后继续清理并再次等待 | stopping、stop、execute_blocking、close |
+| [graceful_shutdown](../examples/graceful_shutdown.rs) | 内部发起关闭，外部超时后继续等清理 | request_close、close、wait_closed、execute_blocking |
 | [error_handling](../examples/error_handling.rs) | 业务失败、异常及 panic 隔离 | fail、set_exception_handler、clear_exception_handler |
 
 ### TCP 与 HTTP 示例
@@ -179,14 +179,14 @@ abort 只能在执行器重新取得执行权后生效，不能抢占同步死�
 ## graceful_shutdown：超时停止等待，不停止清理
 
 ```text
-close → 任务收到取消 → stop → Worker 清理等待 gate
-  ↓ 250ms 超时                     ↑
-ShutdownTimeout → 拒绝新工作 → 放行 gate → 再次 close → 全部线程 join
+实例任务 request_close() → 任务收到取消 → stop → Worker 清理等待 gate
+外部 close().await → ShutdownTimeout → 放行 gate → wait_closed().await
 ```
 
-先等待部署任务和实例级任务就绪。close 触发两级停止信号。stop 中的 blocking 闭包通过 channel 阻止清理完成，
-因此第一次 close 必须超时；等到协作任务退出且 blocking 已启动后，确认实例拒绝新业务。
-随后放行 gate，确认清理结果为 42、stop 只执行一次，并再次等待 close 成功。
+部署任务和实例级任务就绪后，实例任务通过 `VertxHandle::request_close()` 发出关闭请求。
+`stop` 中的 blocking 闭包通过 channel 等待放行，外部调用 `close()` 得到 `ShutdownTimeout`。
+等到协作任务退出且 blocking 已启动后，确认实例拒绝新业务。
+随后放行 gate，确认清理结果为 42、`stop` 执行一次，并用 `wait_closed()` 确认全部执行器线程退出。
 
 gate 的发送端在失败或业务超时时被丢弃，也能解除 Worker 的等待，不留下永久阻塞的清理操作。
 这只是示例控制的可释放操作；框架不能强制中断任意 blocking 闭包。

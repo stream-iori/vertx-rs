@@ -138,6 +138,10 @@ async fn retaining_weak_handles_does_not_keep_pending_runtime_tasks_alive() {
     let retained = vx.deploy(|| local(|_| async { Ok(()) })).await.unwrap();
     drop(vx);
     assert!(matches!(handle.event_bus(), Err(VertxError::VertxClosed)));
+    assert!(matches!(
+        handle.request_close(),
+        Err(VertxError::VertxClosed)
+    ));
     tokio::time::timeout(Duration::from_secs(3), observed)
         .await
         .unwrap()

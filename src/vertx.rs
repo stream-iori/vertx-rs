@@ -77,8 +77,8 @@ pub struct Vertx {
 }
 
 impl Vertx {
-    /// Returns a weak handle for business operations. It can be moved into
-    /// callbacks and tasks without extending the instance's lifetime.
+    /// Returns a weak handle for business operations and shutdown requests.
+    /// Callbacks and tasks can retain it without extending the instance's lifetime.
     pub fn handle(&self) -> VertxHandle {
         VertxHandle::new(Arc::downgrade(&self.inner))
     }
@@ -117,7 +117,7 @@ impl Vertx {
         self.inner.executors.workers.threads()
     }
     /// Returns whether business admission has closed.
-    /// Cleanup and thread joins may still be in progress. Await [`Self::close`]
+    /// Cleanup and thread joins may still be in progress. Await [`Self::wait_closed`]
     /// to confirm that all executor threads have exited.
     pub fn is_admission_closed(&self) -> bool {
         self.inner.lifetime.scope.instance_admission_closed()

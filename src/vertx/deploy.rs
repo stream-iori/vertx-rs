@@ -181,18 +181,21 @@ mod tests {
             })
         });
         ready.await.unwrap();
-        let close = vertx.close();
-        tokio::pin!(close);
-        assert!(futures::poll!(&mut close).is_pending());
+        vertx.request_close().unwrap();
+        let closed = vertx.wait_closed();
+        tokio::pin!(closed);
+        assert!(futures::poll!(&mut closed).is_pending());
         assert_eq!(vertx.diagnostics().active_deployments, 1);
         fail.send(()).unwrap();
         assert!(matches!(
             submission.join().unwrap(),
             Err(VertxError::Other(_))
         ));
-        assert!(matches!(close.await, Err(VertxError::CleanupFailed(errors))
-            if matches!(errors.as_slice(), [VertxError::Other(error)] if error == "executor rejected submission")
-        ));
+        assert!(
+            matches!(closed.await, Err(VertxError::CleanupFailed(errors))
+                if matches!(errors.as_slice(), [VertxError::Other(error)] if error == "executor rejected submission")
+            )
+        );
         assert_eq!(vertx.diagnostics().active_deployments, 0);
     }
 }

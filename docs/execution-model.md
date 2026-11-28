@@ -29,7 +29,7 @@ Vertx
 
 ## 业务入口和资源归属
 
-应用通过 `Vertx` 构建、部署和关闭实例，也可直接调用业务 API。Verticle 的 `start` 和 `stop` 接收 `VertxHandle`。
+应用通过 `Vertx` 构建、部署和等待实例关闭，也可直接调用业务 API。Verticle 的 `start` 和 `stop` 接收 `VertxHandle`，可用它发起实例关闭。
 两者走同一套派发逻辑。把任务提交到指定部署时，使用部署返回的 `Deployment::spawn`。
 
 | 调用位置 | 执行目标 | 资源随谁停止 |

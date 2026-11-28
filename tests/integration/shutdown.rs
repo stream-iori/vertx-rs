@@ -1,14 +1,15 @@
 //! Stop/close ordering, deadlines, joins and deadlock rejection.
 
-use super::support::{capture, capture_worker, echo, local, vx};
+use super::support::{capture, capture_worker, echo, local, report_on_thread_exit, vx};
 use rstest::rstest;
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    ExecutionInfo, ExecutorThread, Result, Verticle, Vertx, VertxError, VertxHandle, WorkerVerticle,
+    ExecutionInfo, ExecutorThread, Result, ThreadingModel, Verticle, Vertx, VertxError,
+    VertxHandle, WorkerVerticle,
 };
 
 #[tokio::test]
@@ -161,6 +162,86 @@ async fn close_is_idempotent_cancels_global_resources_and_rejects_work(vx: Vertx
 }
 
 #[rstest]
+#[case::event_loop(ThreadingModel::EventLoop)]
+#[case::worker(ThreadingModel::Worker)]
+#[tokio::test]
+async fn managed_task_can_request_close_with_an_external_waiter(#[case] model: ThreadingModel) {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let (deployment, _) = match model {
+        ThreadingModel::EventLoop => capture(&vx).await,
+        ThreadingModel::Worker => capture_worker(&vx).await,
+    };
+    let closed = vx.wait_closed();
+    tokio::pin!(closed);
+    assert!(futures::poll!(&mut closed).is_pending());
+    assert!(!vx.is_admission_closed());
+
+    let handle = vx.handle();
+    let (report, mut exited) = oneshot::channel();
+    deployment
+        .spawn(async move {
+            assert_eq!(ExecutionInfo::current().unwrap().threading_model, model);
+            report_on_thread_exit(report);
+            handle.request_close()
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(vx.is_admission_closed());
+
+    tokio::time::timeout(Duration::from_secs(3), closed)
+        .await
+        .unwrap()
+        .unwrap();
+    exited.try_recv().unwrap();
+    vx.wait_closed().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn concurrent_close_requests_run_stop_once(vx: Vertx) {
+    struct CountStops(Arc<AtomicUsize>);
+    impl Verticle for CountStops {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let stops = Arc::new(AtomicUsize::new(0));
+    let count = stops.clone();
+    vx.deploy(move || CountStops(count)).await.unwrap();
+    let handle = vx.handle();
+    let ready = Barrier::new(2);
+    std::thread::scope(|threads| {
+        let request = threads.spawn(|| {
+            ready.wait();
+            handle.request_close()
+        });
+        ready.wait();
+        vx.request_close().unwrap();
+        request.join().unwrap().unwrap();
+    });
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(vx.wait_closed(), vx.wait_closed())
+    })
+    .await
+    .unwrap();
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+}
+
+#[rstest]
 #[tokio::test]
 async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Vertx) {
     let (tx, rx) = oneshot::channel();
@@ -182,6 +263,10 @@ async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Ver
                         owner.close().await,
                         Err(VertxError::WouldDeadlock)
                     ));
+                    assert!(matches!(
+                        owner.wait_closed().await,
+                        Err(VertxError::WouldDeadlock)
+                    ));
                     current.request_stop();
                     tx.send(()).ok();
                     Ok(())
@@ -191,8 +276,12 @@ async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Ver
         })
         .await
         .unwrap();
-    rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), rx)
+        .await
+        .unwrap()
+        .unwrap();
     deployment.wait_stopped().await.unwrap();
+    assert!(!vx.is_admission_closed());
     vx.close().await.unwrap();
 }
 
@@ -315,7 +404,10 @@ async fn cancelled_close_waiter_does_not_cancel_cleanup(vx: Vertx) {
     assert!(futures::poll!(close.as_mut()).is_pending());
     drop(close);
     tx.send(()).unwrap();
-    vx.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), vx.wait_closed())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(vx.is_admission_closed());
 }
 
@@ -385,7 +477,10 @@ async fn saturated_worker_pool_does_not_prevent_close_timeout_or_later_cleanup()
         result.unwrap(),
         Err(VertxError::ShutdownTimeout(_))
     ));
-    vx.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), vx.wait_closed())
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -440,6 +535,10 @@ async fn raw_tokio_task_on_owned_eventloop_cannot_wait_for_its_own_close() {
             assert!(matches!(
                 owner.close().await,
                 Err(VertxError::WouldDeadlock)
+            ));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(3), owner.wait_closed()).await,
+                Ok(Err(VertxError::WouldDeadlock))
             ));
         })
         .await
@@ -515,7 +614,8 @@ async fn eventloop_can_await_close_of_a_different_vertx_instance() {
     let id = Some(ctx.id());
     let target = second.clone();
     ctx.spawn(async move {
-        target.close().await?;
+        target.request_close()?;
+        target.wait_closed().await?;
         assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
         Ok(())
     })

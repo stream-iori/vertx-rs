@@ -1,4 +1,4 @@
-//! close 超时不取消后台清理；stop 可在共享 Worker 池执行 blocking 清理。
+//! 实例任务请求关闭，外部等待共享 Worker 池完成 blocking 清理。
 //! cargo run --example graceful_shutdown
 //! 首次 ShutdownTimeout 是预期结果；不用 sleep 猜测清理进度。
 mod support;
@@ -85,6 +85,10 @@ async fn run(vx: &Vertx) -> Result<()> {
         Ok(())
     })?;
     instance_ready.await.map_err(|_| VertxError::ReplyClosed)?;
+
+    let requester = vx.handle();
+    vx.spawn(async move { requester.request_close() })?.await?;
+    println!("instance task requested shutdown");
     let first = vx.close().await;
     assert!(matches!(first, Err(VertxError::ShutdownTimeout(_))));
     instance_task.await?;
@@ -95,7 +99,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     println!("close timed out; cooperative task exited; blocking cleanup is still running");
     release.send(()).map_err(|_| VertxError::ReplyClosed)?;
     finished.await.map_err(|_| VertxError::ReplyClosed)?;
-    vx.close().await?;
+    vx.wait_closed().await?;
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let snapshot = vx.diagnostics();
     assert_eq!(snapshot.close_stage, "closed");
@@ -103,7 +107,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     assert_eq!(snapshot.active_deployments, 0);
     assert_eq!(snapshot.active_consumers, 0);
     assert_eq!(snapshot.blocking_waiting + snapshot.blocking_running, 0);
-    println!("cleanup completed once; subsequent close joined all executor threads");
+    println!("cleanup ran once and wait_closed confirmed all executor threads exited");
     Ok(())
 }
 #[tokio::main(flavor = "current_thread")]

@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-/// A cloneable weak handle for business operations on a Vertx instance.
+/// A cloneable weak handle for business operations and shutdown requests.
 ///
 /// Managed calls inherit the current execution when it belongs to this
 /// instance. Calls from outside that execution use the instance's lifetime.
@@ -57,6 +57,13 @@ impl VertxHandle {
             return Ok(ctx.scope().clone());
         }
         Ok(self.instance()?.lifetime.scope.clone())
+    }
+
+    /// Requests shutdown of this instance without waiting. This can be called
+    /// from its own EventLoop or Worker. See [`Vertx::request_close`].
+    /// Returns [`VertxError::VertxClosed`] if the instance has been dropped.
+    pub fn request_close(&self) -> Result<()> {
+        self.instance()?.request_close()
     }
 
     /// Returns the instance's bus. Consumer ownership is decided at registration.

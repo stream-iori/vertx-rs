@@ -59,8 +59,10 @@ Starting → start 成功 → Running → 请求停止 → Stopping → Stopped
 - `TcpServer::request_shutdown(grace)` 通知服务停止接收、排空连接，调用后立即返回。服务可以在所属 Context 中发起关闭。首个有效请求确定期限，零宽限期会立即请求中止剩余连接。
 - 从外部或其他 Context 调用 `wait_closed()`，可以等到监听登记和连接清理完成。`shutdown(grace)` 同时发起关闭并等待到同一个期限，超时返回 `ShutdownTimeout`。清理继续在所属 EventLoop 执行，仍可用 `wait_closed()` 等结果。在所属 Context 中等待任一接口都会返回 `WouldDeadlock`。
 - 如需在途 HTTP 请求继续访问 EventBus 等应用服务，先等待各服务排空，再调用 `Vertx::close()`。直接停止部署或实例时，服务走受管任务取消流程。启动等待被取消时，尚未交付的服务会撤销监听。
-- `Vertx::close()` 幂等关闭实例和部署准入，发出取消，清理实例资源与全部部署，再 join Worker 和 EventLoop。关闭协调期间，EventLoop 继续驱动任务、I/O 和停止回调。线程都已退出并完成 join 后才返回成功。
-- `is_admission_closed()` 在封住准入时变为 true。超时或丢弃等待 Future 都只影响本次等待，后续可再次等待 `close()`。关闭错误用 `CleanupFailed` 保留。
-- 本实例任一 EventLoop OS 线程或受管执行中等待 `close()` 会得到 `WouldDeadlock`。其他实例的 EventLoop 可以等待。需要确认线程退出时显式等待 `close()`，释放最后一个 `Vertx` 会发起尽力清理。
+- `Vertx::request_close()` 和 `VertxHandle::request_close()` 同步封住准入、发出取消并提交关闭任务。实例内的 EventLoop 和 Worker 都可以调用，重复请求共享一次关闭流程。弱句柄的实例已释放时返回 `VertxClosed`。
+- `Vertx::wait_closed().await` 等待最终结果，可以先开始等待，再由其他任务请求关闭。EventLoop 在清理期间继续驱动任务、I/O 和停止回调。所有 Worker 和 EventLoop 完成 join 后才返回成功。
+- `Vertx::close().await` 发起关闭并按 `shutdown_grace` 等待。超时返回 `ShutdownTimeout`，丢弃等待 Future 也只结束本次等待，后续可用 `wait_closed()` 读取最终结果。清理错误用 `CleanupFailed` 保留，协调任务的派发错误直接记录和返回。
+- 在本实例的受管执行或任一 EventLoop OS 线程上，`close()` 和 `wait_closed()` 都返回 `WouldDeadlock`。此时可以用 `request_close()` 发起关闭。其他实例可以异步等待。
+- `is_admission_closed()` 在封住准入时变为 true。需要确认线程退出时显式等待 `wait_closed()` 或 `close()`。释放最后一个 `Vertx` 会发起尽力清理。
 
 [执行模型](execution-model.md) · [错误与诊断](diagnostics.md)

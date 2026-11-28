@@ -503,10 +503,14 @@ async fn pipe_distinguishes_own_shutdown_from_foreign_source_failure(
     vx.close().await.unwrap();
 }
 
-#[rstest]
 #[tokio::test]
-async fn message_sink_global_close_releases_cached_and_pending_reservations(vx: Vertx) {
+async fn message_sink_global_close_releases_cached_and_pending_reservations() {
     use futures::{Sink, SinkExt};
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
     let bus = vx.event_bus().unwrap();
     let _consumer = bus
         .consumer_with::<()>(
@@ -526,15 +530,26 @@ async fn message_sink_global_close_releases_cached_and_pending_reservations(vx: 
         .poll_ready(cx)))
         .is_pending()
     );
-    vx.close().await.unwrap();
-    assert!(matches!(
-        std::pin::Pin::new(&mut reserved).start_send(()),
-        Err(VertxError::VertxClosed)
-    ));
+    let handle = vx.handle();
+    let observer = vx.clone();
+    vx.spawn(async move {
+        handle.request_close()?;
+        // The close task can sweep routes after this poll returns.
+        assert_eq!(observer.diagnostics().active_consumers, 1);
+        assert!(matches!(
+            std::pin::Pin::new(&mut reserved).start_send(()),
+            Err(VertxError::VertxClosed)
+        ));
+        Ok(())
+    })
+    .unwrap()
+    .await
+    .unwrap();
     assert!(matches!(
         waiting.send(()).await,
         Err(VertxError::VertxClosed)
     ));
+    vx.wait_closed().await.unwrap();
     assert_eq!(
         (
             vx.diagnostics().waiting_senders,
