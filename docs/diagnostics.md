@@ -66,7 +66,7 @@ Stopped 阶段按枚举移除部署记录。
 
 异常优先由 `Deployment::set_exception_handler` 设置的部署 hook 接收，再回退到 `Vertx::set_exception_handler` 设置的全局 hook。调用、替换和清除都先释放配置锁，hook 及其析构可以重设注册。
 框架错误事件独立于用户 hook，每个报告入口只输出一次。hook 自身的 panic 单独记录，避免递归。
-生命周期结束与实例关闭时释放 hook 并收集析构错误，再继续完成清理。
+生命周期结束与实例关闭时封存 hook，在锁外释放并收集析构错误。部署 hook 封存后，后续设置或清除返回 `DeploymentTerminated`。
 受管任务自身的部署终止、实例关闭和显式取消不作为业务异常报告；读取其他部署的流而遇到终止，仍是失败并报告。
 
 | 错误 | 用途 |

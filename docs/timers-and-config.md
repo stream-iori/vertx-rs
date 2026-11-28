@@ -5,7 +5,7 @@
 Timer 创建时记录绝对 deadline，首次 poll 再晚也不会重新计算延迟。
 Periodic 创建时同样记录起点，首次 tick 才初始化 Tokio interval；错过 tick 使用 Skip 策略。
 取消检查优先于同轮到期，is_cancelled 同时反映显式取消和作用域取消。
-完成的一次性 Timer 不因后续关闭变为已取消。
+一次性 Timer 在 poll 得到结果时记录最终状态。正常完成后，后续关闭或取消不会改变状态。
 在部署中创建的 Timer 随部署停止取消，实例级 Timer 随 Vertx 关闭取消。
 创建接口返回 `Result`。零周期或初始 deadline 无法表示时返回 `InvalidOptions`，关闭后返回相应生命周期错误。
 等待 Timer/tick 需要 Tokio 时间驱动；Timer 对象不会把调用方 Future 派发到其他 Context。
@@ -19,6 +19,7 @@ Periodic 创建时同样记录起点，首次 tick 才初始化 Tokio interval�
 | 请求 timeout | 30 秒 |
 
 有序 blocking 使用每个来源 Context 的公平锁保持 FIFO。独立的外部调用各有自己的来源，可以并行占用 Worker。
+如果有序闭包在当前 Worker 线程上首次 poll 同一 Context 的另一个有序 blocking Future，框架会在排队前返回 `WouldDeadlock`。可以在闭包内构造 Future，等外层闭包结束后再 poll。
 跟踪记录覆盖排队、实际执行及调用方取消。
 blocking 闭包使用独立的有序准入。作用域关闭后，等待有序准入和尚未开始的普通操作跳过用户闭包，已开始的操作自然结束。
 阻塞任务提交后，等待方取消不撤回操作；跟踪记录保持到实际闭包结束。

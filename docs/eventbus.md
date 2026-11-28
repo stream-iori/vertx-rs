@@ -68,6 +68,7 @@ const LOOKUP: RequestAddress<u64, String> = RequestAddress::new("lookup");
 - `handler_worker` 使用 `FnMut -> Future`，闭包和返回的 Future 都要求 `Send`。两个入口都校验调用 Context。
 - 丢弃 handler 返回的 `TaskHandle` 会分离等待者，任务继续由原作用域管理。调用 `abort()` 后等待句柄，确认当前处理 Future 已析构且订阅已注销。取消在执行器取得执行权后生效。
 - EventBus 路由表拥有订阅和队列。受管消费者在作用域登记地址和注册 ID，生命周期可以按登记准确注销。
+- 受管 `Consumer` 记录所属 Context 的 ID，并弱引用作用域。保留消费者时，实例仍可关闭并回收执行器。取消后，`recv()` 或 Stream 最多返回一次终止错误，后续读取结束。
 - 注册受管消费者时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
 - 撤销部署只处理属于它的登记。关闭 EventBus 清除所有路由，包括框架外的注册。发送始终按地址查表。
 - Consumer Drop 按地址和订阅 ID 注销单条记录。每次移除都和路由更新原子进行，移除地址下最后一个订阅时同时清除轮询状态。

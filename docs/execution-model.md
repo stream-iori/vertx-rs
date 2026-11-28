@@ -89,10 +89,10 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - 早到的 abort 不会丢失；取消、未首次 poll 的 Future 析构和 panic 清理都在目标线程完成。
 - 命令每处理最多 64 条主动让出执行权。命令队列沿用无界方式，不增加背压 API。
 - 创建实例等待全部 EventLoop 就绪，记录实际 ThreadId 和 runtime Handle；部分启动失败时回收已创建线程。
-- `VertxBuilder::build() -> Result<Vertx>` 在创建线程前校验线程数与 shutdown_grace，零值返回 InvalidOptions。
-  线程/runtime 创建失败以 Other 保留阶段与底层错误文本；后续回收失败使用 LifecycleFailed 保留首错与 cleanup。
-  EventLoop 部分启动失败、或 Worker 初始化失败，均在返回错误前停止并 join 已创建线程。
-  `Vertx::new() -> Result<Vertx>` 使用默认配置构建实例。
+- `VertxBuilder::build() -> Result<Vertx>` 检查线程数与 `shutdown_grace`。每个池在启动自己的线程前预留存储，零值或预留失败返回 `InvalidOptions`。
+  线程或 runtime 创建失败时，`Other` 保留失败阶段和底层错误。回收也失败时，`LifecycleFailed` 保留原始错误和清理错误。
+  EventLoop 部分启动失败或 Worker 初始化失败时，框架在返回错误前停止并 join 已创建的线程。
+  `Vertx::try_new() -> Result<Vertx>` 使用默认配置构建实例。
 - 普通依赖不启用 Tokio rt-multi-thread；tokio-util 继续用于 CancellationToken、TaskTracker 等工具。
 - 本轮只验证派发结构与执行语义，不提供未经测量的性能提升数字。
 
@@ -116,6 +116,7 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - 等待者轮流独占一次接收。暂时忙的 Verticle 在下一次 `accept()` 时重新排队。没人等时，连接留在操作系统的监听队列。
 - 首次绑定的 EventLoop 驱动监听 socket。领取连接的 EventLoop 驱动已接收的 socket。停止首个注册的部署后，仍注册的 Verticle 可以继续接收。
 - 原始监听要求本实例当前 EventLoop。随后只能在登记时的 Context 里轮询 `accept()`，接收器为 `!Send`。线程或归属不匹配返回 `ContextMismatch`。
+- `TcpIncoming` 保存登记 ID、取消信号和弱引用。保留它时，作用域仍可注销登记，EventLoop 仍可退出。
 - 取消一次 `accept()` 会释放等待位置，接收器仍可再次接收。绑定和接收的系统错误通过 `TcpIo` 返回，包含操作、地址及错误类别。
 
 [可运行示例](../examples/tcp_shared_listener.rs) · [停止部署](lifecycle.md#停止部署)
@@ -131,6 +132,7 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 - 受管监听调用 `listen(128)` 设置系统监听队列，请求的队列长度还受操作系统限制。`TcpServerOptions::max_connections` 控制框架的连接许可。
 - 同地址的服务必须设置相同上限。原始 `listen_tcp` 和 `serve_tcp` 在同地址互斥，冲突返回 `InvalidOptions`。最后一份注册退出就释放监听 socket，旧连接仍占用该地址的预算，使用相同上限的服务可重新绑定并复用预算。
 - 受管服务沿用同一监听器的 FIFO 等待顺序。领取连接的 EventLoop 负责该连接的 I/O 和处理任务。Axum 适配 crate 为请求提供 `ConnectInfo<SocketAddr>`，路由和中间件在该任务中运行。
+- 单个服务的连接登记表只由所属 EventLoop 读写，使用 `Rc<RefCell<_>>`。`TcpServer` 可以跨线程传递关闭期限和取消信号，并接收最终结果。同地址的监听登记和连接预算由多个 EventLoop 共享，仍使用同步原语。
 
 [网络示例与运行命令](examples.md#tcp-与-http-示例) · [服务关闭](lifecycle.md#关闭实例与服务)
 

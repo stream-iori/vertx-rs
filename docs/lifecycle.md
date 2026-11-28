@@ -49,14 +49,15 @@ Starting → start 成功 → Running → 请求停止 → Stopping → Stopped
 1. 封住部署准入。取消停止信号，取出订阅与监听登记，在锁外逐项注销。
 2. 给子任务半个关闭宽限期协作退出，再中止剩余异步任务，等待用户 Future 析构。
 3. 等待已经开始的 blocking，执行用户 stop。只有实际 stop 回调中创建并首次 poll 的 blocking Future 能提交清理操作。
-4. 析构 Verticle，等待清理期间提交的 blocking，析构异常 hook，移除部署记录并发布结果。
+4. 析构 Verticle，等待清理期间提交的 blocking，封存并析构异常 hook，移除部署记录并发布结果。封存后设置或清除部署 hook 会返回 `DeploymentTerminated`。
 
 中止只能在执行器取得控制权后生效，已开始的 blocking 会自然结束。丢弃 `TcpIncoming` 会注销监听。最后一个登记退出时释放端口。
 已接收的 socket 由调用者持有，可交给受管任务随任务清理。
 
 ## 关闭实例与服务
 
-- `TcpServer::shutdown(grace)` 停止该服务接收并通知现有连接排空。首个调用确定期限。超时会请求中止剩余连接，`wait_closed()` 等待清理完成。服务执行环境中等待自己的服务关闭会得到 `WouldDeadlock`。
+- `TcpServer::request_shutdown(grace)` 通知服务停止接收、排空连接，调用后立即返回。服务可以在所属 Context 中发起关闭。首个有效请求确定期限，零宽限期会立即请求中止剩余连接。
+- 从外部或其他 Context 调用 `wait_closed()`，可以等到监听登记和连接清理完成。`shutdown(grace)` 同时发起关闭并等待到同一个期限，超时返回 `ShutdownTimeout`。清理继续在所属 EventLoop 执行，仍可用 `wait_closed()` 等结果。在所属 Context 中等待任一接口都会返回 `WouldDeadlock`。
 - 如需在途 HTTP 请求继续访问 EventBus 等应用服务，先等待各服务排空，再调用 `Vertx::close()`。直接停止部署或实例时，服务走受管任务取消流程。启动等待被取消时，尚未交付的服务会撤销监听。
 - `Vertx::close()` 幂等关闭实例和部署准入，发出取消，清理实例资源与全部部署，再 join Worker 和 EventLoop。关闭协调期间，EventLoop 继续驱动任务、I/O 和停止回调。线程都已退出并完成 join 后才返回成功。
 - `is_admission_closed()` 在封住准入时变为 true。超时或丢弃等待 Future 都只影响本次等待，后续可再次等待 `close()`。关闭错误用 `CleanupFailed` 保留。

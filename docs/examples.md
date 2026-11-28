@@ -40,7 +40,7 @@
 | 示例 | 场景 | 重点 API |
 |---|---|---|
 | [tcp_shared_listener](../examples/tcp_shared_listener.rs) | 两个 EventLoop 共用一个 TCP 端口并回显 | listen_tcp、local_addr、accept、spawn_local |
-| [axum_http1](../adapters/axum/examples/axum_http1.rs) | 应用与 Verticle 共用一个 HTTP/1.1 端口，路由返回 EventLoop ID | serve_axum、ConnectInfo、TcpServer::shutdown |
+| [axum_http1](../adapters/axum/examples/axum_http1.rs) | 应用与 Verticle 共用一个 HTTP/1.1 端口，路由返回 EventLoop ID | serve_axum、ConnectInfo、TcpServer::request_shutdown、wait_closed |
 
 ## 运行方式
 
@@ -236,7 +236,7 @@ handler Err → 部署 hook
 
 应用直接用 `serve_axum(&vertx, ...)` 启动第一个服务，一个 Verticle 加入同一地址。内置客户端发起 HTTP/1.1 请求，
 路由读取 `ConnectInfo<SocketAddr>` 获取对端地址，检查 yield 前后的 EventLoop，并用 EventLoop ID 作为响应。
-预期看到同一个地址分别返回两个不同的 `EventLoopId`。示例先并行等待两个服务的 `shutdown()`，再调用 `vx.close()`。
+预期看到同一个地址分别返回两个不同的 `EventLoopId`。示例用 `request_shutdown()` 向两个服务发出排空请求，用 `wait_closed()` 等待清理，再调用 `vx.close()`。
 
 需要自定义连接上限时，可从应用或 Verticle 调用 `serve_axum_with_options`。
 

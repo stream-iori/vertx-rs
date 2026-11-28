@@ -36,8 +36,9 @@ async fn demo(vx: &Vertx) -> Result<()> {
     assert_eq!(owners.len(), 2);
     assert!(owners.contains(&format!("{:?}", deployment.event_loop_id.unwrap())));
     let grace = Duration::from_secs(1);
-    // 先等两个 HTTP 服务排空，再由 main 关闭 Vertx。
-    tokio::try_join!(first.shutdown(grace), second.shutdown(grace))?;
+    first.request_shutdown(grace)?;
+    second.request_shutdown(grace)?;
+    tokio::try_join!(first.wait_closed(), second.wait_closed())?;
     Ok(())
 }
 

@@ -137,6 +137,9 @@ impl VertxHandle {
     /// Runs a blocking closure on the shared Worker pool, FIFO per source Context.
     /// Independent external calls each have their own source Context.
     /// Already-started closures run to completion even when the waiter is dropped.
+    /// First polling a nested ordered call on the thread already running an
+    /// ordered closure for the same Context returns [`VertxError::WouldDeadlock`].
+    /// The closure can construct the future for polling after it returns.
     pub fn execute_blocking<F, T>(
         &self,
         operation: F,
