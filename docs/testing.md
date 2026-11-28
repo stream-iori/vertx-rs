@@ -89,7 +89,7 @@ fixture 只消除重复创建，时序、消息、断言和清理保留在测试
 cargo test --test integration -- --list
 cargo test --test integration streams::
 cargo test --test integration tcp::
-cargo test --test integration tcp_service::
+cargo test --test integration tcp_server::
 cargo test -p vertx-rs-axum --test service
 cargo test --test integration pipe_preserves_primary_and_cleanup_failures::case_04_read_and_close_errors
 cargo test --lib eventloop::tests::cancellation::

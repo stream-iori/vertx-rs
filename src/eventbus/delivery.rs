@@ -18,9 +18,9 @@ impl EventBus {
         body: T,
         options: DeliveryOptions,
     ) -> Result<()> {
-        let senders = self.router.subscribers::<T>(address)?;
+        let senders = self.router().subscribers::<T>(address)?;
         let headers = options.into_headers();
-        let diagnostics = &self.router.diagnostics;
+        let diagnostics = &self.router().diagnostics;
         let mut dropped = 0;
         for sender in senders {
             let Ok(reservation) = sender.try_reserve() else {
@@ -127,7 +127,7 @@ impl EventBus {
         let timeout = options.timeout();
         let request = self.request_reply(request_id, address, body, options.into_headers());
         tokio::time::timeout(timeout, request).await.map_err(|_| {
-            let diagnostics = &self.router.diagnostics;
+            let diagnostics = &self.router().diagnostics;
             diagnostics.timeout();
             if diagnostics.options.enabled {
                 tracing::warn!(
@@ -155,7 +155,7 @@ impl EventBus {
             self.prepare(address, body, headers, Some(reply_to), Some(request_id))?;
         sender.send(envelope).await?;
         let response = tokio::select! { biased;
-            _ = self.router.closed.cancelled() => return Err(VertxError::VertxClosed),
+            _ = self.router().closed.cancelled() => return Err(VertxError::VertxClosed),
             result = reply => result.map_err(|_| VertxError::ReplyClosed)??,
         };
         response.trace.reply("received");
@@ -170,9 +170,9 @@ impl EventBus {
         reply_to: Option<oneshot::Sender<Result<ErasedEnvelope>>>,
         request_id: Option<u64>,
     ) -> Result<(QueueSender, ErasedEnvelope)> {
-        let sender = self.router.select::<T>(address)?;
+        let sender = self.router().select::<T>(address)?;
         let envelope = ErasedEnvelope {
-            trace: MessageTrace::new(&self.router.diagnostics, address, request_id),
+            trace: MessageTrace::new(&self.router().diagnostics, address, request_id),
             body: Box::new(body),
             headers,
             reply_to,

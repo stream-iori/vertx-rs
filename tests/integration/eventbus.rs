@@ -74,6 +74,46 @@ async fn undeploy_removes_only_its_own_subscribers(vx: Vertx) {
 
 #[rstest]
 #[tokio::test]
+async fn instance_bus_only_binds_to_contexts_in_the_same_instance(vx: Vertx) {
+    let other = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let own_bus = vx.event_bus();
+    let other_bus = other.event_bus();
+    let (registered, ready) = oneshot::channel();
+    let id = vx
+        .deploy(move |_| {
+            local(move |_| async move {
+                let bound = own_bus.consumer::<u32>("owned")?;
+                let unbound = other_bus.consumer::<u32>("foreign")?;
+                registered.send((bound, unbound)).ok();
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let (mut bound, mut unbound) = ready.await.unwrap();
+
+    vx.undeploy(id).await.unwrap();
+    assert!(matches!(
+        vx.event_bus().try_send("owned", 42u32),
+        Err(VertxError::NoConsumer(_))
+    ));
+    assert!(matches!(
+        bound.recv().await,
+        Err(VertxError::DeploymentTerminated(owner)) if owner == id
+    ));
+    other.event_bus().try_send("foreign", 42u32).unwrap();
+    assert_eq!(unbound.recv().await.unwrap().unwrap().into_body(), 42);
+
+    other.close().await.unwrap();
+    vx.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn publish_delivers_to_all_subscribers(vx: Vertx) {
     let bus = vx.event_bus();
     let mut a = bus.consumer::<u32>("pub").unwrap();

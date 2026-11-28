@@ -1,4 +1,4 @@
-use super::TcpIncoming;
+use super::listener::{PortBudget, PortPermit, TcpIncoming, listen_managed};
 use crate::task::ActiveTasks;
 use crate::{Context, ContextId, Result, TaskAbortHandle, TaskId, VertxError};
 use std::net::SocketAddr;
@@ -11,7 +11,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
@@ -185,13 +185,7 @@ impl Context {
     where
         F: for<'a> AsyncFn(TcpConnection<'a>) -> Result<()> + 'static,
     {
-        self.check_local()?;
-        if options.max_connections.get() > Semaphore::MAX_PERMITS {
-            return Err(VertxError::InvalidOptions(
-                "TCP connection limit exceeds Semaphore::MAX_PERMITS".into(),
-            ));
-        }
-        let incoming = self.open_tcp(addr, Some(options)).await?;
+        let (incoming, budget) = listen_managed(self, addr, options.max_connections).await?;
         let control = Arc::new(Control {
             addr: incoming.local_addr(),
             owner: self.id(),
@@ -199,7 +193,7 @@ impl Context {
             stop: CancellationToken::new(),
             done: watch::channel(None).0,
         });
-        let task = ServiceTask {
+        let task = ServerTask {
             incoming: Some(incoming),
             handler: Rc::new(handler),
             connections: TaskTracker::new(),
@@ -208,28 +202,13 @@ impl Context {
                 outcome: Mutex::new(Ok(())),
             }),
         };
-        self.spawn_local(run_service(self.clone(), task))?;
+        self.spawn_local(run_server(self.clone(), task, budget))?;
         Ok(TcpServer { control })
     }
 }
 
-pub(super) struct PortBudget {
-    pub(super) options: TcpServerOptions,
-    capacity: Arc<Semaphore>,
-}
-
-impl PortBudget {
-    pub(super) fn new(options: TcpServerOptions) -> Self {
-        Self {
-            options,
-            capacity: Arc::new(Semaphore::new(options.max_connections.get())),
-        }
-    }
-}
-
 struct ConnectionPermit {
-    _capacity: OwnedSemaphorePermit,
-    _budget: Arc<PortBudget>,
+    _port: PortPermit,
     _tracked: TaskTrackerToken,
     registration: Option<ConnectionRegistration>,
     _completion: Arc<Completion>,
@@ -315,7 +294,7 @@ impl Drop for Completion {
     }
 }
 
-struct ServiceTask<F> {
+struct ServerTask<F> {
     incoming: Option<TcpIncoming>,
     handler: Rc<F>,
     connections: TaskTracker,
@@ -347,11 +326,11 @@ where
     .await
 }
 
-async fn run_service<F>(ctx: Context, mut task: ServiceTask<F>) -> Result<()>
+async fn run_server<F>(ctx: Context, mut task: ServerTask<F>, budget: Arc<PortBudget>) -> Result<()>
 where
     F: for<'a> AsyncFn(TcpConnection<'a>) -> Result<()> + 'static,
 {
-    let outcome = accept_connections(&ctx, &mut task).await;
+    let outcome = accept_connections(&ctx, &mut task, budget).await;
     let outcome = match outcome {
         Err(VertxError::VertxClosed) => Ok(()),
         Err(error) if ctx.is_expected_cancellation(&error) => Ok(()),
@@ -384,24 +363,24 @@ where
     outcome
 }
 
-async fn accept_connections<F>(ctx: &Context, task: &mut ServiceTask<F>) -> Result<()>
+async fn accept_connections<F>(
+    ctx: &Context,
+    task: &mut ServerTask<F>,
+    budget: Arc<PortBudget>,
+) -> Result<()>
 where
     F: for<'a> AsyncFn(TcpConnection<'a>) -> Result<()> + 'static,
 {
     let control = &task.completion.control;
     let incoming = task.incoming.as_mut().unwrap();
-    let budget = incoming.budget.as_ref().unwrap().clone();
     loop {
         let accepted = tokio::select! {
             biased;
             _ = control.stop.cancelled() => return Ok(()),
             _ = ctx.scope().cancel.cancelled() => return Ok(()),
             accepted = async {
-                let capacity = budget.capacity.clone().acquire_owned().await
-                    .expect("the port capacity semaphore is never closed");
                 let permit = ConnectionPermit {
-                    _capacity: capacity,
-                    _budget: budget.clone(),
+                    _port: budget.acquire().await,
                     _tracked: task.connections.token(),
                     registration: None,
                     _completion: task.completion.clone(),

@@ -22,8 +22,8 @@ struct PaymentClient {
 | 对比 | 句柄自己保存 | 用 `Arc` 共享 |
 |---|---|---|
 | 支付客户端 | `MerchantId` | 网关客户端和连接池 |
-| `EventBus` | `owner: Option<Context>`，决定新消费者归哪个 Context | `EventBusInner`，包含实例共用的路由表 |
+| `EventBus` | `owner: Option<Context>`，决定新消费者归哪个 Context | `Router`，包含实例共用的路由表 |
 
-`ctx.event_bus()` 创建一个绑定当前 Context 的句柄，里面的 `Arc<EventBusInner>` 仍然指向原来的路由表。[绑定实现](../src/eventbus/mod.rs#L32) · [消费者注册](../src/eventbus/mod.rs#L201)
+`ctx.event_bus()` 创建一个绑定该 Context 的句柄，里面的 `Arc<Router>` 仍指向同一张路由表。[绑定和注册实现](../src/eventbus/bus.rs)
 
 判断时问自己：**多个调用方需要同一个带身份的对象，还是各自带身份、共用底层资源？** 同一家商户的多个任务可以共享整个 `Arc<PaymentClient>`。不同商户可以各自持有 `PaymentClient`，再共享里面的网关客户端。

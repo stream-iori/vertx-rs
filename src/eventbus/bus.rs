@@ -1,20 +1,8 @@
-mod consumer;
-mod delivery;
-mod envelope;
-mod options;
-mod queue;
-mod route;
-mod sink;
-
+use super::route::{Router, SubscriptionOwner};
+use super::{Consumer, ConsumerOptions};
 use crate::deployment::ResourceRegistration;
 use crate::diagnostics::Diagnostics;
 use crate::{Context, Result};
-pub use consumer::Consumer;
-pub use envelope::{Envelope, ReplyHandle};
-pub use options::{ConsumerOptions, DeliveryOptions, Headers, RequestOptions};
-pub(crate) use route::SubscriptionRegistration;
-use route::{Router, SubscriptionOwner};
-pub use sink::MessageSink;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +32,9 @@ impl EventBus {
     }
     pub(crate) fn close(&self) {
         self.router.close();
+    }
+    pub(super) fn router(&self) -> &Arc<Router> {
+        &self.router
     }
     /// Immediately registers with capacity 256. A live address with a different
     /// body type returns `TypeMismatch`. Registration binds to the bus Context, or

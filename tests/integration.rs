@@ -26,8 +26,8 @@ mod streams;
 mod support;
 #[path = "integration/tcp.rs"]
 mod tcp;
-#[path = "integration/tcp_service.rs"]
-mod tcp_service;
+#[path = "integration/tcp_server.rs"]
+mod tcp_server;
 #[path = "integration/timers.rs"]
 mod timers;
 #[path = "integration/tracing_propagation.rs"]

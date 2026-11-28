@@ -2,6 +2,9 @@
 
 [返回文档索引](index.md)
 
+`eventbus.rs` 导出消息类型。`bus.rs` 管 EventBus 句柄的归属和消费者注册。
+地址路由、投递、消费和队列各自在对应子模块实现。
+
 ```text
 address → Route { TypeId, subscribers, round-robin cursor }
                        ↓

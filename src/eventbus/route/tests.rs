@@ -22,13 +22,13 @@ async fn malformed_envelope_reports_conversion_failure_once(bus: EventBus) {
     let mut consumer = bus
         .consumer_with::<u32>("typed", ConsumerOptions::new().with_capacity(1))
         .unwrap();
-    bus.router
+    bus.router()
         .select::<u32>("typed")
         .unwrap()
         .try_reserve()
         .unwrap()
         .send(ErasedEnvelope {
-            trace: MessageTrace::new(&bus.router.diagnostics, "typed", None),
+            trace: MessageTrace::new(&bus.router().diagnostics, "typed", None),
             body: Box::new("wrong type"),
             headers: Headers::new(),
             reply_to: None,
@@ -39,7 +39,7 @@ async fn malformed_envelope_reports_conversion_failure_once(bus: EventBus) {
         Err(VertxError::TypeMismatch(_))
     ));
     assert!(consumer.recv().await.unwrap().is_none());
-    assert!(bus.router.routes.is_empty());
+    assert!(bus.router().routes.is_empty());
 }
 #[rstest::rstest]
 #[tokio::test]
@@ -63,7 +63,7 @@ async fn concurrent_last_unregister_and_new_register_preserve_new_route(bus: Eve
         bus.try_send("race", 42u32).unwrap();
         assert_eq!(new.recv().await.unwrap().unwrap().into_body(), 42);
     }
-    assert!(bus.router.routes.is_empty());
+    assert!(bus.router().routes.is_empty());
 }
 
 #[rstest::rstest]
@@ -86,9 +86,9 @@ fn unregister_wakes_waiters_after_releasing_the_route_lock(bus: EventBus) {
         .consumer_with::<u32>("wake", ConsumerOptions::new().with_capacity(1))
         .unwrap();
     bus.try_send("wake", 1u32).unwrap();
-    let mut reservation = bus.router.select::<u32>("wake").unwrap().reserve();
+    let mut reservation = bus.router().select::<u32>("wake").unwrap().reserve();
     let reenter = Arc::new(Reenter {
-        router: bus.router.clone(),
+        router: bus.router().clone(),
         wakes: std::sync::atomic::AtomicUsize::new(0),
     });
     let waker = std::task::Waker::from(reenter.clone());
@@ -118,7 +118,7 @@ fn concurrent_close_and_unregister_leave_no_queue_counts() {
         barrier.wait();
         bus.close();
         dropper.join().unwrap();
-        let snapshot = bus.router.diagnostics.snapshot();
+        let snapshot = bus.router().diagnostics.snapshot();
         assert_eq!(snapshot.active_consumers, 0);
         assert!(snapshot.queues.is_empty());
     }

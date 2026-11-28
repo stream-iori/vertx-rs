@@ -25,7 +25,7 @@ impl EventBus {
     ) -> Result<MessageSink<T>> {
         self.ensure_open()?;
         Ok(MessageSink {
-            router: self.router.clone(),
+            router: self.router().clone(),
             address: address.into(),
             headers: options.into_headers(),
             pending: None,

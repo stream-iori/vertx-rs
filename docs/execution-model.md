@@ -106,6 +106,9 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 
 ### 受管 TCP 服务
 
+`tcp.rs` 导出 TCP 类型。`listener.rs` 管共享监听、部署注册和按地址复用的连接预算。
+`server.rs` 使用监听登记和连接许可来派发任务，并等待连接排空。
+
 `Context::serve_tcp` 为每条连接启动受管任务。处理函数通过 `TcpConnection` 借用
 异步 I/O，可读对端地址和服务关闭信号，socket 由任务持有。它只在所属普通 Verticle 上运行。
 

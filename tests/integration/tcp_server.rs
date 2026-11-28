@@ -60,6 +60,21 @@ where
 }
 
 #[tokio::test]
+async fn oversized_connection_limit_is_rejected_before_binding() {
+    let vx = instance();
+    let occupied = std::net::TcpListener::bind(ephemeral()).unwrap();
+    let result = start(
+        &vx,
+        occupied.local_addr().unwrap(),
+        options(Semaphore::MAX_PERMITS + 1),
+        || async |_: TcpConnection<'_>| Ok(()),
+    )
+    .await;
+    assert!(matches!(result, Err(VertxError::InvalidOptions(_))));
+    vx.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn one_capacity_budget_covers_all_registrations_and_replacement() {
     let vx = instance();
     let (entered, mut connections) = mpsc::unbounded_channel();
