@@ -1,16 +1,16 @@
 use crate::{Result, VertxError};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
-const PENDING: u8 = 0;
-const COMPLETED: u8 = 1;
-const CANCELLED: u8 = 2;
+enum TimerState {
+    Pending,
+    Completed,
+    Cancelled,
+}
 
 /// One-shot future whose deadline is fixed at construction, even if first
 /// polled later. Cancellation wins when both branches are ready.
@@ -18,55 +18,56 @@ pub struct Timer {
     future: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
     timer_cancel: CancellationToken,
     owner_cancel: CancellationToken,
-    state: Arc<AtomicU8>,
+    state: TimerState,
 }
 impl Timer {
     pub(crate) fn new(delay: Duration, owner_cancel: CancellationToken) -> Result<Self> {
         let deadline = deadline_after(Instant::now(), delay)?;
         let timer_cancel = CancellationToken::new();
-        let state = Arc::new(AtomicU8::new(PENDING));
-        let (timer_cancel_for_poll, owner_cancel_for_poll, state_for_poll) =
-            (timer_cancel.clone(), owner_cancel.clone(), state.clone());
+        let (timer_cancel_for_poll, owner_cancel_for_poll) =
+            (timer_cancel.clone(), owner_cancel.clone());
         let future = Box::pin(async move {
-            let result = tokio::select! { biased;
+            tokio::select! { biased;
                 _ = timer_cancel_for_poll.cancelled() => Err(VertxError::TimerCancelled),
                 _ = owner_cancel_for_poll.cancelled() => Err(VertxError::TimerCancelled),
                 _ = tokio::time::sleep_until(deadline) => Ok(()),
-            };
-            state_for_poll.store(
-                if result.is_ok() { COMPLETED } else { CANCELLED },
-                Ordering::Release,
-            );
-            result
+            }
         });
         Ok(Self {
             future,
             timer_cancel,
             owner_cancel,
-            state,
+            state: TimerState::Pending,
         })
     }
     /// Cancels a pending timer without changing an already-completed timer.
     pub fn cancel(&self) {
-        if self
-            .state
-            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if matches!(self.state, TimerState::Pending) {
             self.timer_cancel.cancel();
         }
     }
     /// Includes explicit and owner cancellation while pending.
     /// A completed timer does not become cancelled on later close.
     pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == CANCELLED
-            || self.state.load(Ordering::Acquire) == PENDING && self.owner_cancel.is_cancelled()
+        match self.state {
+            TimerState::Pending => {
+                self.timer_cancel.is_cancelled() || self.owner_cancel.is_cancelled()
+            }
+            TimerState::Completed => false,
+            TimerState::Cancelled => true,
+        }
     }
 }
 impl Future for Timer {
     type Output = Result<()>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.future.as_mut().poll(cx)
+        let result = ready!(self.future.as_mut().poll(cx));
+        self.state = if result.is_ok() {
+            TimerState::Completed
+        } else {
+            TimerState::Cancelled
+        };
+        Poll::Ready(result)
     }
 }
 /// Pull-based periodic timer; creating or dropping it does not spawn work.
