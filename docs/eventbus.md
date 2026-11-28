@@ -2,7 +2,7 @@
 
 [返回文档索引](index.md)
 
-`eventbus.rs` 导出消息类型。`bus.rs` 管 EventBus 句柄的归属和消费者注册。
+`eventbus.rs` 导出消息类型。`bus.rs` 按消费者注册时的执行位置确定作用域。
 地址路由、投递、消费和队列各自在对应子模块实现。
 
 ```text
@@ -45,7 +45,7 @@ const LOOKUP: RequestAddress<u64, String> = RequestAddress::new("lookup");
 ```
 
 调用方用 `LOOKUP.request(&bus, id).await` 获取 `String`，需要响应 headers 时用 `LOOKUP.request_message(&bus, id)`。
-服务端用 `LOOKUP.consumer(&ctx.event_bus())?` 取得 `RequestConsumer`，可拉取 `IncomingRequest<u64, String>` 或启动 handler。
+服务端用 `LOOKUP.consumer(&vertx.event_bus()?)?` 取得 `RequestConsumer`，可拉取 `IncomingRequest<u64, String>` 或启动 handler。
 `reply` 消耗请求并接受 `String`。需要延迟回复时，`into_parts` 可拆出保留同一类型约束的 `TypedReplyHandle<String>`。
 
 首个存活的订阅确定地址协议。普通字符串地址记录消息体类型，固定请求地址同时记录请求和回复类型。
@@ -56,14 +56,19 @@ const LOOKUP: RequestAddress<u64, String> = RequestAddress::new("lookup");
 
 ## 归属与竞态
 
-- Context::event_bus 注册始终绑定该 Context。
-- Vertx::event_bus 在框架外注册为 unbound；在本实例的 Context 中注册时自动绑定当前 Context。
-- 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
+应用和 Verticle 都用 `vertx.event_bus()?` 获取同一实例的路由句柄。注册时决定消费者的归属，发送按地址查表。
+
+| 注册位置 | 归属 | 可用入口 |
+|---|---|---|
+| 同实例的部署任务 | 当前部署 | `recv`、Stream、当前执行类型对应的 handler |
+| 同实例的实例级任务 | 实例 | `recv`、Stream、EventLoop handler |
+| 框架外、裸 Tokio 任务或其他实例 | 目标实例路由 | `recv`、Stream |
+
 - `handler` 在所属 EventLoop 逐条等待异步闭包完成。用 `async move |env|` 把状态交给回调，同一个回调可反复调用，也可以跨 `.await` 可变借用自己持有的 `!Send` 状态。
 - `handler_worker` 使用 `FnMut -> Future`，闭包和返回的 Future 都要求 `Send`。两个入口都校验调用 Context。
-- 丢弃 handler 返回的 `TaskHandle` 会分离等待者，部署仍负责管理任务。调用 `abort()` 后等待句柄，确认当前处理 Future 已析构且订阅已注销。取消在执行器取得执行权后生效。
-- EventBus 路由表拥有订阅和队列。绑定消费者在部署作用域登记地址和注册 ID，生命周期可以按登记准确注销。
-- 绑定部署时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
+- 丢弃 handler 返回的 `TaskHandle` 会分离等待者，任务继续由原作用域管理。调用 `abort()` 后等待句柄，确认当前处理 Future 已析构且订阅已注销。取消在执行器取得执行权后生效。
+- EventBus 路由表拥有订阅和队列。受管消费者在作用域登记地址和注册 ID，生命周期可以按登记准确注销。
+- 注册受管消费者时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
 - 撤销部署只处理属于它的登记。关闭 EventBus 清除所有路由，包括框架外的注册。发送始终按地址查表。
 - Consumer Drop 按地址和订阅 ID 注销单条记录。每次移除都和路由更新原子进行，移除地址下最后一个订阅时同时清除轮询状态。
 - 注销先在路由锁内标记失活、移除目标并更新计数，再释放相关注册表锁，取消并释放 sender；Waker 可重入路由。

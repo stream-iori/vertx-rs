@@ -12,7 +12,7 @@
 
 | 入口 / 数据 | 保证 |
 |---|---|
-| `Context::id()` / `TaskHandle::id()` | 进程内唯一；任务句柄与对应诊断记录使用相同 TaskId |
+| `ExecutionInfo::context_id` / `TaskHandle::id()` | 进程内唯一；任务句柄与对应诊断记录使用相同 TaskId |
 | `VertxBuilder::diagnostics(DiagnosticsOptions)` | 默认启用轻量计数及线程当前操作；`enabled=false` 关闭诊断记录 |
 | `task_details` / `max_task_details` | 详情默认关闭；开启后默认最多 1024 个活跃记录，截断有标记；不保留历史 |
 | `queue_details` / `max_queue_details` | 队列详情默认关闭；开启后快照默认最多 1024 条，queue_details_truncated 标记截断 |
@@ -26,7 +26,7 @@
 部署与关闭的诊断阶段在内部使用私有枚举；只在快照与日志输出时转换为既有字符串。
 Stopped 阶段按枚举移除部署记录。
 
-诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
+实例级任务的 `TaskSnapshot::deployment_id` 为 `None`。诊断只保存 ID、时间和小型元数据，不强持有 Context、Verticle 或用户 Future。
 任务销毁时删除详情；晚到的 wake 不复活记录。未采集的任务不会为了补齐列表而被保留。
 消费者数量指有效路由订阅；scope 清扫、close 与 Consumer Drop 不重复扣减。
 诊断锁内取样计数、阶段和详情元数据。耗时换算、队列详情复制和排序在锁外完成。
@@ -64,7 +64,7 @@ Stopped 阶段按枚举移除部署记录。
 普通与 Worker 生命周期保留两个静态驱动，以保留 Send/!Send 差异；消息处理复用泛型循环，
 不额外装箱 Future，不改变逐消息串行、Span/Dispatch 恢复或异常报告次数。
 
-异常按 Context hook → 全局 hook 回退。调用、替换和清除都先释放配置锁，hook 及其析构可以重设注册。
+异常优先由 `Deployment::set_exception_handler` 设置的部署 hook 接收，再回退到 `Vertx::set_exception_handler` 设置的全局 hook。调用、替换和清除都先释放配置锁，hook 及其析构可以重设注册。
 框架错误事件独立于用户 hook，每个报告入口只输出一次。hook 自身的 panic 单独记录，避免递归。
 生命周期结束与实例关闭时释放 hook 并收集析构错误，再继续完成清理。
 受管任务自身的部署终止、实例关闭和显式取消不作为业务异常报告；读取其他部署的流而遇到终止，仍是失败并报告。

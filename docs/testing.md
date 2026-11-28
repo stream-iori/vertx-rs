@@ -14,19 +14,20 @@
 - Worker 内真实异步 IO、Timer、timeout 可用；取消析构和析构 panic 不破坏线程池或 Context。
 - EventLoop 同线程派发不内联；跨线程早到取消、运行中取消及关闭入队竞争不遗失任务结果。
 - 共享 TCP 监听验证同端口分流、等待取消和端口重绑。受管 TCP 服务验证端口级连接额度、排空超时和连接析构。
-- Axum 适配测试校验 HTTP handler 在 await 前后保持 Context 和线程，排空期间在途请求仍能使用 EventBus。
-- 初始化部分失败回收已创建线程；close 成功时全部 EventLoop 已 join，保留 Context、任务句柄或 Waker 不阻止退出。
+- 校验业务入口按调用时的实例和部署归属，外部派发、弱句柄、实例级资源清理及停止 blocking 权限都用实际 API 测试。
+- TCP 和 Axum 覆盖应用直接启动，并验证未交付的 TCP 启动结果释放监听。Axum 适配测试校验 HTTP handler 在 await 前后保持 Context 和线程，排空期间在途请求仍能使用 EventBus。
+- 初始化部分失败回收已创建线程；close 成功时全部 EventLoop 已 join，保留 VertxHandle、Deployment、任务句柄或 Waker 不阻止退出。
 - start/stop 错误、panic、取消、关闭、批量回滚和自身撤销均有回归覆盖。
 - 分别验证构造、poll 和析构生命周期 Future 的 panic，以及异常 hook 析构失败后仍完成清理和 join。
 - 验证诊断回调重入准入、任务提交失败、abort 句柄迟到和 TCP 同地址重绑后的旧登记。
-- undeploy 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
+- Deployment::stop 成功返回前受管用户状态已析构；不可中断工作超时返回错误，随后可继续关闭。
 - 路由注册/清扫/最后订阅注销竞争不残留路由；请求超时包含满队列等待。
 - 业务失败、重复 headers、完整响应、迟到回复、广播满队列行为明确。
 - Stream 终止错误只产生一次；Sink 重复就绪、排队取消及目标注销不泄漏许可；publish 先获许可再 Clone。
 - pipe 验证背压、有限 EOF、异步 flush/close、主错与清理错误、!Send/!Unpin、取消析构及 Context/Span 隔离。
 - 队列快照区分 queued/reserved/waiting，详情受限；并发关闭/注销后活跃计数归零。
 - Timer 延后首次 poll、scope/global 取消、周期 Skip 均有测试。
-- cargo test、cargo clippy --all-targets -- -D warnings、三个示例运行及格式检查通过。
+- 全 workspace 的单测、集成测试、Rustdoc、Clippy 和格式检查通过。跨业务门面的改动实际运行全部核心和 Axum 示例。
 - 不以未经测量的性能或完整 Vert.x Core 兼容率作承诺。
 
 ## 测试组织
@@ -49,7 +50,7 @@ tests/
  └─ integration/
       ├─ support.rs：独立 fixture、Verticle 适配、日志缓冲及可控 Sink
       ├─ configuration.rs / lifecycle.rs / shutdown.rs
-      ├─ context.rs / worker.rs / blocking.rs
+      ├─ facade.rs / context.rs / worker.rs / blocking.rs
       ├─ eventbus.rs / shared_state.rs / timers.rs
       └─ errors.rs / diagnostics.rs / tracing_propagation.rs / streams.rs
 

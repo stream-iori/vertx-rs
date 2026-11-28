@@ -1,7 +1,12 @@
 # vertx-rs 0.3 设计文档索引
 
 目标：用 Rust Future、固定 OS Worker 线程池和 Tokio IO 驱动实现 Vert.x 5 的**单进程执行核心**。
-范围包括 Verticle、Context、Worker、EventBus、Stream/Sink 传输、共享 TCP 监听和受管服务、Timer、部署及异步关闭。
+应用从 `Vertx` 调用服务。Verticle 通过 `VertxHandle` 使用同一组业务 API。框架在内部管理 Context、EventLoop、Worker 和资源归属。
+
+```text
+Vertx / VertxHandle → 当前受管执行或实例作用域 → EventLoop / Worker
+Deployment::spawn  → 指定部署的执行环境
+```
 
 ## 主题导航
 

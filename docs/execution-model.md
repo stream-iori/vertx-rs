@@ -27,13 +27,29 @@ Vertx
  └─ EventBus：进程内共享地址路由，每个消费者一个有界队列
 ```
 
+## 业务入口和资源归属
+
+应用通过 `Vertx` 构建、部署和关闭实例，也可直接调用业务 API。Verticle 的 `start` 和 `stop` 接收 `VertxHandle`。
+两者走同一套派发逻辑。把任务提交到指定部署时，使用部署返回的 `Deployment::spawn`。
+
+| 调用位置 | 执行目标 | 资源随谁停止 |
+|---|---|---|
+| 同实例内的部署 | 当前部署的 EventLoop 或 Worker | 当前部署 |
+| 同实例内的实例级任务 | 当前任务的执行环境 | 实例 |
+| 框架外、裸 Tokio 任务或其他实例 | `spawn` 和 `serve_tcp` 选择 EventLoop。blocking 交给共享 Worker | 调用目标实例 |
+| `Deployment::spawn` | 指定部署的 EventLoop 或 Worker | 指定部署 |
+
+`Context` 是框架内部执行状态。`VertxHandle` 和 `Deployment` 可跨线程传递，分别通过弱引用指向实例和部署执行目标。
+普通任务与端口监听通过作用域登记，关闭时统一清理。`execute_blocking` 和 TCP 启动 Future 在方法调用时确定归属，首次 poll 时准入。
+同实例的部署进入停止阶段后，普通操作返回 `DeploymentTerminated`。实例关闭准入后返回 `VertxClosed`。
+`spawn_local`、`serve_tcp_local` 和 `listen_tcp` 只可在本实例当前 EventLoop 内提交。
+
 ## Context 隔离
 
 `ContextFuture` 在**每次 poll** 前设置 CURRENT，返回 Pending/Ready 或 panic 时立即恢复。
 ContextGuard 不可 Send，也不跨 await 保存。Future 取消时，在所属执行环境中设置 Context 后析构用户状态。
 Worker 的 Context 就绪队列每次派发一个 poll；Pending 后释放执行权，析构也与普通 poll 互斥。
 同 Context 的其他任务可以在该 Future 等待期间执行；同消费者仍等待当前消息 Future 完成再取下一条。
-`Context::vertx()` 尝试取得所属的 Vertx 句柄，实例已析构时返回 None。
 
 ```text
 poll(A): CURRENT=A → poll user A → restore
@@ -41,15 +57,14 @@ poll(B): CURRENT=B → poll user B → restore
 poll(A): CURRENT=A → poll user A → restore
 ```
 
-Context 与物理线程身份分开记录。`Context::threading_model()` 只返回 `EventLoop` 或 `Worker`；
-框架外代码的 `Context::current()` 为 None，不自动创建外部 Context。调用 execute_blocking 时：
+用 `vertx.current_execution()` 查询本实例的受管执行。框架外、裸 Tokio 任务和其他实例的执行返回 `None`。
+`ExecutionInfo::current()` 可读取任意实例的当前执行，用于日志与诊断。blocking 闭包沿用来源 Context，物理线程在 Worker 池上。
 
-| 查询 | EventLoop 内 | 其 blocking 闭包内 | await 返回后 |
+| 字段 | EventLoop 任务 | 它的 blocking 闭包 | await 返回后 |
 |---|---|---|---|
-| Context::current() | 来源 Context | 同一来源 Context | 同一来源 Context |
-| ctx.is_event_loop() | true | true | true |
-| is_on_event_loop_thread() | true | false | true |
-| is_on_worker_thread() | false | true | false |
+| `context_id` | 来源 ID | 同一 ID | 同一 ID |
+| `threading_model` | EventLoop | EventLoop | EventLoop |
+| `thread` | EventLoop | Worker | EventLoop |
 
 EventLoop 在所属线程构造受管包装，并同时校验 poll 与 drop 的线程亲和性。线程私有执行依靠 LocalSet 串行。
 Worker 的执行门覆盖同一 Context 的普通 poll 和 drop。用户析构 panic 时，先恢复 Context、Dispatch、Span 并释放执行门，再由执行器处理 panic。
@@ -84,15 +99,15 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 ## 共享 TCP 监听
 
 同一 Vertx 实例对同一个 `SocketAddr` 只绑定一次。普通 Verticle 用
-`ctx.listen_tcp(addr).await` 注册，用 `incoming.accept().await` 领取连接。
+`vertx.listen_tcp(addr).await` 注册，用 `incoming.accept().await` 领取连接。
 端口 `0` 每次申请新地址，其他部署用 `incoming.local_addr()` 返回的地址加入。
-同一部署在同一地址重复注册返回 `InvalidOptions`。
+每个作用域在同一地址可以登记一次，重复登记返回 `InvalidOptions`。
 
 | 入口 | 适用场景 | 谁持有连接 |
 |---|---|---|
-| `Context::listen_tcp` | 需要自己控制何时 `accept()`、如何派发连接 | 应用拿到原生 `TcpStream`，可交给受管任务 |
-| `Context::serve_tcp` | 需要统一的连接限额、关闭信号和服务句柄 | 框架为每条连接启动受管任务，处理函数借用 `TcpConnection` |
-| `vertx_rs_axum::serve_axum` | 已有 Axum Router，想让 HTTP handler 在 Verticle 上运行 | TCP 任务持有连接，Hyper 驱动 HTTP/1.1，Axum 执行路由 |
+| `listen_tcp` | 需要自己控制何时 `accept()`、如何派发连接 | 应用拿到原生 `TcpStream`，可交给受管任务 |
+| `serve_tcp` / `serve_tcp_local` | 需要统一的连接限额、关闭信号和服务句柄 | 框架为每条连接启动受管任务，处理函数借用 `TcpConnection` |
+| `vertx_rs_axum::serve_axum` | 已有 Axum Router，需要在 EventLoop 提供 HTTP 服务 | TCP 任务持有连接，Hyper 驱动 HTTP/1.1，Axum 执行路由 |
 
 ```text
 共享 TcpListener → FIFO 等待队列 → 最早等待的 EventLoop → 原生 TcpStream
@@ -100,25 +115,24 @@ EventLoop 的 OS 线程、启动握手及退出回收由项目管理；每个线
 
 - 等待者轮流独占一次接收。暂时忙的 Verticle 在下一次 `accept()` 时重新排队。没人等时，连接留在操作系统的监听队列。
 - 首次绑定的 EventLoop 驱动监听 socket。领取连接的 EventLoop 驱动已接收的 socket。停止首个注册的部署后，仍注册的 Verticle 可以继续接收。
-- 受管监听要求所属的普通 Verticle Context 和实际 EventLoop 线程。活跃的 Worker 或其他 Context 调用返回 `ContextMismatch`。接收器为 `!Send`，Worker 可直接使用 Tokio 网络 API。
+- 原始监听要求本实例当前 EventLoop。随后只能在登记时的 Context 里轮询 `accept()`，接收器为 `!Send`。线程或归属不匹配返回 `ContextMismatch`。
 - 取消一次 `accept()` 会释放等待位置，接收器仍可再次接收。绑定和接收的系统错误通过 `TcpIo` 返回，包含操作、地址及错误类别。
 
-[可运行示例](../examples/tcp_shared_listener.rs) · [撤销与关闭](lifecycle.md#撤销与关闭)
+[可运行示例](../examples/tcp_shared_listener.rs) · [停止部署](lifecycle.md#停止部署)
 
 ### 受管 TCP 服务
 
-`tcp.rs` 导出 TCP 类型。`listener.rs` 管共享监听、部署注册和按地址复用的连接预算。
+`tcp.rs` 导出 TCP 类型。`listener.rs` 管共享监听、作用域登记和按地址复用的连接预算。
 `server.rs` 使用监听登记和连接许可来派发任务，并等待连接排空。
 
-`Context::serve_tcp` 为每条连接启动受管任务。处理函数通过 `TcpConnection` 借用
-异步 I/O，可读对端地址和服务关闭信号，socket 由任务持有。它只在所属普通 Verticle 上运行。
+`serve_tcp` 从应用直接调用时选择实例的 EventLoop，从普通 Verticle 调用时选择其 EventLoop。处理器要求 `Send`，它产生的连接 Future 在目标线程创建和执行，可以持有 `Rc`。`serve_tcp_local` 可以直接捕获该线程的 `Rc`。两者都让连接任务持有 socket，处理器通过 `TcpConnection` 借用 I/O、读取对端地址及关闭信号。Worker Context 调用返回 `ContextMismatch`。
 
 - 同一实例的同一绑定地址共用一个连接上限，默认 1024。服务先拿到许可，再等 `accept()`，许可一直保留到 socket 析构。容量耗尽时，新连接留在系统监听队列。
 - 受管监听调用 `listen(128)` 设置系统监听队列，请求的队列长度还受操作系统限制。`TcpServerOptions::max_connections` 控制框架的连接许可。
 - 同地址的服务必须设置相同上限。原始 `listen_tcp` 和 `serve_tcp` 在同地址互斥，冲突返回 `InvalidOptions`。最后一份注册退出就释放监听 socket，旧连接仍占用该地址的预算，使用相同上限的服务可重新绑定并复用预算。
 - 受管服务沿用同一监听器的 FIFO 等待顺序。领取连接的 EventLoop 负责该连接的 I/O 和处理任务。Axum 适配 crate 为请求提供 `ConnectInfo<SocketAddr>`，路由和中间件在该任务中运行。
 
-[网络示例与运行命令](examples.md#tcp-与-http-示例) · [服务关闭](lifecycle.md#撤销与关闭)
+[网络示例与运行命令](examples.md#tcp-与-http-示例) · [服务关闭](lifecycle.md#关闭实例与服务)
 
 ## 相关主题
 

@@ -19,7 +19,7 @@ Future wake → 合并重复通知 → 所属 Context 就绪队列
 - Worker 每次 poll 进入分配的 EventLoop runtime Handle，Tokio 仅提供 IO/Timer 注册和驱动。
   Handle::enter 不推进 Future，也不创建 Worker Tokio runtime。实际 Future 调度由原生池完成。
 - 原生线程池只提供普通 Future 执行环境，不提供 Tokio 多线程任务环境特有的 block_in_place 等保证。
-  裸 tokio::spawn 使用所进入的 Tokio runtime，既不继承 Context，也不成为原生 Worker 任务；使用 Context::spawn 管理业务任务。
+  裸 tokio::spawn 使用所进入的 Tokio runtime，既不继承 Context，也不成为原生 Worker 任务；用 VertxHandle::spawn 提交受管任务，框架外也可直接用 Vertx::spawn。
 - 内部就绪队列不额外设置总容量；每个任务最多保留一个就绪通知。EventBus 的消费者队列默认容量为 256，可单独配置。
   这不是全局任务数量上限，不承诺更高吞吐量。
 

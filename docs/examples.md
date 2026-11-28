@@ -31,8 +31,8 @@
 | 示例 | 场景 | 重点 API |
 |---|---|---|
 | [deployment_rollback](../examples/deployment_rollback.rs) | 第二个实例启动失败，整批回滚 | deploy_with、stop、DeploymentFailed |
-| [external_dispatch](../examples/external_dispatch.rs) | 外部 OS 线程派发到已有 Context | current、spawn、threading_model |
-| [graceful_shutdown](../examples/graceful_shutdown.rs) | close 超时后继续清理并再次等待 | cancellation_token、stop、execute_blocking、close |
+| [external_dispatch](../examples/external_dispatch.rs) | 外部 OS 线程派发实例级任务和指定部署的任务 | VertxHandle::spawn、Deployment::spawn、current_execution |
+| [graceful_shutdown](../examples/graceful_shutdown.rs) | close 超时后继续清理并再次等待 | stopping、stop、execute_blocking、close |
 | [error_handling](../examples/error_handling.rs) | 业务失败、异常及 panic 隔离 | fail、set_exception_handler、clear_exception_handler |
 
 ### TCP 与 HTTP 示例
@@ -40,7 +40,7 @@
 | 示例 | 场景 | 重点 API |
 |---|---|---|
 | [tcp_shared_listener](../examples/tcp_shared_listener.rs) | 两个 EventLoop 共用一个 TCP 端口并回显 | listen_tcp、local_addr、accept、spawn_local |
-| [axum_http1](../adapters/axum/examples/axum_http1.rs) | 两个 EventLoop 共用一个 HTTP/1.1 端口，路由返回执行它的 EventLoop ID | serve_axum、ConnectInfo、TcpServer::shutdown |
+| [axum_http1](../adapters/axum/examples/axum_http1.rs) | 应用与 Verticle 共用一个 HTTP/1.1 端口，路由返回 EventLoop ID | serve_axum、ConnectInfo、TcpServer::shutdown |
 
 ## 运行方式
 
@@ -88,7 +88,7 @@ main ── request ──→ Pinger（Rc<Cell> 状态）── reply ──→ 
 ```
 
 - 两个观察者先注册，随后启动生产者，分别收集同样的 `[1, 2, 3]` 心跳序列。
-- 三次 tick 后显式取消 Periodic。该任务结束不会撤销 Pinger，之后仍能请求服务。
+- 在 start 中创建 timer 和 bus，再直接移入心跳任务。三次 tick 后显式取消 Periodic。该任务结束不会撤销 Pinger，之后仍能请求服务。
 - 正常请求返回 `pong#1` 和响应 headers；非法输入返回 `RecipientFailure`。
 - 慢请求触发 timeout；随后发送一个排在慢请求后面的请求，确认迟到 reply 路径实际执行。
 - factory/start、handler 与 stop 的实际线程及 Context 保持一致，状态可用 `Rc<Cell>`。
@@ -165,21 +165,16 @@ abort 只能在执行器重新取得执行权后生效，不能抢占同步死�
 确认 rollback 错误列表为空、只创建了两个实例、两者 stop 各执行一次、地址路由已注销。
 预期看到启动失败 ERROR 日志和 `created=2, stopped=[0, 1], routes removed`，最后退出码为 0。
 
-## external_dispatch：提交线程不是执行线程
+## external_dispatch 外部派发
 
 ```text
-外部 OS 线程（current=None）
-    → Context::spawn
-    → EventLoop 执行任务（指定 Context、所属 ThreadId）
+外部 OS 线程 ── VertxHandle::spawn ──→ 实例级 EventLoop 任务
+             └─ Deployment::spawn ──→ 指定部署及其 EventLoop
 ```
 
-Verticle 启动时传出 Context 和实际 ThreadId。外部线程只提交任务，将句柄交回异步调用方等待，
-不阻塞等待 EventLoop 工作。任务检查 Context ID、所属线程及 EventLoop 物理身份。
-撤销部署后，再从框架外提交任务得到 `DeploymentTerminated`。
-
-该示例用同步 main 驱动 current-thread Tokio runtime，最后在 runtime 外 join 外部线程，
-同时保留业务/关闭错误和外部线程的 join 错误。`threading_model()` 描述 Context，
-即使从外部线程查询，结果也仍是该 Context 的 `EventLoop`。
+外部线程提交两类任务，再把结果句柄交给异步调用方等待。实例级任务的部署 ID 为 `None`。
+定向任务检查 Context ID、部署 ID 和实际 OS 线程，确认与启动时一致。停止部署后再向它派发会得到 `DeploymentTerminated`。
+主线程在 Tokio runtime 外 join 提交线程，并保留业务、关闭及 join 的错误。
 
 ## graceful_shutdown：超时停止等待，不停止清理
 
@@ -189,7 +184,7 @@ close → 任务收到取消 → stop → Worker 清理等待 gate
 ShutdownTimeout → 拒绝新工作 → 放行 gate → 再次 close → 全部线程 join
 ```
 
-先等待受管任务就绪，保证实际演示协作取消。stop 中的 blocking 闭包通过 channel 阻止清理完成，
+先等待部署任务和实例级任务就绪。close 触发两级停止信号。stop 中的 blocking 闭包通过 channel 阻止清理完成，
 因此第一次 close 必须超时；等到协作任务退出且 blocking 已启动后，确认实例拒绝新业务。
 随后放行 gate，确认清理结果为 42、stop 只执行一次，并再次等待 close 成功。
 
@@ -219,12 +214,12 @@ headers 不会自动传播。handler 自身仍然逐消息串行，并发来自�
 
 ```text
 业务拒绝 → RecipientFailure → 请求方；不触发异常 hook
-handler Err → Context hook
-清除 Context hook → handler panic → 全局 hook
+handler Err → 部署 hook
+清除 部署 hook → handler panic → 全局 hook
 随后健康请求 → healthy
 ```
 
-Context hook 优先于全局 hook，不是两个 hook 都执行。handler 返回 Err 或 panic 没有回复时，
+异常先交给部署 hook，清除它后会回退到全局 hook。handler 返回 Err 或 panic 没有回复时，
 请求方得到 `ReplyClosed`，异常详情由 hook 接收；业务拒绝则直接返回结构化 `RecipientFailure`。
 最后用正常请求作为串行处理屏障，检查消费者继续工作且没有重复异常通知。
 
@@ -239,21 +234,21 @@ Context hook 优先于全局 hook，不是两个 hook 都执行。handler 返回
 
 ## axum_http1：在受管任务中运行 Axum Router
 
-两个普通 Verticle 通过 `serve_axum` 共享监听地址。内置客户端发起 HTTP/1.1 请求，
+应用直接用 `serve_axum(&vertx, ...)` 启动第一个服务，一个 Verticle 加入同一地址。内置客户端发起 HTTP/1.1 请求，
 路由读取 `ConnectInfo<SocketAddr>` 获取对端地址，检查 yield 前后的 EventLoop，并用 EventLoop ID 作为响应。
 预期看到同一个地址分别返回两个不同的 `EventLoopId`。示例先并行等待两个服务的 `shutdown()`，再调用 `vx.close()`。
 
-自定义连接上限时，在 Verticle 的 `start` 中调用 `serve_axum_with_options`，例如：
+需要自定义连接上限时，可从应用或 Verticle 调用 `serve_axum_with_options`。
 
 ```rust
 let options = TcpServerOptions {
     max_connections: std::num::NonZeroUsize::new(256).unwrap(),
 };
-let server = vertx_rs_axum::serve_axum_with_options(&ctx, addr, router, options).await?;
+let server = vertx_rs_axum::serve_axum_with_options(&vertx, addr, router, options).await?;
 ```
 
-共享这个地址的 Verticle 必须使用相同的上限。常驻服务应把返回的 `TcpServer` 交给部署外的控制任务，用于等待关闭。
-[连接限额与线程归属](execution-model.md#受管-tcp-服务) · [关闭顺序](lifecycle.md#撤销与关闭)
+共享这个地址的服务必须使用相同的上限。常驻服务应把返回的 `TcpServer` 交给部署外的控制任务，用于等待关闭。
+[连接限额与线程归属](execution-model.md#受管-tcp-服务) · [关闭顺序](lifecycle.md#关闭实例与服务)
 
 ## 共享状态
 
