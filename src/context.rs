@@ -303,7 +303,7 @@ impl Context {
         let registration = self.scope().register_task(id)?;
         let frame = self.frame(id);
         let task = self.clone().track_future(frame, registration, future);
-        let handle = TaskHandle::from_tokio(tokio::task::spawn_local(task)).with_id(id);
+        let handle = TaskHandle::from_tokio(id, tokio::task::spawn_local(task));
         self.scope().attach_task(id, handle.abort_handle());
         Ok(handle)
     }
@@ -336,21 +336,20 @@ impl Context {
                 if loops.check_thread(loop_id) && Self::current().is_some() =>
             {
                 let task = ctx.track_future(frame, registration, future);
-                TaskHandle::from_tokio(tokio::task::spawn_local(task))
+                TaskHandle::from_tokio(id, tokio::task::spawn_local(task))
             }
-            Target::EventLoop(loop_id) => loops.spawn_pinned(loop_id, move || {
+            Target::EventLoop(loop_id) => loops.spawn_pinned(loop_id, id, move || {
                 ctx.track_future(frame, registration, future)
             })?,
             Target::Worker { .. } => {
                 let task = ctx.track_future(frame, registration, future);
-                self.spawn_worker(task)?
+                self.spawn_worker(id, task)?
             }
-        }
-        .with_id(id);
+        };
         self.scope().attach_task(id, handle.abort_handle());
         Ok(handle)
     }
-    pub(crate) fn spawn_worker<F>(&self, task: F) -> Result<TaskHandle<()>>
+    pub(crate) fn spawn_worker<F>(&self, id: TaskId, task: F) -> Result<TaskHandle<()>>
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
@@ -360,7 +359,7 @@ impl Context {
         self.data
             .executors
             .workers
-            .spawn(self.data.id.0, driver.clone(), task)
+            .spawn(id, self.data.id.0, driver.clone(), task)
     }
     /// Requests this deployment to stop without waiting for its own tasks.
     /// Use this inside the deployment instead of awaiting its own undeploy.

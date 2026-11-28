@@ -4,7 +4,7 @@ mod thread;
 use self::thread::EventLoop;
 use crate::context::{Context, ThreadIdentity, thread_identity};
 use crate::error::{panic_error, retain_failure};
-use crate::{Result, TaskHandle, VertxError};
+use crate::{Result, TaskHandle, TaskId, VertxError};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,7 +113,12 @@ impl EventLoopPool {
             _ => false,
         }
     }
-    pub fn spawn_pinned<F, Fut, T>(&self, id: EventLoopId, factory: F) -> Result<TaskHandle<T>>
+    pub fn spawn_pinned<F, Fut, T>(
+        &self,
+        loop_id: EventLoopId,
+        task_id: TaskId,
+        factory: F,
+    ) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + 'static,
@@ -127,16 +132,17 @@ impl EventLoopPool {
                 crate::task::TracedFuture::new(factory(), dispatch.clone(), parent.clone())
             })
         };
-        let admission = self.loops[id.0].admission.lock().unwrap();
+        let admission = self.loops[loop_id.0].admission.lock().unwrap();
         let sender = admission.as_ref().ok_or(VertxError::VertxClosed)?;
-        if self.check_thread(id) && Context::current().is_some() {
+        if self.check_thread(loop_id) && Context::current().is_some() {
             // Defer the factory as well: user code never executes inline.
             drop(admission);
-            return Ok(TaskHandle::from_tokio(tokio::task::spawn_local(
-                async move { factory().await },
-            )));
+            return Ok(TaskHandle::from_tokio(
+                task_id,
+                tokio::task::spawn_local(async move { factory().await }),
+            ));
         }
-        let (command, handle) = task::spawn_command(factory);
+        let (command, handle) = task::spawn_command(task_id, factory);
         let sent = sender.send(command);
         drop(admission);
         sent.map_err(|_| VertxError::VertxClosed)?;

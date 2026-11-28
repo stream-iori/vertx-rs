@@ -46,6 +46,7 @@ TaskHandle<T> 的 await 输出为 Result<T>，无需嵌套 await??。
 提供 abort、abort_handle、is_finished；TaskAbortHandle 可克隆。
 丢弃 TaskHandle 只分离调用方，任务仍由部署管理；取消返回 TaskCancelled，不作为业务异常报告。
 is_finished 和等待结果都晚于用户 Future 析构。保留取消句柄或迟到的 Waker 不阻止线程池关闭。
+任务在提交时分配一次 `TaskId`，部署登记、诊断记录、执行器和任务句柄共用这个 ID。
 任务在部署准入时登记，再于锁外提交执行器并挂接 abort 句柄。拒绝提交撤销登记，迟到句柄遵循已请求的 abort。
 跟踪令牌和任务登记在用户 Future 析构后释放，覆盖未首次 poll 就被 abort 的情况。
 普通任务错误报告给异常 handler；Consumer 按消息捕获错误及 panic，随后继续接收。

@@ -1,7 +1,7 @@
 use super::task::Task;
 use crate::context::{ThreadIdentity, enter_thread};
 use crate::error::panic_error;
-use crate::{Result, VertxError};
+use crate::{Result, TaskId, VertxError};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,7 +21,7 @@ enum Dispatch {
 struct State {
     ready: VecDeque<Dispatch>,
     lanes: HashMap<u64, Lane>,
-    tasks: HashMap<u64, Arc<Task>>,
+    tasks: HashMap<TaskId, Arc<Task>>,
     closing: bool,
 }
 
@@ -75,7 +75,7 @@ impl Scheduler {
         self.available.notify_one();
     }
 
-    pub(super) fn task_finished(&self, id: u64) {
+    pub(super) fn task_finished(&self, id: TaskId) {
         let task = self.state.lock().unwrap().tasks.remove(&id);
         drop(task);
         self.available.notify_all();

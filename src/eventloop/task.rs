@@ -1,5 +1,5 @@
 use crate::error::panic_error;
-use crate::{Result, TaskHandle, VertxError};
+use crate::{Result, TaskHandle, TaskId, VertxError};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -128,7 +128,7 @@ pub(super) trait Command: Send {
     fn run(self: Box<Self>);
 }
 
-pub(super) fn spawn_command<F, Fut, T>(factory: F) -> (Box<dyn Command>, TaskHandle<T>)
+pub(super) fn spawn_command<F, Fut, T>(id: TaskId, factory: F) -> (Box<dyn Command>, TaskHandle<T>)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<T>> + 'static,
@@ -145,7 +145,7 @@ where
     };
     (
         Box::new(command),
-        TaskHandle::from_channel(receiver, control),
+        TaskHandle::from_channel(id, receiver, control),
     )
 }
 

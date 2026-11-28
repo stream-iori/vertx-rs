@@ -1,17 +1,16 @@
 //! Read-only snapshots, bounded details and lifecycle accounting.
 
-use super::support::{TraceOutput, capture, vx};
+use super::support::{TraceOutput, capture, capture_worker, vx};
 use rstest::rstest;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError};
 
 #[tokio::test]
 async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
-    use vertx_rs::DiagnosticsOptions;
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
@@ -112,6 +111,84 @@ async fn diagnostics_read_current_poll_without_waiting_for_blocked_eventloop() {
     );
     assert!(snapshot.tasks.is_empty(), "details must be opt-in");
     vx.close().await.unwrap();
+}
+
+#[rstest]
+#[case::spawn_local(TaskSubmission::Local)]
+#[case::same_event_loop(TaskSubmission::SameEventLoop)]
+#[case::cross_thread(TaskSubmission::CrossThread)]
+#[case::worker(TaskSubmission::Worker)]
+#[tokio::test]
+async fn handle_and_diagnostics_use_the_same_task_id(#[case] submission: TaskSubmission) {
+    let vx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .diagnostics(DiagnosticsOptions {
+            task_details: true,
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    let (deployment, ctx) = if matches!(submission, TaskSubmission::Worker) {
+        capture_worker(&vx).await
+    } else {
+        capture(&vx).await
+    };
+    let (report, observed) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    let owner = vx.clone();
+    let task = async move {
+        let thread = std::thread::current().id();
+        let operation = owner
+            .diagnostics()
+            .threads
+            .into_iter()
+            .find(|operation| operation.thread_id == thread)
+            .unwrap();
+        report.send(operation).unwrap();
+        wait.await.unwrap();
+        Ok(())
+    };
+
+    let handle = match submission {
+        TaskSubmission::Local | TaskSubmission::SameEventLoop => {
+            let (send, recv) = oneshot::channel();
+            let target = ctx.clone();
+            ctx.spawn(async move {
+                let handle = match submission {
+                    TaskSubmission::Local => target.spawn_local(task),
+                    _ => target.spawn(task),
+                }?;
+                send.send(handle).map_err(|_| VertxError::ReplyClosed)?;
+                Ok(())
+            })
+            .unwrap()
+            .await
+            .unwrap();
+            recv.await.unwrap()
+        }
+        TaskSubmission::CrossThread | TaskSubmission::Worker => ctx.spawn(task).unwrap(),
+    };
+
+    let operation = observed.await.unwrap();
+    assert_eq!(operation.task_id, handle.id());
+    assert_eq!(operation.context_id, ctx.id());
+    assert_eq!(operation.operation, "future_poll");
+    assert!(vx.diagnostics().tasks.iter().any(|record| {
+        record.task_id == handle.id()
+            && record.context_id == ctx.id()
+            && record.deployment_id == deployment
+    }));
+    release.send(()).unwrap();
+    handle.await.unwrap();
+    vx.close().await.unwrap();
+}
+
+enum TaskSubmission {
+    Local,
+    SameEventLoop,
+    CrossThread,
+    Worker,
 }
 
 #[rstest]

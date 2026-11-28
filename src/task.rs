@@ -100,26 +100,23 @@ impl ActiveTasks {
 }
 impl<T> TaskHandle<T> {
     pub(crate) fn from_channel(
+        id: TaskId,
         receiver: oneshot::Receiver<Result<T>>,
         control: Arc<dyn TaskControl>,
     ) -> Self {
         Self {
-            id: TaskId::next(),
+            id,
             backend: TaskBackend::Channel(receiver),
             abort: TaskAbortHandle { control },
         }
     }
-    pub(crate) fn from_tokio(handle: tokio::task::JoinHandle<Result<T>>) -> Self {
+    pub(crate) fn from_tokio(id: TaskId, handle: tokio::task::JoinHandle<Result<T>>) -> Self {
         let control = Arc::new(handle.abort_handle());
         Self {
-            id: TaskId::next(),
+            id,
             backend: TaskBackend::Tokio(handle),
             abort: TaskAbortHandle { control },
         }
-    }
-    pub(crate) fn with_id(mut self, id: TaskId) -> Self {
-        self.id = id;
-        self
     }
     /// Returns the process-unique ID shared with diagnostics and logs.
     pub fn id(&self) -> TaskId {

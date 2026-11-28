@@ -1,5 +1,5 @@
 use super::WorkerPool;
-use crate::VertxError;
+use crate::{TaskId, VertxError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
@@ -21,6 +21,7 @@ mod scheduling {
         let count = polls.clone();
         let task = pool
             .spawn(
+                TaskId::next(),
                 1,
                 Handle::current(),
                 futures::future::poll_fn(move |cx| {
@@ -69,7 +70,7 @@ mod scheduling {
         let dropped = Arc::new(AtomicUsize::new(0));
         let probe = DropProbe(dropped.clone());
         let task = pool
-            .spawn(1, Handle::current(), async move {
+            .spawn(TaskId::next(), 1, Handle::current(), async move {
                 let _probe = probe;
                 let mut entered = Some(entered);
                 futures::future::poll_fn(move |cx| {
@@ -110,6 +111,7 @@ mod scheduling {
         let mut first = None;
         let task = pool
             .spawn(
+                TaskId::next(),
                 1,
                 Handle::current(),
                 futures::future::poll_fn(move |cx| {
@@ -203,7 +205,7 @@ mod shutdown {
         } else {
             let (release, wait) = oneshot::channel();
             let task = pool
-                .spawn(1, Handle::current(), async move {
+                .spawn(TaskId::next(), 1, Handle::current(), async move {
                     wait.await.unwrap();
                     Ok(PanicDrop)
                 })
@@ -212,7 +214,7 @@ mod shutdown {
             release.send(()).unwrap();
         }
         // One Worker and the same lane: completion follows the result's Drop.
-        pool.spawn(1, Handle::current(), async { Ok(()) })
+        pool.spawn(TaskId::next(), 1, Handle::current(), async { Ok(()) })
             .unwrap()
             .await
             .unwrap();

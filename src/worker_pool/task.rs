@@ -1,7 +1,7 @@
 use super::scheduler::Scheduler;
 use crate::context::{ThreadIdentity, thread_identity};
 use crate::error::panic_error;
-use crate::{Result, TaskHandle, VertxError};
+use crate::{Result, TaskHandle, TaskId, VertxError};
 use futures::task::{ArcWake, waker_ref};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -129,7 +129,7 @@ impl TaskState {
 }
 
 pub(super) struct Task {
-    pub(super) id: u64,
+    pub(super) id: TaskId,
     pub(super) lane: u64,
     driver: Handle,
     scheduler: Weak<Scheduler>,
@@ -145,7 +145,7 @@ enum PollOutcome {
 
 impl Task {
     pub(super) fn new<F, T>(
-        id: u64,
+        id: TaskId,
         lane: u64,
         driver: Handle,
         scheduler: &Arc<Scheduler>,
@@ -179,7 +179,7 @@ impl Task {
             task: Arc::downgrade(self),
             finished: self.finished.clone(),
         });
-        TaskHandle::from_channel(receiver, control)
+        TaskHandle::from_channel(self.id, receiver, control)
     }
 
     pub(super) fn schedule(self: &Arc<Self>) {

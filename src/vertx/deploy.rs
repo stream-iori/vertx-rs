@@ -3,7 +3,7 @@ use super::lifecycle::{ReadySender, drive_local, drive_worker};
 use crate::deployment::DeploymentScope;
 use crate::diagnostics::DeploymentStage;
 use crate::{
-    Context, DeploymentId, DeploymentOptions, Result, TaskHandle, Verticle, VertxError,
+    Context, DeploymentId, DeploymentOptions, Result, TaskHandle, TaskId, Verticle, VertxError,
     WorkerVerticle,
 };
 use std::mem::DropGuard;
@@ -24,8 +24,9 @@ impl Vertx {
         let pending = self.submit_deployment(|scope, ready| {
             let loop_id = loops.pick();
             let ctx = Context::new_event_loop(loop_id, &self.inner, scope);
-            loops.spawn_pinned(loop_id, move || {
-                ctx.wrap(drive_local(ctx.clone(), factory, ready))
+            let task_id = TaskId::next();
+            loops.spawn_pinned(loop_id, task_id, move || {
+                ctx.wrap(task_id, drive_local(ctx.clone(), factory, ready))
             })
         })?;
         pending.wait_ready("lifecycle driver terminated").await
@@ -41,8 +42,9 @@ impl Vertx {
     {
         let pending = self.submit_deployment(|scope, ready| {
             let ctx = Context::new_worker(&self.inner, scope);
-            let future = ctx.wrap(drive_worker(ctx.clone(), factory, ready));
-            ctx.spawn_worker(future)
+            let task_id = TaskId::next();
+            let future = ctx.wrap(task_id, drive_worker(ctx.clone(), factory, ready));
+            ctx.spawn_worker(task_id, future)
         })?;
         pending
             .wait_ready("worker lifecycle driver terminated")

@@ -31,8 +31,8 @@ impl Context {
         }
     }
 
-    pub(crate) fn wrap<F: Future>(&self, future: F) -> ContextFuture<F> {
-        ContextFuture::new(self.clone(), self.frame(TaskId::next()), future)
+    pub(crate) fn wrap<F: Future>(&self, id: TaskId, future: F) -> ContextFuture<F> {
+        ContextFuture::new(self.clone(), self.frame(id), future)
     }
 
     pub(super) fn track_future<F>(

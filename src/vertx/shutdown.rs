@@ -1,7 +1,7 @@
 use super::{Vertx, VertxInner};
 use crate::deployment::DeploymentScope;
 use crate::diagnostics::CloseStage;
-use crate::{Context, Result, VertxError};
+use crate::{Context, Result, TaskId, VertxError};
 use std::sync::Arc;
 
 impl Vertx {
@@ -43,7 +43,9 @@ impl Vertx {
         let owner = self.inner.clone();
         let loops = &self.inner.executors.event_loops;
         let control_loop = loops.pick();
-        if let Err(error) = loops.spawn_pinned(control_loop, move || owner.finish_close(scopes)) {
+        if let Err(error) = loops.spawn_pinned(control_loop, TaskId::next(), move || {
+            owner.finish_close(scopes)
+        }) {
             self.inner
                 .close_result
                 .send_replace(Some(Err(error.clone())));

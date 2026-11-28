@@ -1,6 +1,6 @@
 use super::{Context, ContextId, TaskResult, ThreadIdentity, enter_thread, thread_identity};
 use crate::deployment::DeploymentScope;
-use crate::{DeploymentId, EventLoopId, Result, Vertx, VertxError};
+use crate::{DeploymentId, EventLoopId, Result, TaskId, Vertx, VertxError};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -40,15 +40,18 @@ async fn context_restored_when_send_future_moves_between_os_threads() {
     let ctx = Context::new_worker(&vx.inner, scope);
     let id = ctx.deployment_id();
     let mut polls = 0;
-    let mut future = Box::pin(ctx.wrap(futures::future::poll_fn(move |_| {
-        assert_eq!(Context::current().unwrap().deployment_id(), id);
-        polls += 1;
-        if polls == 2 {
-            Poll::Ready(TaskResult::Finished(Ok(())))
-        } else {
-            Poll::Pending
-        }
-    })));
+    let mut future = Box::pin(ctx.wrap(
+        TaskId::next(),
+        futures::future::poll_fn(move |_| {
+            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            polls += 1;
+            if polls == 2 {
+                Poll::Ready(TaskResult::Finished(Ok(())))
+            } else {
+                Poll::Pending
+            }
+        }),
+    ));
     let mut threads = Vec::new();
     for n in 0..2 {
         future = std::thread::spawn(move || {

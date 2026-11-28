@@ -263,13 +263,13 @@ mod tests {
 
         let pending_probe = Arc::new(AbortProbe::default());
         let pending_handle =
-            TaskHandle::<()>::from_channel(oneshot::channel().1, pending_probe.clone());
+            TaskHandle::<()>::from_channel(pending, oneshot::channel().1, pending_probe.clone());
         scope.attach_task(pending, pending_handle.abort_handle());
         assert!(pending_probe.0.load(Ordering::Relaxed));
 
         let finished_probe = Arc::new(AbortProbe::default());
         let finished_handle =
-            TaskHandle::<()>::from_channel(oneshot::channel().1, finished_probe.clone());
+            TaskHandle::<()>::from_channel(finished, oneshot::channel().1, finished_probe.clone());
         scope.attach_task(finished, finished_handle.abort_handle());
         assert!(!finished_probe.0.load(Ordering::Relaxed));
         drop(registration);

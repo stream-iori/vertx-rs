@@ -1,6 +1,6 @@
 use super::task::LocalTaskControl;
 use super::{EventLoopId, EventLoopPool};
-use crate::{Result, TaskHandle, VertxError};
+use crate::{Result, TaskHandle, TaskId, VertxError};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -49,7 +49,7 @@ async fn occupy(pool: &EventLoopPool) -> (std::sync::mpsc::Sender<()>, TaskHandl
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     let task = pool
-        .spawn_pinned(EventLoopId(0), move || async move {
+        .spawn_pinned(EventLoopId(0), TaskId::next(), move || async move {
             entered.send(()).ok();
             wait.recv().unwrap();
             Ok(())
@@ -73,12 +73,12 @@ mod dispatch {
     async fn same_thread_dispatch_is_deferred_and_supports_local_futures() {
         let pool = Arc::new(EventLoopPool::new(1, 2003).unwrap());
         let target = pool.clone();
-        pool.spawn_pinned(EventLoopId(0), move || async move {
+        pool.spawn_pinned(EventLoopId(0), TaskId::next(), move || async move {
             let local = Rc::new(Cell::new(0));
             let invoked = Arc::new(AtomicBool::new(false));
             let flag = invoked.clone();
             let thread = std::thread::current().id();
-            let task = target.spawn_pinned(EventLoopId(0), move || {
+            let task = target.spawn_pinned(EventLoopId(0), TaskId::next(), move || {
                 flag.store(true, Ordering::Release);
                 let local = Rc::new(Cell::new(0));
                 async move {
@@ -116,7 +116,7 @@ mod cancellation {
             dropped: dropped.clone(),
         };
         let task = pool
-            .spawn_pinned(EventLoopId(0), move || {
+            .spawn_pinned(EventLoopId(0), TaskId::next(), move || {
                 let local = Rc::new(Cell::new(0));
                 async move {
                     let _guard = guard;
@@ -150,7 +150,7 @@ mod cancellation {
         };
         let (entered, started) = oneshot::channel();
         let task = pool
-            .spawn_pinned(EventLoopId(0), move || async move {
+            .spawn_pinned(EventLoopId(0), TaskId::next(), move || async move {
                 let _guard = guard;
                 entered.send(()).ok();
                 std::future::pending::<Result<()>>().await
@@ -186,7 +186,7 @@ mod shutdown {
         let driver = pool.driver(EventLoopId(0));
         let (entered, started) = oneshot::channel();
         let task = pool
-            .spawn_pinned(EventLoopId(0), move || {
+            .spawn_pinned(EventLoopId(0), TaskId::next(), move || {
                 EXIT_PROBE.with(|slot| *slot.borrow_mut() = Some(ExitProbe(probe)));
                 let mut entered = Some(entered);
                 futures::future::poll_fn(move |cx| {
@@ -204,7 +204,7 @@ mod shutdown {
         assert!(abort.is_finished());
         assert!(matches!(task.await, Err(VertxError::TaskCancelled)));
         assert!(matches!(
-            pool.spawn_pinned(EventLoopId(0), || async { Ok(()) }),
+            pool.spawn_pinned(EventLoopId(0), TaskId::next(), || async { Ok(()) }),
             Err(VertxError::VertxClosed)
         ));
         wake.wake_by_ref();
@@ -222,7 +222,7 @@ mod shutdown {
             dropped: dropped.clone(),
         };
         let task = pool
-            .spawn_pinned(EventLoopId(0), move || async move {
+            .spawn_pinned(EventLoopId(0), TaskId::next(), move || async move {
                 let _guard = guard;
                 panic!("shutdown command was polled");
                 #[allow(unreachable_code)]
@@ -291,12 +291,14 @@ mod shutdown {
             submitters.push(std::thread::spawn(move || {
                 let mut tasks = vec![
                     target
-                        .spawn_pinned(EventLoopId(n % 2), || async { Ok(()) })
+                        .spawn_pinned(EventLoopId(n % 2), TaskId::next(), || async { Ok(()) })
                         .unwrap(),
                 ];
                 start.wait();
                 for _ in 0..64 {
-                    match target.spawn_pinned(EventLoopId(n % 2), || async { Ok(()) }) {
+                    match target
+                        .spawn_pinned(EventLoopId(n % 2), TaskId::next(), || async { Ok(()) })
+                    {
                         Ok(task) => tasks.push(task),
                         Err(VertxError::VertxClosed) => {}
                         Err(error) => panic!("unexpected admission error: {error}"),
@@ -348,12 +350,14 @@ mod panic_recovery {
         let pool = EventLoopPool::new(1, 2007).unwrap();
         let task = match stage {
             PanicStage::Factory => pool
-                .spawn_pinned(EventLoopId(0), || -> std::future::Ready<Result<()>> {
-                    panic!("factory panic")
-                })
+                .spawn_pinned(
+                    EventLoopId(0),
+                    TaskId::next(),
+                    || -> std::future::Ready<Result<()>> { panic!("factory panic") },
+                )
                 .unwrap(),
             PanicStage::Poll => pool
-                .spawn_pinned(EventLoopId(0), || async {
+                .spawn_pinned(EventLoopId(0), TaskId::next(), || async {
                     panic!("future panic");
                     #[allow(unreachable_code)]
                     Ok(())
@@ -362,7 +366,7 @@ mod panic_recovery {
             PanicStage::Drop => {
                 let (entered, started) = oneshot::channel();
                 let task = pool
-                    .spawn_pinned(EventLoopId(0), move || async move {
+                    .spawn_pinned(EventLoopId(0), TaskId::next(), move || async move {
                         let _guard = PanicDrop;
                         entered.send(()).ok();
                         std::future::pending::<Result<()>>().await
@@ -374,7 +378,7 @@ mod panic_recovery {
             }
         };
         assert!(matches!(task.await, Err(VertxError::Panic(_))));
-        pool.spawn_pinned(EventLoopId(0), || async { Ok(()) })
+        pool.spawn_pinned(EventLoopId(0), TaskId::next(), || async { Ok(()) })
             .unwrap()
             .await
             .unwrap();

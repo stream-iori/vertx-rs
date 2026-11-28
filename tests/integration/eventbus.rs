@@ -3,8 +3,8 @@
 use super::support::{capture, echo, local, vx};
 use rstest::rstest;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{Context, DeliveryOptions, RequestOptions, Vertx, VertxError};

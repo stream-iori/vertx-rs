@@ -2,11 +2,10 @@ mod scheduler;
 mod task;
 
 use crate::error::{panic_error, retain_failure};
-use crate::{Result, TaskHandle, VertxError};
+use crate::{Result, TaskHandle, TaskId, VertxError};
 use scheduler::Scheduler;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,7 +17,6 @@ pub(crate) struct WorkerPool {
     scheduler: Arc<Scheduler>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     threads: usize,
-    next_task: AtomicU64,
     exited: Arc<Notify>,
 }
 
@@ -45,7 +43,6 @@ impl WorkerPool {
             scheduler,
             handles: Mutex::new(handles),
             threads,
-            next_task: AtomicU64::new(1),
             exited,
         })
     }
@@ -54,12 +51,17 @@ impl WorkerPool {
         self.threads
     }
 
-    pub fn spawn<F, T>(&self, lane: u64, driver: Handle, future: F) -> Result<TaskHandle<T>>
+    pub fn spawn<F, T>(
+        &self,
+        id: TaskId,
+        lane: u64,
+        driver: Handle,
+        future: F,
+    ) -> Result<TaskHandle<T>>
     where
         F: Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let id = self.next_task.fetch_add(1, Ordering::Relaxed);
         let (task, receiver) = Task::new(id, lane, driver, &self.scheduler, future);
         self.scheduler.submit(task.clone())?;
         Ok(task.handle(receiver))
