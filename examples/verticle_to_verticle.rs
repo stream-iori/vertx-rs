@@ -12,7 +12,8 @@ use futures::future::{join_all, select_ok, try_join_all};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    Context, RequestAddress, RequestOptions, Result, TaskHandle, Verticle, Vertx, VertxError,
+    Deployment, ExecutionInfo, RequestAddress, RequestOptions, Result, TaskHandle, Verticle, Vertx,
+    VertxError, VertxHandle,
 };
 
 const UPPER: RequestAddress<String, String> = RequestAddress::new("upper");
@@ -30,8 +31,8 @@ fn allow_late_reply(result: Result<()>) -> Result<()> {
 }
 struct Upper;
 impl Verticle for Upper {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        UPPER.consumer(&ctx.event_bus())?.handler(async |env| {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        UPPER.consumer(&ctx.event_bus()?)?.handler(async |env| {
             let response = env.body().to_uppercase();
             allow_late_reply(env.reply(response))
         })?;
@@ -40,19 +41,19 @@ impl Verticle for Upper {
 }
 struct Reject;
 impl Verticle for Reject {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         REJECT
-            .consumer(&ctx.event_bus())?
+            .consumer(&ctx.event_bus()?)?
             .handler(async |env| allow_late_reply(env.fail(503, "service unavailable")))?;
         Ok(())
     }
 }
 struct Caller {
-    ready: Option<oneshot::Sender<(Context, TaskHandle<()>)>>,
+    ready: Option<oneshot::Sender<TaskHandle<()>>>,
 }
 impl Verticle for Caller {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        let bus = ctx.event_bus();
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        let bus = ctx.event_bus()?;
         let handler = CALLER.consumer(&bus)?.handler(async move |env| {
             let candidates = [&REJECT, &UPPER].into_iter().map(|address| {
                 address
@@ -70,7 +71,7 @@ impl Verticle for Caller {
         self.ready
             .take()
             .expect("start is called once")
-            .send((ctx, handler))
+            .send(handler)
             .map_err(|_| VertxError::ReplyClosed)?;
         Ok(())
     }
@@ -85,13 +86,13 @@ impl Drop for DropNotice {
         }
     }
 }
-async fn task_lifecycle(ctx: &Context) -> Result<()> {
+async fn task_lifecycle(deployment: &Deployment) -> Result<()> {
     let (release, wait) = oneshot::channel();
     let (done, finished) = oneshot::channel();
-    let id = ctx.id();
-    let detached = ctx.spawn(async move {
+    let id = deployment.id();
+    let detached = deployment.spawn(async move {
         wait.await.map_err(|_| VertxError::ReplyClosed)?;
-        assert_eq!(Context::current().unwrap().id(), id);
+        assert_eq!(ExecutionInfo::current().unwrap().deployment_id, Some(id));
         done.send(()).map_err(|_| VertxError::ReplyClosed)?;
         Ok(())
     })?;
@@ -102,7 +103,7 @@ async fn task_lifecycle(ctx: &Context) -> Result<()> {
 
     let (entered, started) = oneshot::channel();
     let (dropped, destroyed) = oneshot::channel();
-    let task = ctx.spawn(async move {
+    let task = deployment.spawn(async move {
         let _notice = DropNotice(Some(dropped));
         entered.send(()).map_err(|_| VertxError::ReplyClosed)?;
         std::future::pending::<Result<()>>().await
@@ -122,14 +123,14 @@ async fn task_lifecycle(ctx: &Context) -> Result<()> {
     Ok(())
 }
 async fn run(vx: &Vertx) -> Result<()> {
-    vx.deploy(|_| Upper).await?;
-    vx.deploy(|_| Reject).await?;
+    vx.deploy(|| Upper).await?;
+    vx.deploy(|| Reject).await?;
     let (ready, context) = oneshot::channel();
-    let caller = vx.deploy(|_| Caller { ready: Some(ready) }).await?;
-    let (ctx, caller_handler) = context.await.map_err(|_| VertxError::ReplyClosed)?;
-    task_lifecycle(&ctx).await?;
+    let caller = vx.deploy(|| Caller { ready: Some(ready) }).await?;
+    let caller_handler = context.await.map_err(|_| VertxError::ReplyClosed)?;
+    task_lifecycle(&caller).await?;
     // 单个任务结束或取消都不会撤销 Caller，下面仍能处理业务请求。
-    let bus = vx.event_bus();
+    let bus = vx.event_bus()?;
     let responses = try_join_all(["hello", "vertx", "rust"].into_iter().map(|word| {
         CALLER.request_with(
             &bus,
@@ -160,13 +161,13 @@ async fn run(vx: &Vertx) -> Result<()> {
     ));
     let after_stop = CALLER.request(&bus, "after stop".to_owned()).await;
     assert!(matches!(after_stop, Err(VertxError::NoConsumer(_))));
-    assert!(ctx.accepts_work());
+    caller.spawn(async { Ok(()) })?.await?;
     assert_eq!(
         UPPER.request(&bus, "still running".to_owned()).await?,
         "STILL RUNNING"
     );
     println!("caller handler cancelled; its deployment still accepts work");
-    vx.undeploy(caller).await?;
+    caller.stop().await?;
     Ok(())
 }
 

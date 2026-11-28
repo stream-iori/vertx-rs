@@ -1,14 +1,13 @@
 use super::{Executors, InstanceLifetime, InstanceServices, Vertx, VertxInner};
 use crate::context::ExceptionSlot;
 use crate::eventloop::EventLoopPool;
+use crate::scope::WorkScope;
 use crate::worker_pool::WorkerPool;
 use crate::{EventBus, Result, VertxError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 /// Configures fixed execution pools and shutdown limits.
 #[must_use = "builder settings take effect only when built"]
@@ -105,8 +104,8 @@ impl VertxBuilder {
 
     fn assemble(self, instance: u64, event_loops: EventLoopPool, workers: WorkerPool) -> Vertx {
         let diagnostics = crate::diagnostics::Diagnostics::new(instance, self.diagnostics);
-        let cancel = CancellationToken::new();
-        let event_bus = EventBus::new(cancel.clone(), diagnostics.clone());
+        let scope = Arc::new(WorkScope::instance());
+        let event_bus = EventBus::new(&scope, diagnostics.clone());
         let inner = Arc::new(VertxInner {
             executors: Arc::new(Executors {
                 event_loops,
@@ -119,8 +118,7 @@ impl VertxBuilder {
                 exception_handler: ExceptionSlot::default(),
             }),
             lifetime: Arc::new(InstanceLifetime {
-                cancel,
-                blocking: TaskTracker::new(),
+                scope,
                 shutdown_grace: self.shutdown_grace,
             }),
             deployments: Default::default(),

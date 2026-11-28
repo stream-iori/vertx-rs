@@ -1,9 +1,10 @@
 use super::Vertx;
 use super::lifecycle::{ReadySender, drive_local, drive_worker};
+use crate::context::Context;
 use crate::deployment::DeploymentScope;
 use crate::diagnostics::DeploymentStage;
 use crate::{
-    Context, DeploymentId, DeploymentOptions, Result, TaskHandle, TaskId, Verticle, VertxError,
+    Deployment, DeploymentId, DeploymentOptions, Result, TaskId, Verticle, VertxError,
     WorkerVerticle,
 };
 use std::mem::DropGuard;
@@ -14,20 +15,22 @@ impl Vertx {
     /// Constructs a non-Send verticle on its assigned EventLoop and awaits start.
     /// Factory, lifecycle and managed work stay on that OS thread. Dropping the
     /// waiter requests background cleanup. Successful start leaves the deployment
-    /// running until undeploy/close; startup and cleanup failures are retained.
-    pub async fn deploy<F, V>(&self, factory: F) -> Result<DeploymentId>
+    /// running until explicitly stopped; startup and cleanup failures are retained.
+    pub async fn deploy<F, V>(&self, factory: F) -> Result<Deployment>
     where
-        F: FnOnce(Context) -> V + Send + 'static,
+        F: FnOnce() -> V + Send + 'static,
         V: Verticle,
     {
         let loops = &self.inner.executors.event_loops;
         let pending = self.submit_deployment(|scope, ready| {
             let loop_id = loops.pick();
-            let ctx = Context::new_event_loop(loop_id, &self.inner, scope);
+            let ctx = Context::new_event_loop(loop_id, &self.inner, Some(scope));
+            let deployment = ctx.deployment().expect("deployment context");
             let task_id = TaskId::next();
             loops.spawn_pinned(loop_id, task_id, move || {
                 ctx.wrap(task_id, drive_local(ctx.clone(), factory, ready))
-            })
+            })?;
+            Ok(deployment)
         })?;
         pending.wait_ready("lifecycle driver terminated").await
     }
@@ -35,16 +38,18 @@ impl Vertx {
     /// Constructs a Send Worker verticle and awaits its asynchronous start.
     /// Same-Context polls are serialized but may migrate across Worker threads.
     /// Dropping the waiter requests background cleanup, as with [`Self::deploy`].
-    pub async fn deploy_worker<F, V>(&self, factory: F) -> Result<DeploymentId>
+    pub async fn deploy_worker<F, V>(&self, factory: F) -> Result<Deployment>
     where
-        F: FnOnce(Context) -> V + Send + 'static,
+        F: FnOnce() -> V + Send + 'static,
         V: WorkerVerticle,
     {
         let pending = self.submit_deployment(|scope, ready| {
             let ctx = Context::new_worker(&self.inner, scope);
+            let deployment = ctx.deployment().expect("deployment context");
             let task_id = TaskId::next();
             let future = ctx.wrap(task_id, drive_worker(ctx.clone(), factory, ready));
-            ctx.spawn_worker(task_id, future)
+            ctx.spawn_worker(task_id, future)?;
+            Ok(deployment)
         })?;
         pending
             .wait_ready("worker lifecycle driver terminated")
@@ -58,35 +63,26 @@ impl Vertx {
         &self,
         factory: F,
         options: DeploymentOptions<C>,
-    ) -> Result<Vec<DeploymentId>>
+    ) -> Result<Vec<Deployment>>
     where
-        F: Fn(Context, Arc<C>) -> V + Send + Sync + 'static,
+        F: Fn(Arc<C>) -> V + Send + Sync + 'static,
         V: Verticle,
         C: Send + Sync + 'static,
     {
         let factory = Arc::new(factory);
         let config = options.shared_config();
-        let mut ids = Vec::new();
-        let mut rollback = DropGuard::new(Vec::<Arc<DeploymentScope>>::new(), |scopes| {
-            request_stop_all(&scopes);
+        let mut rollback = DropGuard::new(Vec::<Deployment>::new(), |deployments| {
+            request_stop_all(&deployments);
         });
         for _ in 0..options.instances_count().get() {
             let (factory, config) = (factory.clone(), config.clone());
-            match self.deploy(move |ctx| factory(ctx, config)).await {
-                Ok(id) => {
-                    if let Some(scope) = self.deployment_scope(id) {
-                        rollback.push(scope);
-                    }
-                    ids.push(id);
-                }
+            match self.deploy(move || factory(config)).await {
+                Ok(deployment) => rollback.push(deployment),
                 Err(cause) => {
                     request_stop_all(&rollback);
                     let mut failures = Vec::new();
-                    for scope in DropGuard::dismiss(rollback) {
-                        if let Err(error) = scope
-                            .wait_with_grace(self.inner.lifetime.shutdown_grace)
-                            .await
-                        {
+                    for deployment in DropGuard::dismiss(rollback) {
+                        if let Err(error) = deployment.stop().await {
                             failures.push(error);
                         }
                     }
@@ -97,106 +93,68 @@ impl Vertx {
                 }
             }
         }
-        drop(DropGuard::dismiss(rollback));
-        Ok(ids)
-    }
-
-    /// Requests shutdown and waits for managed state destruction and stop.
-    /// One shutdown grace bounds the wait; timeout leaves cleanup running.
-    /// Waiting from the same deployment returns `WouldDeadlock`; use
-    /// [`Context::request_undeploy`] there. Unknown IDs return `DeploymentNotFound`.
-    pub async fn undeploy(&self, id: DeploymentId) -> Result<()> {
-        if Context::current()
-            .is_some_and(|ctx| ctx.deployment_id() == id && self.owns_context(&ctx))
-        {
-            return Err(VertxError::WouldDeadlock);
-        }
-        let scope = self
-            .deployment_scope(id)
-            .ok_or(VertxError::DeploymentNotFound(id))?;
-        scope.request_stop();
-        let result = scope
-            .wait_with_grace(self.inner.lifetime.shutdown_grace)
-            .await;
-        if matches!(result, Err(VertxError::ShutdownTimeout(_))) {
-            tracing::warn!(deployment = %id, "shutdown timed out; cleanup continues");
-        }
-        result
-    }
-
-    fn deployment_scope(&self, id: DeploymentId) -> Option<Arc<DeploymentScope>> {
-        self.inner
-            .deployments
-            .lock()
-            .unwrap()
-            .scopes
-            .get(&id)
-            .cloned()
+        Ok(DropGuard::dismiss(rollback))
     }
 
     fn submit_deployment(
         &self,
-        submit: impl FnOnce(Arc<DeploymentScope>, ReadySender) -> Result<TaskHandle<()>>,
+        submit: impl FnOnce(Arc<DeploymentScope>, ReadySender) -> Result<Deployment>,
     ) -> Result<PendingDeployment> {
         let diagnostics = &self.inner.services.diagnostics;
         let id = DeploymentId::next();
-        let scope = Arc::new(DeploymentScope::new(
-            id,
-            self.inner.lifetime.cancel.child_token(),
-        ));
+        let scope = Arc::new(DeploymentScope::new(id, &self.inner.lifetime.scope));
         let (started, ready) = oneshot::channel();
         {
             let mut deployments = self.inner.deployments.lock().unwrap();
-            if deployments.closing {
-                return Err(VertxError::VertxClosed);
-            }
+            self.inner.ensure_open()?;
             diagnostics.record_deployment(id, DeploymentStage::Queued);
-            deployments.scopes.insert(id, scope.clone());
+            deployments.insert(id, scope.clone());
         }
         diagnostics.trace_deployment(id, DeploymentStage::Queued);
         // Close includes the scope in its snapshot even if submission is still in progress.
-        if let Err(error) = submit(scope.clone(), started) {
-            diagnostics.deployment(id, DeploymentStage::Stopped);
-            self.inner.forget_deployment(id);
-            scope.finish(Err(error.clone()));
-            return Err(error);
+        match submit(scope.clone(), started) {
+            Ok(deployment) => Ok(PendingDeployment {
+                deployment: Some(deployment),
+                ready,
+            }),
+            Err(error) => {
+                diagnostics.deployment(id, DeploymentStage::Stopped);
+                self.inner.forget_deployment(id);
+                scope.finish(Err(error.clone()));
+                Err(error)
+            }
         }
-        Ok(PendingDeployment {
-            scope: Some(scope),
-            ready,
-        })
     }
 }
 
 struct PendingDeployment {
-    scope: Option<Arc<DeploymentScope>>,
+    deployment: Option<Deployment>,
     ready: oneshot::Receiver<Result<()>>,
 }
 
 impl PendingDeployment {
-    async fn wait_ready(mut self, driver_terminated: &str) -> Result<DeploymentId> {
+    async fn wait_ready(mut self, driver_terminated: &str) -> Result<Deployment> {
         (&mut self.ready)
             .await
             .map_err(|_| VertxError::StartFailed(driver_terminated.into()))??;
         Ok(self
-            .scope
+            .deployment
             .take()
-            .expect("pending deployment owns its scope")
-            .deployment)
+            .expect("pending deployment owns its handle"))
     }
 }
 
 impl Drop for PendingDeployment {
     fn drop(&mut self) {
-        if let Some(scope) = &self.scope {
-            scope.request_stop();
+        if let Some(deployment) = &self.deployment {
+            deployment.request_stop();
         }
     }
 }
 
-fn request_stop_all(scopes: &[Arc<DeploymentScope>]) {
-    for scope in scopes {
-        scope.request_stop();
+fn request_stop_all(deployments: &[Deployment]) {
+    for deployment in deployments {
+        deployment.request_stop();
     }
 }
 

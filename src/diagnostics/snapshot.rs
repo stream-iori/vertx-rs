@@ -10,8 +10,8 @@ pub struct TaskSnapshot {
     pub task_id: TaskId,
     /// Logical Context that owns the operation.
     pub context_id: ContextId,
-    /// Deployment that tracks completion of the work.
-    pub deployment_id: DeploymentId,
+    /// Deployment that tracks completion, when the work belongs to one.
+    pub deployment_id: Option<DeploymentId>,
     /// Scheduling phase at sampling time.
     pub stage: TaskStage,
     /// Time since submission, including asynchronous waits.

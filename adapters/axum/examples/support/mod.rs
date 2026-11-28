@@ -5,17 +5,19 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, TcpServer, TcpServerOptions, Verticle, Vertx, VertxError};
+use vertx_rs::{
+    ExecutionInfo, Result, TcpServer, TcpServerOptions, Verticle, Vertx, VertxError, VertxHandle,
+};
 use vertx_rs_axum::{serve_axum, serve_axum_with_options};
 
 struct Http {
     addr: SocketAddr,
     router: Router,
     options: Option<TcpServerOptions>,
-    ready: Option<oneshot::Sender<(TcpServer, Context)>>,
+    ready: Option<oneshot::Sender<(TcpServer, ExecutionInfo)>>,
 }
 impl Verticle for Http {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let server = match self.options {
             Some(options) => {
                 serve_axum_with_options(&ctx, self.addr, self.router.clone(), options).await?
@@ -25,7 +27,7 @@ impl Verticle for Http {
         self.ready
             .take()
             .unwrap()
-            .send((server, ctx))
+            .send((server, ctx.current_execution().expect("managed start")))
             .map_err(|_| VertxError::ReplyClosed)
     }
 }
@@ -39,9 +41,9 @@ pub async fn deploy(
     addr: SocketAddr,
     router: Router,
     options: Option<TcpServerOptions>,
-) -> Result<(TcpServer, Context)> {
+) -> Result<(TcpServer, ExecutionInfo)> {
     let (ready, started) = oneshot::channel();
-    vx.deploy(move |_| Http {
+    vx.deploy(move || Http {
         addr,
         router,
         options,

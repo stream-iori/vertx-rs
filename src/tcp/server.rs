@@ -1,6 +1,7 @@
 use super::listener::{PortBudget, PortPermit, TcpIncoming, listen_managed};
+use crate::context::Context;
 use crate::task::ActiveTasks;
-use crate::{Context, ContextId, Result, TaskAbortHandle, TaskId, VertxError};
+use crate::{ContextId, Result, TaskAbortHandle, TaskId, VertxError};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFn;
@@ -99,13 +100,17 @@ impl AsyncWrite for TcpConnection<'_> {
     }
 }
 
-/// A handle to one deployment's TCP service. Dropping a handle detaches it.
+/// A handle to a managed TCP service. Dropping a handle detaches it.
 #[derive(Clone)]
 pub struct TcpServer {
     control: Arc<Control>,
 }
 
 impl TcpServer {
+    pub(crate) fn request_stop(&self) {
+        self.control.stop.cancel();
+    }
+
     /// Returns the bound address, including any OS-assigned port.
     pub fn local_addr(&self) -> SocketAddr {
         self.control.addr
@@ -176,7 +181,7 @@ impl Context {
     /// The async handler may capture non-Send state and borrows each connection.
     /// Services on the same address share a single limit and must use identical
     /// options. The deployment tracks the service and every connection task.
-    pub async fn serve_tcp<F>(
+    pub(crate) async fn serve_tcp<F>(
         &self,
         addr: SocketAddr,
         options: TcpServerOptions,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, ExecutorThread, Result, Verticle, Vertx, VertxError, VertxHandle};
 
 struct Service {
     task_started: Option<oneshot::Sender<()>>,
@@ -17,25 +17,28 @@ struct Service {
     stop_count: Arc<AtomicUsize>,
 }
 impl Verticle for Service {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let cancelled = self.cancelled.take().expect("start called once");
         let task_started = self.task_started.take().expect("start called once");
-        let token = ctx.cancellation_token();
+        let stopping = ctx.stopping()?;
         ctx.spawn_local(async move {
             task_started.send(()).map_err(|_| VertxError::ReplyClosed)?;
-            token.cancelled().await;
+            stopping.await;
             cancelled.send(()).map_err(|_| VertxError::ReplyClosed)?;
             Ok(())
         })?;
         Ok(())
     }
-    async fn stop(&mut self, ctx: Context) -> Result<()> {
+    async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
         self.stop_count.fetch_add(1, Ordering::SeqCst);
         let release = self.release.take().expect("stop called once");
         let started = self.blocking_started.take().expect("stop called once");
         let value = ctx
             .execute_blocking(move || {
-                assert!(Context::is_on_worker_thread());
+                assert!(matches!(
+                    ExecutionInfo::current().map(|info| info.thread),
+                    Some(ExecutorThread::Worker)
+                ));
                 started.send(()).map_err(|_| VertxError::ReplyClosed)?;
                 // 若外层业务超时或失败，发送端 Drop 也会解除这个等待。
                 release
@@ -61,7 +64,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     let (cleaned, finished) = oneshot::channel();
     let count = Arc::new(AtomicUsize::new(0));
     let stops = count.clone();
-    vx.deploy(move |_| Service {
+    vx.deploy(move || Service {
         task_started: Some(task_started),
         cancelled: Some(cancelled),
         blocking_started: Some(blocking_started),
@@ -71,15 +74,24 @@ async fn run(vx: &Vertx) -> Result<()> {
     })
     .await?;
     task_ready.await.map_err(|_| VertxError::ReplyClosed)?;
+    let instance_stopping = vx.stopping()?;
+    let (instance_started, instance_ready) = oneshot::channel();
+    let instance_task = vx.spawn(async move {
+        instance_started
+            .send(())
+            .map_err(|_| VertxError::ReplyClosed)?;
+        instance_stopping.await;
+        println!("instance task observed shutdown");
+        Ok(())
+    })?;
+    instance_ready.await.map_err(|_| VertxError::ReplyClosed)?;
     let first = vx.close().await;
     assert!(matches!(first, Err(VertxError::ShutdownTimeout(_))));
+    instance_task.await?;
     saw_cancel.await.map_err(|_| VertxError::ReplyClosed)?;
     started.await.map_err(|_| VertxError::ReplyClosed)?;
     assert!(vx.is_admission_closed());
-    assert!(matches!(
-        vx.event_bus().send("new-work", ()).await,
-        Err(VertxError::VertxClosed)
-    ));
+    assert!(matches!(vx.event_bus(), Err(VertxError::VertxClosed)));
     println!("close timed out; cooperative task exited; blocking cleanup is still running");
     release.send(()).map_err(|_| VertxError::ReplyClosed)?;
     finished.await.map_err(|_| VertxError::ReplyClosed)?;

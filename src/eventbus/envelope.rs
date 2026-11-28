@@ -48,7 +48,7 @@ impl MessageTrace {
             enqueued: None,
         }
     }
-    pub fn handler_span(&self, ctx: &crate::Context) -> tracing::Span {
+    pub fn handler_span(&self, ctx: &crate::context::Context) -> tracing::Span {
         if !self.enabled {
             return tracing::Span::none();
         }
@@ -60,7 +60,7 @@ impl MessageTrace {
             // The message's parent may describe its sender. Name the receiving
             // execution explicitly so causal ancestry cannot masquerade as CURRENT.
             tracing::debug_span!(parent: &self.span, "message_handler", instance_id = self.instance,
-                deployment_id = %ctx.scope().deployment, context_id = %ctx.id(), task_id = %task_id)
+                deployment_id = ctx.deployment_id().as_ref().map(tracing::field::display), context_id = %ctx.id(), task_id = %task_id)
         })
     }
     pub fn mark_enqueued(&mut self) -> Option<Self> {

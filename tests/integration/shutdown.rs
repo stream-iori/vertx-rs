@@ -7,18 +7,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError, WorkerVerticle};
+use vertx_rs::{
+    ExecutionInfo, ExecutorThread, Result, Verticle, Vertx, VertxError, VertxHandle, WorkerVerticle,
+};
 
 #[tokio::test]
 async fn stop_timeout_reports_error_then_cleanup_continues() {
     struct SlowStop(Option<oneshot::Receiver<()>>);
     impl Verticle for SlowStop {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, ctx: Context) -> Result<()> {
+        async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
             self.0.take().unwrap().await.ok();
-            assert!(Context::current().unwrap().deployment_id() == ctx.deployment_id());
+            assert!(ExecutionInfo::current() == ctx.current_execution());
             Ok(())
         }
     }
@@ -29,9 +31,9 @@ async fn stop_timeout_reports_error_then_cleanup_continues() {
         .build()
         .unwrap();
     let (tx, rx) = oneshot::channel();
-    let id = vx.deploy(|_| SlowStop(Some(rx))).await.unwrap();
+    let id = vx.deploy(|| SlowStop(Some(rx))).await.unwrap();
     assert!(matches!(
-        vx.undeploy(id).await,
+        id.stop().await,
         Err(VertxError::ShutdownTimeout(_))
     ));
     tx.send(()).unwrap();
@@ -43,22 +45,19 @@ async fn stop_timeout_reports_error_then_cleanup_continues() {
 async fn stop_can_execute_blocking_cleanup_during_global_close(vx: Vertx) {
     struct Cleanup;
     impl Verticle for Cleanup {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, ctx: Context) -> Result<()> {
-            assert_eq!(
-                Context::current().unwrap().execute_blocking(|| 42).await?,
-                42
-            );
+        async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
+            assert_eq!(ctx.execute_blocking(|| 42).await?, 42);
             assert!(matches!(
                 ctx.timer(Duration::ZERO),
-                Err(VertxError::DeploymentTerminated(_))
+                Err(VertxError::VertxClosed)
             ));
             Ok(())
         }
     }
-    vx.deploy(|_| Cleanup).await.unwrap();
+    vx.deploy(|| Cleanup).await.unwrap();
     vx.close().await.unwrap();
 }
 
@@ -70,11 +69,11 @@ async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
         destroyed: Option<oneshot::Sender<()>>,
     }
     impl Verticle for Cleanup {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
 
-        async fn stop(&mut self, ctx: Context) -> Result<()> {
+        async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
             let (started, running) = oneshot::channel();
             let release = self.release.take().unwrap();
             tokio::select! {
@@ -101,8 +100,8 @@ async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
     let (destroyed, destruction) = oneshot::channel();
     let (thread, thread_info) = oneshot::channel();
     let id = vx
-        .deploy(move |ctx| {
-            let _ = thread.send((ctx, tokio::runtime::Handle::current()));
+        .deploy(move || {
+            let _ = thread.send(tokio::runtime::Handle::current());
             Cleanup {
                 release: Some(wait),
                 destroyed: Some(destroyed),
@@ -110,13 +109,13 @@ async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
         })
         .await
         .unwrap();
-    let (ctx, driver) = thread_info.await.unwrap();
-    ctx.request_undeploy().unwrap();
+    let driver = thread_info.await.unwrap();
+    id.request_stop();
     destruction.await.unwrap();
     // Let the owning EventLoop finish the poll that destroyed the verticle.
     driver.spawn(async {}).await.unwrap();
 
-    let undeploy = vx.undeploy(id);
+    let undeploy = id.stop();
     tokio::pin!(undeploy);
     assert!(futures::poll!(&mut undeploy).is_pending());
     release.send(()).unwrap();
@@ -128,7 +127,7 @@ async fn undeploy_waits_for_detached_blocking_work_from_stop(vx: Vertx) {
 #[tokio::test]
 async fn close_is_idempotent_cancels_global_resources_and_rejects_work(vx: Vertx) {
     echo(&vx, "echo").await;
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut external = bus.consumer::<()>("external").unwrap();
     let timer = vx.timer(Duration::from_secs(99)).unwrap();
     let mut periodic = vx.periodic(Duration::ZERO, Duration::from_secs(1)).unwrap();
@@ -152,7 +151,7 @@ async fn close_is_idempotent_cancels_global_resources_and_rejects_work(vx: Vertx
         Err(VertxError::VertxClosed)
     ));
     assert!(matches!(
-        vx.deploy(|_| local(|_| async { Ok(()) })).await,
+        vx.deploy(|| local(|_| async { Ok(()) })).await,
         Err(VertxError::VertxClosed)
     ));
     assert!(matches!(
@@ -165,21 +164,25 @@ async fn close_is_idempotent_cancels_global_resources_and_rejects_work(vx: Vertx
 #[tokio::test]
 async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Vertx) {
     let (tx, rx) = oneshot::channel();
-    let id = vx
-        .deploy(move |_| {
+    let owner = vx.clone();
+    let deployment = vx
+        .deploy(move || {
             local(move |ctx| async move {
-                let c = ctx.clone();
+                let current = ctx.current_deployment().unwrap();
                 ctx.spawn_local(async move {
-                    let vertx = c.vertx().unwrap();
                     assert!(matches!(
-                        vertx.undeploy(c.deployment_id()).await,
+                        current.stop().await,
                         Err(VertxError::WouldDeadlock)
                     ));
                     assert!(matches!(
-                        vertx.close().await,
+                        current.wait_stopped().await,
                         Err(VertxError::WouldDeadlock)
                     ));
-                    c.request_undeploy()?;
+                    assert!(matches!(
+                        owner.close().await,
+                        Err(VertxError::WouldDeadlock)
+                    ));
+                    current.request_stop();
                     tx.send(()).ok();
                     Ok(())
                 })?;
@@ -189,10 +192,7 @@ async fn own_context_waiting_shutdown_is_rejected_and_request_stop_works(vx: Ver
         .await
         .unwrap();
     rx.await.unwrap();
-    match vx.undeploy(id).await {
-        Ok(()) | Err(VertxError::DeploymentNotFound(_)) => {}
-        other => panic!("unexpected: {other:?}"),
-    }
+    deployment.wait_stopped().await.unwrap();
     vx.close().await.unwrap();
 }
 
@@ -203,7 +203,7 @@ async fn close_during_start_cancels_deploy_without_cleanup_error(vx: Vertx) {
     let owner = vx.clone();
     let deployment = tokio::spawn(async move {
         owner
-            .deploy(move |_| {
+            .deploy(move || {
                 local(move |_| async move {
                     tx.send(()).ok();
                     std::future::pending::<Result<()>>().await
@@ -224,24 +224,26 @@ async fn close_during_start_cancels_deploy_without_cleanup_error(vx: Vertx) {
 async fn stop_error_is_returned_and_resources_still_close(vx: Vertx) {
     struct BadStop;
     impl Verticle for BadStop {
-        async fn start(&mut self, ctx: Context) -> Result<()> {
+        async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("bad-stop")?
                 .handler(async |_| Ok(()))?;
             Ok(())
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             Err(VertxError::Other("stop failed".into()))
         }
     }
-    vx.deploy(|_| BadStop).await.unwrap();
+    vx.deploy(|| BadStop).await.unwrap();
+    let bus = vx.event_bus().unwrap();
     assert!(matches!(
         vx.close().await,
         Err(VertxError::CleanupFailed(_))
     ));
     assert!(vx.is_admission_closed());
     assert!(matches!(
-        vx.event_bus().try_send("bad-stop", ()),
+        bus.try_send("bad-stop", ()),
         Err(VertxError::VertxClosed)
     ));
     assert!(matches!(
@@ -259,10 +261,10 @@ async fn concurrent_undeploy_runs_stop_exactly_once(vx: Vertx) {
         started: Option<oneshot::Sender<()>>,
     }
     impl Verticle for OnceStop {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.started.take().unwrap().send(()).ok();
             self.release.take().unwrap().await.ok();
@@ -274,17 +276,17 @@ async fn concurrent_undeploy_runs_stop_exactly_once(vx: Vertx) {
     let (tx, rx) = oneshot::channel();
     let (start, started) = oneshot::channel();
     let id = vx
-        .deploy(move |_| OnceStop {
+        .deploy(move || OnceStop {
             count: n,
             release: Some(rx),
             started: Some(start),
         })
         .await
         .unwrap();
-    let a = vx.clone();
-    let first = tokio::spawn(async move { a.undeploy(id).await });
+    let a = id.clone();
+    let first = tokio::spawn(async move { a.stop().await });
     started.await.unwrap();
-    let second = vx.undeploy(id);
+    let second = id.stop();
     tokio::pin!(second);
     assert!(futures::poll!(&mut second).is_pending());
     tx.send(()).unwrap();
@@ -299,16 +301,16 @@ async fn concurrent_undeploy_runs_stop_exactly_once(vx: Vertx) {
 async fn cancelled_close_waiter_does_not_cancel_cleanup(vx: Vertx) {
     struct Gate(Option<oneshot::Receiver<()>>);
     impl Verticle for Gate {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.0.take().unwrap().await.ok();
             Ok(())
         }
     }
     let (tx, rx) = oneshot::channel();
-    vx.deploy(|_| Gate(Some(rx))).await.unwrap();
+    vx.deploy(|| Gate(Some(rx))).await.unwrap();
     let mut close = Box::pin(vx.close());
     assert!(futures::poll!(close.as_mut()).is_pending());
     drop(close);
@@ -319,17 +321,22 @@ async fn cancelled_close_waiter_does_not_cancel_cleanup(vx: Vertx) {
 
 #[rstest]
 #[tokio::test]
-async fn retained_stop_context_cannot_admit_cleanup_from_external_tasks(vx: Vertx) {
+async fn blocking_created_during_stop_cannot_be_admitted_by_an_external_task(vx: Vertx) {
+    type Blocking = std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send>>;
     struct Retained {
-        tx: Option<oneshot::Sender<Context>>,
+        tx: Option<oneshot::Sender<Blocking>>,
         release: Option<oneshot::Receiver<()>>,
     }
     impl Verticle for Retained {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, ctx: Context) -> Result<()> {
-            self.tx.take().unwrap().send(ctx).ok();
+        async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
+            self.tx
+                .take()
+                .unwrap()
+                .send(Box::pin(ctx.execute_blocking(|| 42)))
+                .ok();
             self.release.take().unwrap().await.ok();
             Ok(())
         }
@@ -337,17 +344,16 @@ async fn retained_stop_context_cannot_admit_cleanup_from_external_tasks(vx: Vert
     let (tx, rx) = oneshot::channel();
     let (release, wait) = oneshot::channel();
     let id = vx
-        .deploy(move |_| Retained {
+        .deploy(move || Retained {
             tx: Some(tx),
             release: Some(wait),
         })
         .await
         .unwrap();
-    let v = vx.clone();
-    let shutdown = tokio::spawn(async move { v.undeploy(id).await });
-    let ctx = rx.await.unwrap();
+    let shutdown = tokio::spawn(async move { id.stop().await });
+    let blocking = rx.await.unwrap();
     assert!(matches!(
-        ctx.execute_blocking(|| 42).await,
+        blocking.await,
         Err(VertxError::DeploymentTerminated(_))
     ));
     release.send(()).unwrap();
@@ -363,7 +369,7 @@ async fn saturated_worker_pool_does_not_prevent_close_timeout_or_later_cleanup()
         .shutdown_grace(Duration::from_millis(30))
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     ctx.spawn(async move {
@@ -386,17 +392,20 @@ async fn saturated_worker_pool_does_not_prevent_close_timeout_or_later_cleanup()
 async fn single_worker_stop_can_await_blocking_cleanup_in_the_shared_pool() {
     struct StopWorker(Option<oneshot::Sender<()>>);
     impl WorkerVerticle for StopWorker {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, ctx: Context) -> Result<()> {
-            let id = ctx.deployment_id();
+        async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
+            let id = ctx.current_execution().unwrap().deployment_id;
             ctx.execute_blocking(move || {
-                assert!(Context::is_on_worker_thread());
-                assert_eq!(Context::current().unwrap().deployment_id(), id);
+                assert!(matches!(
+                    ExecutionInfo::current().map(|info| info.thread),
+                    Some(ExecutorThread::Worker)
+                ));
+                assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             })
             .await?;
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             self.0.take().unwrap().send(()).ok();
             Ok(())
         }
@@ -407,7 +416,7 @@ async fn single_worker_stop_can_await_blocking_cleanup_in_the_shared_pool() {
         .build()
         .unwrap();
     let (done, finished) = oneshot::channel();
-    vx.deploy_worker(move |_| StopWorker(Some(done)))
+    vx.deploy_worker(move || StopWorker(Some(done)))
         .await
         .unwrap();
     vx.close().await.unwrap();
@@ -421,12 +430,13 @@ async fn raw_tokio_task_on_owned_eventloop_cannot_wait_for_its_own_close() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let owner = vx.clone();
     ctx.spawn(async move {
+        let thread = std::thread::current().id();
         tokio::spawn(async move {
-            assert!(Context::current().is_none());
-            assert!(Context::is_on_event_loop_thread());
+            assert!(ExecutionInfo::current().is_none());
+            assert_eq!(std::thread::current().id(), thread);
             assert!(matches!(
                 owner.close().await,
                 Err(VertxError::WouldDeadlock)
@@ -463,7 +473,7 @@ async fn close_joins_every_eventloop_even_with_retained_contexts_and_task_handle
     let mut contexts = Vec::new();
     let mut tasks = Vec::new();
     for _ in 0..2 {
-        let (_, ctx) = capture(&vx).await;
+        let (ctx, _) = capture(&vx).await;
         let count = exited.clone();
         let (entered, started) = oneshot::channel();
         tasks.push(
@@ -501,12 +511,12 @@ async fn eventloop_can_await_close_of_a_different_vertx_instance() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture(&first).await;
-    let id = ctx.deployment_id();
+    let (ctx, _) = capture(&first).await;
+    let id = Some(ctx.id());
     let target = second.clone();
     ctx.spawn(async move {
         target.close().await?;
-        assert_eq!(Context::current().unwrap().deployment_id(), id);
+        assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
         Ok(())
     })
     .unwrap()

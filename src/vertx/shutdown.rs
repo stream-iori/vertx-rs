@@ -1,7 +1,7 @@
 use super::{Vertx, VertxInner};
 use crate::deployment::DeploymentScope;
 use crate::diagnostics::CloseStage;
-use crate::{Context, Result, TaskId, VertxError};
+use crate::{Result, TaskId, VertxError};
 use std::sync::Arc;
 
 impl Vertx {
@@ -14,7 +14,7 @@ impl Vertx {
     /// EventLoop threads returns `WouldDeadlock`, including from raw Tokio tasks.
     pub async fn close(&self) -> Result<()> {
         if self.inner.executors.event_loops.owns_current_thread()
-            || Context::current().is_some_and(|ctx| self.owns_context(&ctx))
+            || self.handle().current_context().is_some()
         {
             return Err(VertxError::WouldDeadlock);
         }
@@ -33,12 +33,11 @@ impl Vertx {
         let services = &self.inner.services;
         services.diagnostics.close_stage(CloseStage::Deployments);
         services.tcp.close_admission();
-        self.inner.lifetime.cancel.cancel();
+        self.inner.lifetime.scope.request_stop();
         services.event_bus.close();
         for scope in &scopes {
-            scope.request_stop();
+            scope.work.request_stop();
         }
-        self.inner.lifetime.blocking.close();
 
         let owner = self.inner.clone();
         let loops = &self.inner.executors.event_loops;
@@ -57,25 +56,33 @@ impl Vertx {
 
 impl VertxInner {
     fn begin_close(&self) -> Option<Vec<Arc<DeploymentScope>>> {
-        let mut deployments = self.deployments.lock().unwrap();
-        if deployments.closing {
-            return None;
-        }
-        deployments.closing = true;
-        Some(deployments.scopes.values().cloned().collect())
+        let deployments = self.deployments.lock().unwrap();
+        self.lifetime
+            .scope
+            .close_instance_admission()
+            .then(|| deployments.values().cloned().collect())
     }
 
     async fn finish_close(self: Arc<Self>, scopes: Vec<Arc<DeploymentScope>>) -> Result<()> {
-        let mut errors = Vec::new();
-        for scope in scopes {
-            if let Err(error) = scope.wait().await {
-                errors.push(error);
+        let root = &self.lifetime.scope;
+        root.unregister_resources();
+        let wait_deployments = async {
+            let mut errors = Vec::new();
+            for scope in scopes {
+                if let Err(error) = scope.wait().await {
+                    errors.push(error);
+                }
             }
-        }
+            errors
+        };
+        let (mut errors, ()) = tokio::join!(
+            wait_deployments,
+            root.drain_tasks(self.lifetime.shutdown_grace),
+        );
 
         let diagnostics = &self.services.diagnostics;
         diagnostics.close_stage(CloseStage::Blocking);
-        self.lifetime.blocking.wait().await;
+        root.wait_blocking().await;
         if let Err(error) = self.services.exception_handler.seal() {
             errors.push(error);
         }

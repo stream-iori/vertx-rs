@@ -1,7 +1,8 @@
-use crate::context::TaskResult;
+use crate::context::{Context, TaskResult};
+use crate::deployment::DeploymentScope;
 use crate::diagnostics::DeploymentStage;
 use crate::error::{panic_error, retain_failure};
-use crate::{Context, Result, Verticle, VertxError, WorkerVerticle};
+use crate::{Result, Verticle, VertxError, WorkerVerticle};
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::task::Poll;
@@ -13,18 +14,18 @@ pub(super) type ReadySender = oneshot::Sender<Result<()>>;
 // The drivers share bookkeeping while the compiler checks Send independently.
 pub(super) async fn drive_local<V: Verticle>(
     ctx: Context,
-    factory: impl FnOnce(Context) -> V,
+    factory: impl FnOnce() -> V,
     ready: ReadySender,
 ) -> TaskResult<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
     if let Some(mut verticle) = lifecycle.create(factory) {
-        let startup = lifecycle.start(|| verticle.start(ctx.clone())).await;
+        let startup = lifecycle.start(|| verticle.start(ctx.vertx_handle())).await;
         let run_stop = startup.runs_stop();
         lifecycle.quiesce_after_start(startup).await;
         if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
-                .stop(&stop_ctx, || verticle.stop(stop_ctx.clone()))
+                .stop(&stop_ctx, || verticle.stop(stop_ctx.vertx_handle()))
                 .await;
         }
         lifecycle.destroy(verticle);
@@ -37,18 +38,18 @@ pub(super) async fn drive_local<V: Verticle>(
 
 pub(super) async fn drive_worker<V: WorkerVerticle>(
     ctx: Context,
-    factory: impl FnOnce(Context) -> V,
+    factory: impl FnOnce() -> V,
     ready: ReadySender,
 ) -> TaskResult<()> {
     let mut lifecycle = Lifecycle::new(&ctx, ready);
     if let Some(mut verticle) = lifecycle.create(factory) {
-        let startup = lifecycle.start(|| verticle.start(ctx.clone())).await;
+        let startup = lifecycle.start(|| verticle.start(ctx.vertx_handle())).await;
         let run_stop = startup.runs_stop();
         lifecycle.quiesce_after_start(startup).await;
         if run_stop {
             let stop_ctx = lifecycle.stop_context();
             lifecycle
-                .stop(&stop_ctx, || verticle.stop(stop_ctx.clone()))
+                .stop(&stop_ctx, || verticle.stop(stop_ctx.vertx_handle()))
                 .await;
         }
         lifecycle.destroy(verticle);
@@ -130,6 +131,7 @@ impl Startup {
 
 struct Lifecycle<'a> {
     ctx: &'a Context,
+    scope: &'a DeploymentScope,
     ready: Option<ReadySender>,
     outcome: Result<()>,
     startup_cancellation: Option<VertxError>,
@@ -139,6 +141,7 @@ impl<'a> Lifecycle<'a> {
     fn new(ctx: &'a Context, ready: ReadySender) -> Self {
         let lifecycle = Self {
             ctx,
+            scope: ctx.deployment_scope(),
             ready: Some(ready),
             outcome: Ok(()),
             startup_cancellation: None,
@@ -147,8 +150,8 @@ impl<'a> Lifecycle<'a> {
         lifecycle
     }
 
-    fn create<V>(&mut self, factory: impl FnOnce(Context) -> V) -> Option<V> {
-        match catch_unwind(AssertUnwindSafe(|| factory(self.ctx.clone()))) {
+    fn create<V>(&mut self, factory: impl FnOnce() -> V) -> Option<V> {
+        match catch_unwind(AssertUnwindSafe(factory)) {
             Ok(verticle) => Some(verticle),
             Err(error) => {
                 self.outcome = Err(panic_error(error));
@@ -158,14 +161,14 @@ impl<'a> Lifecycle<'a> {
     }
 
     async fn start<F: Future<Output = Result<()>>>(&self, start: impl FnOnce() -> F) -> Startup {
-        let scope = self.ctx.scope();
+        let scope = &self.scope.work;
         match invoke(self.ctx, start, Some(&scope.cancel)).await {
             CallbackOutcome::Returned(Ok(())) if scope.try_mark_running() => Startup::Started,
             CallbackOutcome::Returned(Ok(())) | CallbackOutcome::Cancelled => {
-                Startup::Cancelled(VertxError::DeploymentTerminated(scope.deployment))
+                Startup::Cancelled(VertxError::DeploymentTerminated(self.scope.id))
             }
             CallbackOutcome::Returned(Err(error)) => {
-                if matches!(error, VertxError::DeploymentTerminated(id) if id == scope.deployment && scope.cancel.is_cancelled())
+                if matches!(error, VertxError::DeploymentTerminated(id) if id == self.scope.id && scope.cancel.is_cancelled())
                     || matches!(error, VertxError::VertxClosed if self.ctx.instance_admission_closed())
                 {
                     Startup::Cancelled(error)
@@ -244,11 +247,12 @@ impl<'a> Lifecycle<'a> {
     fn finish(self) -> TaskResult<()> {
         let Self {
             ctx,
+            scope,
             ready,
             mut outcome,
             startup_cancellation,
         } = self;
-        let id = ctx.scope().deployment;
+        let id = scope.id;
         if let Err(error) = &outcome {
             ctx.report_error(error);
         }
@@ -257,10 +261,10 @@ impl<'a> Lifecycle<'a> {
             retain_failure(&mut outcome, error);
         }
         ctx.diagnostics().deployment(id, DeploymentStage::Stopped);
-        if let Some(vertx) = ctx.vertx() {
-            vertx.inner.forget_deployment(id);
+        if let Some(instance) = ctx.instance() {
+            instance.forget_deployment(id);
         }
-        ctx.scope().finish(outcome.clone());
+        scope.finish(outcome.clone());
         if let Some(ready) = ready {
             let readiness = match (startup_cancellation.clone(), outcome.clone()) {
                 (Some(cancellation), cleanup) => {
@@ -282,8 +286,6 @@ impl<'a> Lifecycle<'a> {
     }
 
     fn stage(&self, stage: DeploymentStage) {
-        self.ctx
-            .diagnostics()
-            .deployment(self.ctx.scope().deployment, stage);
+        self.ctx.diagnostics().deployment(self.scope.id, stage);
     }
 }

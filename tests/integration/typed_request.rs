@@ -9,8 +9,8 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    ConsumerOptions, Context, DeliveryOptions, IncomingRequest, RequestAddress, RequestOptions,
-    Result, Vertx, VertxError,
+    ConsumerOptions, DeliveryOptions, IncomingRequest, RequestAddress, RequestOptions, Result,
+    Vertx, VertxError, VertxHandle,
 };
 
 #[rstest]
@@ -19,7 +19,7 @@ async fn a_live_address_rejects_conflicting_protocols(vx: Vertx) {
     const LOOKUP: RequestAddress<u32, String> = RequestAddress::new("lookup");
     const WRONG_BODY: RequestAddress<u16, String> = RequestAddress::new("lookup");
     const WRONG_REPLY: RequestAddress<u32, bool> = RequestAddress::new("lookup");
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let address = LOOKUP.address();
     let subscription = LOOKUP.consumer(&bus).unwrap();
     assert_eq!(subscription.address(), address);
@@ -89,7 +89,7 @@ async fn a_live_address_rejects_conflicting_protocols(vx: Vertx) {
 #[tokio::test]
 async fn typed_subscribers_share_an_address_and_can_reply_or_fail(vx: Vertx) {
     const FIND: RequestAddress<u32, String> = RequestAddress::new("find");
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut first = FIND.consumer(&bus).unwrap();
     let mut second = FIND.consumer(&bus).unwrap();
 
@@ -130,7 +130,7 @@ async fn typed_subscribers_share_an_address_and_can_reply_or_fail(vx: Vertx) {
 #[tokio::test(start_paused = true)]
 async fn typed_timeout_covers_admission_and_late_replies(vx: Vertx) {
     const FULL: RequestAddress<u32, ()> = RequestAddress::new("full");
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut consumer = FULL
         .consumer_with(&bus, ConsumerOptions::new().with_capacity(1))
         .unwrap();
@@ -187,8 +187,8 @@ async fn handler_handle_can_cancel_one_subscription(#[case] on_worker: bool, vx:
     let (ready_tx, ready_rx) = oneshot::channel();
     let (started, entered) = oneshot::channel();
     let (destroyed, mut destruction) = oneshot::channel();
-    let register = move |ctx: Context| {
-        let bus = ctx.event_bus();
+    let register = move |ctx: VertxHandle| {
+        let bus = ctx.event_bus().unwrap();
         let mut state = Some((started, DropNotice(Some(destroyed))));
         let wait = move |request: IncomingRequest<(), ()>| {
             let (started, notice) = state.take().unwrap();
@@ -209,20 +209,20 @@ async fn handler_handle_can_cancel_one_subscription(#[case] on_worker: bool, vx:
             cancel.handler(wait)?
         };
         ready_tx
-            .send((handle, ctx))
+            .send((handle, ctx.current_deployment().unwrap()))
             .map_err(|_| VertxError::ReplyClosed)
     };
     if on_worker {
-        vx.deploy_worker(move |_| worker(move |ctx| ready(register(ctx))))
+        vx.deploy_worker(move || worker(move |ctx| ready(register(ctx))))
             .await
             .unwrap();
     } else {
-        vx.deploy(move |_| local(move |ctx| ready(register(ctx))))
+        vx.deploy(move || local(move |ctx| ready(register(ctx))))
             .await
             .unwrap();
     }
     let (handle, ctx) = ready_rx.await.unwrap();
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     assert_eq!(KEEP.request(&bus, 1).await.unwrap(), 1);
 
     let b = bus.clone();
@@ -243,7 +243,7 @@ async fn handler_handle_can_cancel_one_subscription(#[case] on_worker: bool, vx:
         CANCEL.request(&bus, ()).await,
         Err(VertxError::NoConsumer(_))
     ));
-    assert!(ctx.accepts_work());
+    ctx.spawn(async { Ok(()) }).unwrap().await.unwrap();
     assert_eq!(KEEP.request(&bus, 2).await.unwrap(), 2);
     vx.close().await.unwrap();
 }

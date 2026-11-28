@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use tokio::sync::oneshot;
 use vertx_rs::{
-    Consumer, Context, DeploymentOptions, Result, Verticle, Vertx, VertxError, WorkerVerticle,
+    Consumer, DeploymentOptions, ExecutionInfo, Result, Verticle, Vertx, VertxError, VertxHandle,
+    WorkerVerticle,
 };
 
 #[derive(Clone, Copy)]
@@ -22,7 +23,7 @@ enum Fault {
 }
 
 struct ReadyCallback {
-    ctx: Context,
+    execution: ExecutionInfo,
     drop_panic: Option<&'static str>,
 }
 
@@ -30,15 +31,14 @@ impl Future for ReadyCallback {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<()>> {
-        assert_eq!(Context::current().unwrap().id(), self.ctx.id());
+        assert_eq!(ExecutionInfo::current(), Some(self.execution));
         Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for ReadyCallback {
     fn drop(&mut self) {
-        assert_eq!(Context::current().unwrap().id(), self.ctx.id());
-        assert_eq!(Context::is_on_worker_thread(), self.ctx.is_worker());
+        assert_eq!(ExecutionInfo::current(), Some(self.execution));
         if let Some(message) = self.drop_panic {
             panic!("{message}");
         }
@@ -52,49 +52,51 @@ struct CallbackFault {
 }
 
 impl CallbackFault {
-    fn start_callback(&mut self, ctx: Context) -> ReadyCallback {
-        assert_eq!(Context::current().unwrap().id(), ctx.id());
-        self.consumer = Some(ctx.event_bus().consumer("callback_fault").unwrap());
+    fn start_callback(&mut self, ctx: VertxHandle) -> ReadyCallback {
+        let execution = ctx.current_execution().unwrap();
+        assert_eq!(ExecutionInfo::current(), Some(execution));
+        self.consumer = Some(ctx.event_bus().unwrap().consumer("callback_fault").unwrap());
         assert!(
             !matches!(self.fault, Fault::StartConstruction),
             "start construction"
         );
         ReadyCallback {
-            ctx,
+            execution,
             drop_panic: matches!(self.fault, Fault::StartDrop).then_some("start future destructor"),
         }
     }
 
-    fn stop_callback(&mut self, ctx: Context) -> ReadyCallback {
-        assert_eq!(Context::current().unwrap().id(), ctx.id());
+    fn stop_callback(&mut self, ctx: VertxHandle) -> ReadyCallback {
+        let execution = ctx.current_execution().unwrap();
+        assert_eq!(ExecutionInfo::current(), Some(execution));
         self.stops.fetch_add(1, Ordering::SeqCst);
         assert!(
             !matches!(self.fault, Fault::StopConstruction),
             "stop construction"
         );
         ReadyCallback {
-            ctx,
+            execution,
             drop_panic: matches!(self.fault, Fault::StopDrop).then_some("stop future destructor"),
         }
     }
 }
 
 impl Verticle for CallbackFault {
-    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>> {
+    fn start(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>> {
         self.start_callback(ctx)
     }
 
-    fn stop(&mut self, ctx: Context) -> impl Future<Output = Result<()>> {
+    fn stop(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>> {
         self.stop_callback(ctx)
     }
 }
 
 impl WorkerVerticle for CallbackFault {
-    fn start(&mut self, ctx: Context) -> impl Future<Output = Result<()>> + Send {
+    fn start(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>> + Send {
         self.start_callback(ctx)
     }
 
-    fn stop(&mut self, ctx: Context) -> impl Future<Output = Result<()>> + Send {
+    fn stop(&mut self, ctx: VertxHandle) -> impl Future<Output = Result<()>> + Send {
         self.stop_callback(ctx)
     }
 }
@@ -114,7 +116,7 @@ async fn lifecycle_contains_panics_outside_future_poll(
 ) {
     let stops = Arc::new(AtomicUsize::new(0));
     let count = stops.clone();
-    let factory = move |_| CallbackFault {
+    let factory = move || CallbackFault {
         fault,
         consumer: None,
         stops: count,
@@ -125,14 +127,14 @@ async fn lifecycle_contains_panics_outside_future_poll(
         vx.deploy(factory).await
     };
     let result = match deployment {
-        Ok(id) => vx.undeploy(id).await,
+        Ok(id) => id.stop().await,
         Err(error) => Err(error),
     };
     assert!(matches!(result, Err(VertxError::Panic(actual)) if actual == message));
     assert_eq!(stops.load(Ordering::SeqCst), expected_stops);
     assert_eq!(vx.diagnostics().active_deployments, 0);
     assert!(matches!(
-        vx.event_bus().try_send("callback_fault", ()),
+        vx.event_bus().unwrap().try_send("callback_fault", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -145,16 +147,21 @@ async fn lifecycle_contains_panics_outside_future_poll(
 #[tokio::test]
 async fn a_live_start_reports_deployment_terminated_as_failure(vx: Vertx, #[case] own: bool) {
     let (foreign, _) = capture(&vx).await;
-    vx.undeploy(foreign).await.unwrap();
+    foreign.stop().await.unwrap();
+    let foreign = foreign.id();
     let reports = Arc::new(AtomicUsize::new(0));
     let count = reports.clone();
     vx.set_exception_handler(move |_| {
         count.fetch_add(1, Ordering::SeqCst);
     });
     let result = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
-                let id = if own { ctx.deployment_id() } else { foreign };
+                let id = if own {
+                    ctx.current_deployment().unwrap().id()
+                } else {
+                    foreign
+                };
                 Err(VertxError::DeploymentTerminated(id))
             })
         })
@@ -170,12 +177,12 @@ struct Lifecycle {
     stopped: Arc<AtomicUsize>,
 }
 impl Verticle for Lifecycle {
-    async fn start(&mut self, _: Context) -> Result<()> {
+    async fn start(&mut self, _: VertxHandle) -> Result<()> {
         tokio::task::yield_now().await;
         self.started.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    async fn stop(&mut self, _: Context) -> Result<()> {
+    async fn stop(&mut self, _: VertxHandle) -> Result<()> {
         self.stopped.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -188,7 +195,7 @@ async fn deploy_runs_factory_then_start_then_undeploy_stops(vx: Vertx) {
     let stopped = Arc::new(AtomicUsize::new(0));
     let (a, b) = (started.clone(), stopped.clone());
     let id = vx
-        .deploy(move |_| Lifecycle {
+        .deploy(move || Lifecycle {
             started: a,
             stopped: b,
         })
@@ -196,21 +203,21 @@ async fn deploy_runs_factory_then_start_then_undeploy_stops(vx: Vertx) {
         .unwrap();
     assert_eq!(started.load(Ordering::SeqCst), 1);
     assert_eq!(stopped.load(Ordering::SeqCst), 0);
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
     vx.close().await.unwrap();
 }
 
 #[rstest]
 #[tokio::test]
-async fn undeploy_unknown_id_errors(vx: Vertx) {
-    let (id, _) = capture(&vx).await;
-    vx.undeploy(id).await.unwrap();
-    assert!(matches!(
-        vx.undeploy(id).await,
-        Err(VertxError::DeploymentNotFound(_))
-    ));
+async fn stopped_deployment_retains_its_completion(vx: Vertx) {
+    let (deployment, _) = capture(&vx).await;
+    deployment.stop().await.unwrap();
+    deployment.request_stop();
+    deployment.stop().await.unwrap();
+    deployment.wait_stopped().await.unwrap();
     vx.close().await.unwrap();
+    deployment.wait_stopped().await.unwrap();
 }
 
 #[rstest]
@@ -218,7 +225,7 @@ async fn undeploy_unknown_id_errors(vx: Vertx) {
 async fn undeploy_aborts_misbehaving_child(vx: Vertx) {
     let (tx, rx) = oneshot::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let (entered, started) = oneshot::channel();
                 let handle = ctx.spawn_local(async move {
@@ -235,7 +242,7 @@ async fn undeploy_aborts_misbehaving_child(vx: Vertx) {
         .await
         .unwrap();
     let child = rx.await.unwrap();
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert!(matches!(child.await, Err(VertxError::TaskCancelled)));
     vx.close().await.unwrap();
 }
@@ -246,14 +253,15 @@ async fn undeploy_unregisters_bound_consumers(vx: Vertx) {
     let id = echo(&vx, "echo").await;
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, String>("echo", "hi".to_owned())
             .await
             .unwrap(),
         "hi"
     );
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert!(matches!(
-        vx.event_bus().send("echo", "x".to_owned()).await,
+        vx.event_bus().unwrap().send("echo", "x".to_owned()).await,
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -264,14 +272,15 @@ async fn undeploy_unregisters_bound_consumers(vx: Vertx) {
 async fn deploy_with_instances_and_typed_config(vx: Vertx) {
     let ids = vx
         .deploy_with(
-            |_, cfg: Arc<String>| {
+            |cfg: Arc<String>| {
                 local(move |ctx| async move {
-                    ctx.event_bus().consumer::<String>("configured")?.handler(
-                        async move |env| {
+                    ctx.event_bus()
+                        .unwrap()
+                        .consumer::<String>("configured")?
+                        .handler(async move |env| {
                             let body = format!("{}:{}", cfg, env.body());
                             env.reply(body)
-                        },
-                    )?;
+                        })?;
                     Ok(())
                 })
             },
@@ -285,6 +294,7 @@ async fn deploy_with_instances_and_typed_config(vx: Vertx) {
     for _ in 0..6 {
         assert_eq!(
             vx.event_bus()
+                .unwrap()
                 .request::<_, String>("configured", "x".to_owned())
                 .await
                 .unwrap(),
@@ -298,9 +308,10 @@ async fn deploy_with_instances_and_typed_config(vx: Vertx) {
 #[tokio::test]
 async fn start_failure_and_factory_panic_clean_resources(vx: Vertx) {
     let result = vx
-        .deploy(|_| {
+        .deploy(|| {
             local(|ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("failed")?
                     .handler(async |_| Ok(()))?;
                 Err(VertxError::StartFailed("expected".into()))
@@ -309,18 +320,19 @@ async fn start_failure_and_factory_panic_clean_resources(vx: Vertx) {
         .await;
     assert!(matches!(result, Err(VertxError::StartFailed(_))));
     assert!(matches!(
-        vx.event_bus().try_send("failed", ()),
+        vx.event_bus().unwrap().try_send("failed", ()),
         Err(VertxError::NoConsumer(_))
     ));
+    let bus = vx.event_bus().unwrap();
     let result = vx
-        .deploy::<_, Local<fn(Context) -> std::future::Ready<Result<()>>>>(|ctx| {
-            let _c = ctx.event_bus().consumer::<()>("panic").unwrap();
+        .deploy::<_, Local<fn(VertxHandle) -> std::future::Ready<Result<()>>>>(move || {
+            let _c = bus.consumer::<()>("panic").unwrap();
             panic!("factory panic")
         })
         .await;
     assert!(matches!(result, Err(VertxError::Panic(_))));
     assert!(matches!(
-        vx.event_bus().try_send("panic", ()),
+        vx.event_bus().unwrap().try_send("panic", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -336,21 +348,21 @@ async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: 
         dropped: Arc<AtomicBool>,
     }
     impl Verticle for PanicStart {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             panic!("start panicked");
         }
 
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.stopped.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
     impl WorkerVerticle for PanicStart {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             panic!("start panicked");
         }
 
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.stopped.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -374,9 +386,9 @@ async fn start_panic_skips_stop_and_drops_before_deploy_returns(#[case] worker: 
         dropped: dropped.clone(),
     };
     let result = if worker {
-        vx.deploy_worker(move |_| verticle).await
+        vx.deploy_worker(move || verticle).await
     } else {
-        vx.deploy(move |_| verticle).await
+        vx.deploy(move || verticle).await
     };
     assert!(matches!(result, Err(VertxError::Panic(message)) if message == "start panicked"));
     assert!(!stopped.load(Ordering::SeqCst));
@@ -397,12 +409,13 @@ async fn cancellation_of_pending_deploy_cleans_startup(vx: Vertx) {
     let (tx, rx) = oneshot::channel();
     let v = vx.clone();
     let deploy = tokio::spawn(async move {
-        v.deploy(move |_| {
+        v.deploy(move || {
             local(move |ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("startup")?
                     .handler(async |_| Ok(()))?;
-                tx.send(ctx).ok();
+                tx.send(ctx.current_deployment().unwrap()).ok();
                 std::future::pending::<Result<()>>().await
             })
         })
@@ -412,7 +425,7 @@ async fn cancellation_of_pending_deploy_cleans_startup(vx: Vertx) {
     deploy.abort();
     assert!(deploy.await.unwrap_err().is_cancelled());
     vx.close().await.unwrap();
-    assert!(!ctx.accepts_work());
+    assert!(ctx.spawn(async { Ok(()) }).is_err());
 }
 
 #[rstest]
@@ -423,17 +436,18 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
         second_stopping: Arc<tokio::sync::Notify>,
     }
     impl Verticle for Instance {
-        async fn start(&mut self, ctx: Context) -> Result<()> {
+        async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
             if self.index == 2 {
                 return Err(VertxError::StartFailed("third instance".into()));
             }
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("group")?
                 .handler(async |_| Ok(()))?;
             Ok(())
         }
 
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             match self.index {
                 0 => self.second_stopping.notified().await,
                 1 => {
@@ -451,7 +465,7 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
     let second_stopping = Arc::new(tokio::sync::Notify::new());
     let result = vx
         .deploy_with(
-            move |_, _: Arc<()>| Instance {
+            move |_: Arc<()>| Instance {
                 index: created.fetch_add(1, Ordering::SeqCst),
                 second_stopping: second_stopping.clone(),
             },
@@ -467,7 +481,7 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
     );
     assert_eq!(count.load(Ordering::SeqCst), 3);
     assert!(matches!(
-        vx.event_bus().try_send("group", ()),
+        vx.event_bus().unwrap().try_send("group", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -483,14 +497,15 @@ async fn undeploy_waits_for_inflight_handler_to_be_dropped(vx: Vertx) {
     impl Drop for OnDrop {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
-            assert!(Context::current().is_some());
+            assert!(ExecutionInfo::current().is_some());
         }
     }
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let mut start = Some(started_tx);
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("hang")?
                     .handler(async move |_| {
                         let start = start.take().unwrap();
@@ -503,9 +518,9 @@ async fn undeploy_waits_for_inflight_handler_to_be_dropped(vx: Vertx) {
         })
         .await
         .unwrap();
-    vx.event_bus().send("hang", ()).await.unwrap();
+    vx.event_bus().unwrap().send("hang", ()).await.unwrap();
     started_rx.await.unwrap();
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     vx.close().await.unwrap();
 }
@@ -514,9 +529,10 @@ async fn undeploy_waits_for_inflight_handler_to_be_dropped(vx: Vertx) {
 #[tokio::test]
 async fn worker_failed_start_waits_for_its_resource_cleanup(vx: Vertx) {
     let result = vx
-        .deploy_worker(|_| {
+        .deploy_worker(|| {
             worker(|ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("worker-start")?
                     .handler_worker(|_| async { Ok(()) })?;
                 Err(VertxError::StartFailed("worker startup failed".into()))
@@ -525,7 +541,7 @@ async fn worker_failed_start_waits_for_its_resource_cleanup(vx: Vertx) {
         .await;
     assert!(matches!(result, Err(VertxError::StartFailed(_))));
     assert!(matches!(
-        vx.event_bus().try_send("worker-start", ()),
+        vx.event_bus().unwrap().try_send("worker-start", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -540,8 +556,9 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
         stopped: tokio::sync::mpsc::UnboundedSender<usize>,
     }
     impl Verticle for Instance {
-        async fn start(&mut self, ctx: Context) -> Result<()> {
+        async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("cancel-group")?
                 .handler(async |_| Ok(()))?;
             if let Some(pending) = self.pending.take() {
@@ -551,7 +568,7 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
             Ok(())
         }
 
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.stopped.send(self.index).unwrap();
             Ok(())
         }
@@ -564,7 +581,7 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
     let v = vx.clone();
     let future = tokio::spawn(async move {
         v.deploy_with(
-            move |_, _: Arc<()>| {
+            move |_: Arc<()>| {
                 let index = created.fetch_add(1, Ordering::SeqCst);
                 Instance {
                     index,
@@ -591,7 +608,7 @@ async fn cancelling_multi_instance_deploy_rolls_back_prior_instances(vx: Vertx) 
     stopped.sort_unstable();
     assert_eq!(stopped, [0, 1]);
     assert!(matches!(
-        vx.event_bus().try_send("cancel-group", ()),
+        vx.event_bus().unwrap().try_send("cancel-group", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();

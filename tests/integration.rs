@@ -14,6 +14,8 @@ mod diagnostics;
 mod errors;
 #[path = "integration/eventbus.rs"]
 mod eventbus;
+#[path = "integration/facade.rs"]
+mod facade;
 #[path = "integration/lifecycle.rs"]
 mod lifecycle;
 #[path = "integration/shared_state.rs"]

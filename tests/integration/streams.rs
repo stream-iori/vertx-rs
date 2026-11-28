@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeliveryOptions, Vertx, VertxError};
+use vertx_rs::{DeliveryOptions, ExecutionInfo, Vertx, VertxError};
 
 #[rstest]
 #[tokio::test]
 async fn message_sink_reserves_once_and_only_closes_its_adapter(vx: Vertx) {
     use futures::{Sink, SinkExt};
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut consumer = bus
         .consumer_with::<u32>("sink", vertx_rs::ConsumerOptions::new().with_capacity(1))
         .unwrap();
@@ -51,7 +51,7 @@ async fn message_sink_reserves_once_and_only_closes_its_adapter(vx: Vertx) {
 #[tokio::test]
 async fn message_sink_waits_on_its_selected_consumer_and_drop_releases_wait(vx: Vertx) {
     use futures::{Sink, SinkExt};
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let options = vertx_rs::ConsumerOptions::new().with_capacity(1);
     let mut a = bus.consumer_with::<u32>("sticky", options.clone()).unwrap();
     let _b = bus.consumer_with::<u32>("sticky", options.clone()).unwrap();
@@ -102,19 +102,24 @@ async fn message_sink_waits_on_its_selected_consumer_and_drop_releases_wait(vx: 
 #[tokio::test]
 async fn stream_and_sink_observe_scope_termination_with_retained_consumer(vx: Vertx) {
     use futures::{Sink, StreamExt};
-    let (id, ctx) = capture(&vx).await;
-    let mut consumer = ctx.event_bus().consumer::<u32>("retained").unwrap();
-    let mut sink = vx.event_bus().sink::<u32>("retained").unwrap();
+    let (deployment, _) = capture(&vx).await;
+    let bus = vx.event_bus().unwrap();
+    let mut sink = bus.sink::<u32>("retained").unwrap();
+    let mut consumer = deployment
+        .spawn(async move { bus.consumer::<u32>("retained") })
+        .unwrap()
+        .await
+        .unwrap();
     futures::future::poll_fn(|cx| std::pin::Pin::new(&mut sink).poll_ready(cx))
         .await
         .unwrap();
-    vx.undeploy(id).await.unwrap();
+    deployment.stop().await.unwrap();
     assert!(matches!(
         std::pin::Pin::new(&mut sink).start_send(1),
         Err(VertxError::ChannelClosed(_))
     ));
     assert!(
-        matches!(consumer.next().await, Some(Err(VertxError::DeploymentTerminated(i))) if i == id)
+        matches!(consumer.next().await, Some(Err(VertxError::DeploymentTerminated(i))) if i == deployment.id())
     );
     assert!(consumer.next().await.is_none());
     assert!(consumer.recv().await.unwrap().is_none());
@@ -130,7 +135,7 @@ async fn consumer_stream_supports_non_unpin_messages_and_global_cancel_wins(vx: 
         value: u32,
         _pin: std::marker::PhantomPinned,
     }
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut consumer = bus.consumer::<PinnedMessage>("pinned").unwrap();
     let mut sink = bus.sink::<PinnedMessage>("pinned").unwrap();
     sink.send(PinnedMessage {
@@ -319,22 +324,22 @@ async fn pipe_local_futures_keep_context_and_spans_across_interleaved_awaits() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, a) = capture(&vx).with_subscriber(dispatch.clone()).await;
-    let (_, b) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let a = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let b = capture(&vx).with_subscriber(dispatch.clone()).await;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut tasks = Vec::new();
-    for ctx in [a, b] {
+    for (ctx, execution) in [a, b] {
+        let id = execution.context_id;
         let span = tracing::dispatcher::with_default(
             &dispatch,
-            || tracing::info_span!("local_pipe", owner = %ctx.id()),
+            || tracing::info_span!("local_pipe", owner = %id),
         );
         let gate = barrier.clone();
-        let target = ctx.clone();
+        let target = vx.handle();
         tasks.push(
             async {
                 ctx.spawn(async move {
                     let child = {
-                        let id = target.id();
                         let thread = std::thread::current().id();
                         let local = Rc::new(Cell::new(0));
                         let source_state = local.clone();
@@ -342,7 +347,7 @@ async fn pipe_local_futures_keep_context_and_spans_across_interleaved_awaits() {
                             let (gate, state) = (gate.clone(), source_state.clone());
                             async move {
                                 gate.wait().await;
-                                assert_eq!(Context::current().unwrap().id(), id);
+                                assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
                                 assert_eq!(std::thread::current().id(), thread);
                                 state.set(state.get() + 1);
                                 tracing::info!(probe_context = %id, "local pipe probe");
@@ -355,7 +360,7 @@ async fn pipe_local_futures_keep_context_and_spans_across_interleaved_awaits() {
                         let sink = ProbeSink::new(probe.clone()).with(move |value| {
                             let state = sink_state.clone();
                             async move {
-                                assert_eq!(Context::current().unwrap().id(), id);
+                                assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
                                 state.set(state.get() + 1);
                                 Ok(value)
                             }
@@ -402,12 +407,12 @@ async fn pipe_abort_and_timeout_release_queue_waiters_and_drop_on_context(vx: Ve
     }
     impl Drop for DropContext {
         fn drop(&mut self) {
-            assert_eq!(Context::current().unwrap().id(), self.expected);
+            assert_eq!(ExecutionInfo::current().unwrap().context_id, self.expected);
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let (_, ctx) = capture(&vx).await;
-    let bus = vx.event_bus();
+    let (ctx, execution) = capture(&vx).await;
+    let bus = vx.event_bus().unwrap();
     let mut consumer = bus
         .consumer_with::<u32>(
             "blocked-pipe",
@@ -419,7 +424,7 @@ async fn pipe_abort_and_timeout_release_queue_waiters_and_drop_on_context(vx: Ve
     let mut send = Some(send);
     let dropped = Arc::new(AtomicUsize::new(0));
     let probe = DropContext {
-        expected: ctx.id(),
+        expected: execution.context_id,
         dropped: dropped.clone(),
     };
     let source = futures::stream::iter([Ok(1u32)]).inspect(move |_| {
@@ -459,20 +464,27 @@ async fn pipe_distinguishes_own_shutdown_from_foreign_source_failure(
     vx: Vertx,
 ) {
     use futures::TryStreamExt;
-    let (owner_id, owner) = capture(&vx).await;
-    let (source_id, source_ctx) = if same_scope {
-        (owner_id, owner.clone())
+    let (owner, _) = capture(&vx).await;
+    let source = if same_scope {
+        owner.clone()
     } else {
-        capture(&vx).await
+        capture(&vx).await.0
     };
-    let consumer = source_ctx.event_bus().consumer::<u32>("pipe-stop").unwrap();
+    let bus = vx.event_bus().unwrap();
+    let consumer = source
+        .spawn(async move { bus.consumer::<u32>("pipe-stop") })
+        .unwrap()
+        .await
+        .unwrap();
     let probe = Arc::new(PipeProbe::default());
     probe.ready.store(true, Ordering::SeqCst);
     let calls = Arc::new(AtomicUsize::new(0));
     let hook = calls.clone();
-    owner.set_exception_handler(move |_| {
-        hook.fetch_add(1, Ordering::SeqCst);
-    });
+    owner
+        .set_exception_handler(move |_| {
+            hook.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
     let before = vx.diagnostics();
     let task = owner
         .spawn(vertx_rs::pipe_to(
@@ -481,8 +493,8 @@ async fn pipe_distinguishes_own_shutdown_from_foreign_source_failure(
         ))
         .unwrap();
     owner.spawn(async { Ok(()) }).unwrap().await.unwrap();
-    vx.undeploy(source_id).await.unwrap();
-    assert!(matches!(task.await, Err(VertxError::DeploymentTerminated(id)) if id == source_id));
+    source.stop().await.unwrap();
+    assert!(matches!(task.await, Err(VertxError::DeploymentTerminated(id)) if id == source.id()));
     assert_eq!(calls.load(Ordering::SeqCst), usize::from(!same_scope));
     assert_eq!(*probe.calls.lock().unwrap(), vec!["close"]);
     let after = vx.diagnostics();
@@ -495,7 +507,7 @@ async fn pipe_distinguishes_own_shutdown_from_foreign_source_failure(
 #[tokio::test]
 async fn message_sink_global_close_releases_cached_and_pending_reservations(vx: Vertx) {
     use futures::{Sink, SinkExt};
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let _consumer = bus
         .consumer_with::<()>(
             "closing-sink",

@@ -3,15 +3,15 @@
 use super::{RouteKind, Router};
 use crate::diagnostics::Diagnostics;
 use crate::eventbus::envelope::{ErasedEnvelope, MessageTrace};
+use crate::scope::WorkScope;
 use crate::{ConsumerOptions, EventBus, Headers, VertxError};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio_util::sync::CancellationToken;
 
 #[rstest::fixture]
 fn bus() -> EventBus {
     EventBus::new(
-        CancellationToken::new(),
+        &WorkScope::instance(),
         Diagnostics::new(0, Default::default()),
     )
 }

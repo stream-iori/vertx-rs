@@ -5,23 +5,22 @@ mod support;
 
 use axum::{Router, extract::ConnectInfo, routing::get};
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
-use vertx_rs::{Context, Result, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, Result, Vertx, VertxError};
 
 async fn demo(vx: &Vertx) -> Result<()> {
     let router = Router::new().route(
         "/",
         get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
             assert!(peer.ip().is_loopback());
-            let id = Context::current().unwrap().event_loop_id().unwrap();
+            let id = ExecutionInfo::current().unwrap().event_loop_id.unwrap();
             tokio::task::yield_now().await;
-            assert_eq!(Context::current().unwrap().event_loop_id(), Some(id));
+            assert_eq!(ExecutionInfo::current().unwrap().event_loop_id, Some(id));
             format!("{id:?}")
         }),
     );
-    let (first, ctx0) = support::deploy(vx, support::loopback(), router.clone(), None).await?;
+    let first = vertx_rs_axum::serve_axum(vx, support::loopback(), router.clone()).await?;
     let addr = first.local_addr();
-    let (second, ctx1) = support::deploy(vx, addr, router, None).await?;
-    assert_ne!(ctx0.event_loop_id(), ctx1.event_loop_id());
+    let (second, deployment) = support::deploy(vx, addr, router, None).await?;
     let mut owners = HashSet::new();
     for _ in 0..16 {
         let response = support::request(addr)
@@ -35,6 +34,7 @@ async fn demo(vx: &Vertx) -> Result<()> {
         }
     }
     assert_eq!(owners.len(), 2);
+    assert!(owners.contains(&format!("{:?}", deployment.event_loop_id.unwrap())));
     let grace = Duration::from_secs(1);
     // 先等两个 HTTP 服务排空，再由 main 关闭 Vertx。
     tokio::try_join!(first.shutdown(grace), second.shutdown(grace))?;

@@ -1,9 +1,10 @@
 use super::envelope::{ErasedEnvelope, MessageTrace};
 use super::queue::QueueState;
 use super::route::{Registration, SubscriptionRegistration};
+use crate::context::Context;
 use crate::error::panic_error;
 use crate::task::TracedFuture;
-use crate::{Context, Envelope, Result, TaskHandle, VertxError};
+use crate::{Envelope, Result, TaskHandle, VertxError};
 use futures::stream::FusedStream;
 use futures::{FutureExt, Stream, StreamExt};
 use std::future::Future;
@@ -76,12 +77,12 @@ impl<T: Send + 'static> Consumer<T> {
     /// Dropping the returned handle detaches it; abort and await it to stop this consumer.
     ///
     /// ```
-    /// # use vertx_rs::{Context, Result, Verticle};
+    /// # use vertx_rs::{VertxHandle, Result, Verticle};
     /// # struct Example;
     /// # impl Verticle for Example {
-    /// # async fn start(&mut self, ctx: Context) -> Result<()> {
+    /// # async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
     /// let mut count = 0u64;
-    /// ctx.event_bus().consumer::<()>("count")?.handler(async move |env| {
+    /// ctx.event_bus()?.consumer::<()>("count")?.handler(async move |env| {
     ///     let count = &mut count;
     ///     tokio::task::yield_now().await;
     ///     *count += 1;
@@ -106,11 +107,11 @@ impl<T: Send + 'static> Consumer<T> {
     /// must be `Send`. The returned task handle has the same cancellation behavior.
     ///
     /// ```
-    /// use vertx_rs::{Context, Result, WorkerVerticle};
+    /// use vertx_rs::{VertxHandle, Result, WorkerVerticle};
     /// struct Worker;
     /// impl WorkerVerticle for Worker {
-    ///     async fn start(&mut self, ctx: Context) -> Result<()> {
-    ///         ctx.event_bus().consumer::<u32>("worker")?.handler_worker(|env| async move {
+    ///     async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+    ///         ctx.event_bus()?.consumer::<u32>("worker")?.handler_worker(|env| async move {
     ///             let answer = *env.body() * 2;
     ///             env.reply(answer)
     ///         })?;
@@ -136,7 +137,7 @@ impl<T: Send + 'static> Consumer<T> {
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let ctx = self.handler_context()?;
-        if !ctx.is_worker() {
+        if ctx.event_loop_id().is_some() {
             return Err(VertxError::ContextMismatch);
         }
         ctx.clone().spawn(async move {
@@ -196,7 +197,7 @@ impl<T: Send + 'static> Stream for Consumer<T> {
             let error = this
                 .owner
                 .as_ref()
-                .map(|ctx| VertxError::DeploymentTerminated(ctx.scope().deployment))
+                .map(|ctx| ctx.scope().terminated())
                 .unwrap_or(VertxError::VertxClosed);
             this.terminate();
             return Poll::Ready(Some(Err(error)));
@@ -243,11 +244,11 @@ mod tests {
             .worker_threads(1)
             .build()
             .unwrap();
-        let mut consumer = vx.event_bus().consumer::<()>("eof").unwrap();
+        let mut consumer = vx.event_bus().unwrap().consumer::<()>("eof").unwrap();
         for _ in 0..buffered {
-            vx.event_bus().send("eof", ()).await.unwrap();
+            vx.event_bus().unwrap().send("eof", ()).await.unwrap();
         }
-        let mut other = vx.event_bus().consumer::<()>("eof").unwrap();
+        let mut other = vx.event_bus().unwrap().consumer::<()>("eof").unwrap();
         consumer.rx.close();
         for _ in 0..buffered {
             assert!(consumer.next().await.unwrap().is_ok());
@@ -255,7 +256,7 @@ mod tests {
         assert!(consumer.next().await.is_none());
         assert!(consumer.next().await.is_none());
         assert!(consumer.is_terminated());
-        vx.event_bus().send("eof", ()).await.unwrap();
+        vx.event_bus().unwrap().send("eof", ()).await.unwrap();
         assert!(other.recv().await.unwrap().is_some());
         vx.close().await.unwrap();
     }

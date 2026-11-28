@@ -1,5 +1,5 @@
 //! Pull-based transfers executed by the caller's Future. No tasks or threads
-//! are created here; use Context::spawn_local/spawn to manage the transfer.
+//! are created here; use VertxHandle::spawn_local or VertxHandle::spawn to manage the transfer.
 use crate::{Result, VertxError};
 use futures::{Sink, Stream};
 use std::future::poll_fn;
@@ -29,7 +29,7 @@ impl Default for PipeOptions {
 /// # use vertx_rs::{pipe_to, Result, Vertx};
 /// # async fn example(vx: &Vertx) -> Result<()> {
 /// let source = futures::stream::iter([Ok(1u32), Ok(2)]);
-/// let destination = vx.event_bus().sink::<u32>("numbers")?;
+/// let destination = vx.event_bus()?.sink::<u32>("numbers")?;
 /// // The address must have a live u32 consumer before this future is polled.
 /// pipe_to(source, destination).await?;
 /// # Ok(()) }

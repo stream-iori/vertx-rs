@@ -11,32 +11,36 @@ use futures::{StreamExt, TryStreamExt};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
-use vertx_rs::{Context, DeliveryOptions, RequestOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{
+    DeliveryOptions, ExecutionInfo, RequestOptions, Result, Verticle, Vertx, VertxError,
+    VertxHandle,
+};
 struct Pinger {
     count: Rc<Cell<u64>>,
 }
 impl Verticle for Pinger {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let count = self.count.clone();
         let thread = std::thread::current().id();
-        println!("start {} on {thread:?}", ctx.id());
-        let heartbeat_ctx = ctx.clone();
+        let id = ctx.current_execution().expect("managed start").context_id;
+        println!("start {id} on {thread:?}");
+        let heartbeat_bus = ctx.event_bus()?;
+        let mut timer = ctx.periodic(Duration::ZERO, Duration::from_millis(10))?;
         ctx.spawn_local(async move {
-            let mut timer = heartbeat_ctx.periodic(Duration::ZERO, Duration::from_millis(10))?;
             for tick in 1..=3u32 {
                 timer.tick().await?;
-                heartbeat_ctx.event_bus().publish("heartbeat", tick)?;
+                heartbeat_bus.publish("heartbeat", tick)?;
             }
             timer.cancel();
             assert!(timer.is_cancelled());
             println!("heartbeat timer cancelled after 3 ticks");
             Ok(())
         })?;
-        ctx.event_bus()
+        ctx.event_bus()?
             .consumer::<String>("ping")?
             .handler(async move |env| {
                 assert_eq!(std::thread::current().id(), thread);
-                assert_eq!(Context::current().unwrap().id(), ctx.id());
+                assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
                 if env.body() == "fail" {
                     return env.fail(400, "invalid ping");
                 }
@@ -53,15 +57,15 @@ impl Verticle for Pinger {
                 count.set(count.get() + 1);
                 env.reply_with(
                     format!("pong#{}", count.get()),
-                    DeliveryOptions::new().header("served-by", ctx.id().to_string()),
+                    DeliveryOptions::new().header("served-by", id.to_string()),
                 )
             })?;
         Ok(())
     }
-    async fn stop(&mut self, ctx: Context) -> Result<()> {
+    async fn stop(&mut self, ctx: VertxHandle) -> Result<()> {
         println!(
             "stop {} on {:?}, count={}",
-            ctx.id(),
+            ctx.current_execution().expect("managed stop").context_id,
             std::thread::current().id(),
             self.count.get()
         );
@@ -70,10 +74,10 @@ impl Verticle for Pinger {
 }
 async fn run(vx: &Vertx) -> Result<()> {
     // 先订阅再启动生产者。publish 不等待空位；此处容量足以容纳全部三条。
-    let bus = vx.event_bus();
+    let bus = vx.event_bus()?;
     let monitor = bus.consumer::<u32>("heartbeat")?;
     let audit = bus.consumer::<u32>("heartbeat")?;
-    vx.deploy(|_| Pinger {
+    vx.deploy(|| Pinger {
         count: Rc::new(Cell::new(0)),
     })
     .await?;

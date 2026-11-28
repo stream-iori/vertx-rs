@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DeliveryOptions, RequestOptions, Vertx, VertxError};
+use vertx_rs::{DeliveryOptions, ExecutionInfo, RequestOptions, Vertx, VertxError, VertxHandle};
 
 #[rstest]
 #[tokio::test]
 async fn verticles_communicate_through_their_bound_buses(vx: Vertx) {
     echo(&vx, "upstream").await;
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
-            let bus = ctx.event_bus();
+            let bus = ctx.event_bus().unwrap();
             bus.consumer::<String>("caller")?
                 .handler(async move |env| {
                     let response: String = bus.request("upstream", env.body().clone()).await?;
@@ -28,6 +28,7 @@ async fn verticles_communicate_through_their_bound_buses(vx: Vertx) {
     .unwrap();
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, String>("caller", "hello".to_owned())
             .await
             .unwrap(),
@@ -38,27 +39,41 @@ async fn verticles_communicate_through_their_bound_buses(vx: Vertx) {
 
 #[rstest]
 #[tokio::test]
-async fn bound_consumer_after_undeploy_returns_terminated(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
-    vx.undeploy(id).await.unwrap();
-    assert!(matches!(
-        ctx.event_bus().consumer::<()>("late"),
-        Err(VertxError::DeploymentTerminated(_))
-    ));
+async fn registration_in_stopping_deployment_is_rejected(vx: Vertx) {
+    struct LateConsumer;
+    impl vertx_rs::Verticle for LateConsumer {
+        async fn start(&mut self, _: VertxHandle) -> vertx_rs::Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, vertx: VertxHandle) -> vertx_rs::Result<()> {
+            let deployment = vertx.current_deployment().unwrap();
+            assert!(matches!(
+                vertx.event_bus()?.consumer::<()>("late"),
+                Err(VertxError::DeploymentTerminated(id)) if id == deployment.id()
+            ));
+            Ok(())
+        }
+    }
+    let deployment = vx.deploy(|| LateConsumer).await.unwrap();
+    deployment.stop().await.unwrap();
     vx.close().await.unwrap();
 }
 
 #[rstest]
 #[tokio::test]
 async fn undeploy_removes_only_its_own_subscribers(vx: Vertx) {
-    let (first_id, first) = capture(&vx).await;
-    let (_, second) = capture(&vx).await;
-    let bus = vx.event_bus();
-    let mut removed = first.event_bus().consumer::<u32>("shared").unwrap();
-    let mut retained = second.event_bus().consumer::<u32>("shared").unwrap();
+    let (first, _) = capture(&vx).await;
+    let (second, _) = capture(&vx).await;
+    let bus = vx.event_bus().unwrap();
+    let register = || {
+        let bus = bus.clone();
+        async move { bus.consumer::<u32>("shared") }
+    };
+    let mut removed = first.spawn(register()).unwrap().await.unwrap();
+    let mut retained = second.spawn(register()).unwrap().await.unwrap();
     let mut unbound = bus.consumer::<u32>("shared").unwrap();
 
-    vx.undeploy(first_id).await.unwrap();
+    first.stop().await.unwrap();
 
     // Check the registry before polling or dropping the removed receiver.
     assert_eq!(vx.diagnostics().active_consumers, 2);
@@ -67,7 +82,7 @@ async fn undeploy_removes_only_its_own_subscribers(vx: Vertx) {
     assert_eq!(unbound.recv().await.unwrap().unwrap().into_body(), 42);
     assert!(matches!(
         removed.recv().await,
-        Err(VertxError::DeploymentTerminated(id)) if id == first_id
+        Err(VertxError::DeploymentTerminated(id)) if id == first.id()
     ));
     vx.close().await.unwrap();
 }
@@ -80,11 +95,11 @@ async fn instance_bus_only_binds_to_contexts_in_the_same_instance(vx: Vertx) {
         .worker_threads(1)
         .build()
         .unwrap();
-    let own_bus = vx.event_bus();
-    let other_bus = other.event_bus();
+    let own_bus = vx.event_bus().unwrap();
+    let other_bus = other.event_bus().unwrap();
     let (registered, ready) = oneshot::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |_| async move {
                 let bound = own_bus.consumer::<u32>("owned")?;
                 let unbound = other_bus.consumer::<u32>("foreign")?;
@@ -96,16 +111,20 @@ async fn instance_bus_only_binds_to_contexts_in_the_same_instance(vx: Vertx) {
         .unwrap();
     let (mut bound, mut unbound) = ready.await.unwrap();
 
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert!(matches!(
-        vx.event_bus().try_send("owned", 42u32),
+        vx.event_bus().unwrap().try_send("owned", 42u32),
         Err(VertxError::NoConsumer(_))
     ));
     assert!(matches!(
         bound.recv().await,
-        Err(VertxError::DeploymentTerminated(owner)) if owner == id
+        Err(VertxError::DeploymentTerminated(owner)) if owner == id.id()
     ));
-    other.event_bus().try_send("foreign", 42u32).unwrap();
+    other
+        .event_bus()
+        .unwrap()
+        .try_send("foreign", 42u32)
+        .unwrap();
     assert_eq!(unbound.recv().await.unwrap().unwrap().into_body(), 42);
 
     other.close().await.unwrap();
@@ -115,7 +134,7 @@ async fn instance_bus_only_binds_to_contexts_in_the_same_instance(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn publish_delivers_to_all_subscribers(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut a = bus.consumer::<u32>("pub").unwrap();
     let mut b = bus.consumer::<u32>("pub").unwrap();
     bus.publish("pub", 7u32).unwrap();
@@ -128,7 +147,7 @@ async fn publish_delivers_to_all_subscribers(vx: Vertx) {
 #[tokio::test]
 async fn send_with_no_consumer_errors(vx: Vertx) {
     assert!(matches!(
-        vx.event_bus().send("missing", ()).await,
+        vx.event_bus().unwrap().send("missing", ()).await,
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -137,7 +156,7 @@ async fn send_with_no_consumer_errors(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn request_timeout_fires(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let _consumer = bus.consumer::<()>("timeout").unwrap();
     assert!(matches!(
         bus.request_with::<_, ()>(
@@ -154,10 +173,10 @@ async fn request_timeout_fires(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn dropping_consumer_unregisters(vx: Vertx) {
-    let consumer = vx.event_bus().consumer::<()>("drop").unwrap();
+    let consumer = vx.event_bus().unwrap().consumer::<()>("drop").unwrap();
     drop(consumer);
     assert!(matches!(
-        vx.event_bus().try_send("drop", ()),
+        vx.event_bus().unwrap().try_send("drop", ()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -170,6 +189,7 @@ async fn consumer_handler_dispatches_envelopes(vx: Vertx) {
     for n in 0..10 {
         assert_eq!(
             vx.event_bus()
+                .unwrap()
                 .request::<_, String>("handler", n.to_string())
                 .await
                 .unwrap(),
@@ -183,9 +203,9 @@ async fn consumer_handler_dispatches_envelopes(vx: Vertx) {
 #[tokio::test]
 async fn consumer_handler_unregisters_on_undeploy(vx: Vertx) {
     let id = echo(&vx, "handler").await;
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     assert!(matches!(
-        vx.event_bus().try_send("handler", "x".to_owned()),
+        vx.event_bus().unwrap().try_send("handler", "x".to_owned()),
         Err(VertxError::NoConsumer(_))
     ));
     vx.close().await.unwrap();
@@ -194,15 +214,16 @@ async fn consumer_handler_unregisters_on_undeploy(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn message_passing_between_handlers(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<u32>("double")?
                 .handler(async |env| {
                     let n = *env.body() * 2;
                     env.reply(n)
                 })?;
-            let bus = ctx.event_bus();
+            let bus = ctx.event_bus().unwrap();
             bus.consumer::<u32>("forward")?.handler(async move |env| {
                 let n: u32 = bus.request("double", *env.body()).await?;
                 env.reply(n)
@@ -214,6 +235,7 @@ async fn message_passing_between_handlers(vx: Vertx) {
     .unwrap();
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, u32>("forward", 21u32)
             .await
             .unwrap(),
@@ -225,9 +247,10 @@ async fn message_passing_between_handlers(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn delivery_options_headers_round_trip(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("headers")?
                 .handler(async |env| {
                     assert_eq!(
@@ -243,6 +266,7 @@ async fn delivery_options_headers_round_trip(vx: Vertx) {
     .unwrap();
     let reply = vx
         .event_bus()
+        .unwrap()
         .request_message_with::<_, u32>(
             "headers",
             (),
@@ -258,7 +282,7 @@ async fn delivery_options_headers_round_trip(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn request_timeout_includes_waiting_for_full_queue(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let _consumer = bus.consumer::<u32>("full").unwrap();
     for n in 0..256u32 {
         bus.try_send("full", n).unwrap();
@@ -284,9 +308,10 @@ async fn request_timeout_includes_waiting_for_full_queue(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("business")?
                 .handler(async |env| env.fail(409, "conflict"))?;
             Ok(())
@@ -295,10 +320,13 @@ async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
     .await
     .unwrap();
     assert!(matches!(
-        vx.event_bus().request::<_, ()>("business", ()).await,
+        vx.event_bus()
+            .unwrap()
+            .request::<_, ()>("business", ())
+            .await,
         Err(VertxError::RecipientFailure { code: 409, .. })
     ));
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut consumer = bus.consumer::<()>("late").unwrap();
     let b = bus.clone();
     let job = tokio::spawn(async move {
@@ -318,7 +346,7 @@ async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn type_conflicts_are_rejected_at_registration(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let a = bus.consumer::<u32>("typed").unwrap();
     assert!(matches!(
         bus.consumer::<String>("typed"),
@@ -336,7 +364,7 @@ async fn type_conflicts_are_rejected_at_registration(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn broadcast_drops_only_full_subscriber_and_send_round_robins(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut a = bus.consumer::<u32>("pub").unwrap();
     let mut b = bus.consumer::<u32>("pub").unwrap();
     for n in 0..256u32 {
@@ -358,7 +386,7 @@ async fn broadcast_drops_only_full_subscriber_and_send_round_robins(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn closing_unblocks_senders_waiting_for_capacity(vx: Vertx) {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let _c = bus.consumer::<()>("full").unwrap();
     for _ in 0..256 {
         bus.try_send("full", ()).unwrap();
@@ -381,17 +409,18 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
     let (done, finished) = oneshot::channel();
     let seen = Arc::new(AtomicUsize::new(0));
     let observed = seen.clone();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let mut first = Some((entered, wait));
             let mut done = Some(done);
             let mut history = Vec::<Rc<u8>>::new();
-            let context_id = ctx.id();
+            let context_id = ctx.current_execution().unwrap().context_id;
             let thread = std::thread::current().id();
             ctx.event_bus()
+                .unwrap()
                 .consumer::<u8>("serial-future")?
                 .handler(async move |env| {
-                    assert_eq!(Context::current().unwrap().id(), context_id);
+                    assert_eq!(ExecutionInfo::current().unwrap().context_id, context_id);
                     assert_eq!(std::thread::current().id(), thread);
                     observed.fetch_add(1, Ordering::SeqCst);
                     let history = &mut history;
@@ -400,7 +429,7 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
                         entered.send(()).unwrap();
                         wait.await.unwrap();
                     }
-                    assert_eq!(Context::current().unwrap().id(), context_id);
+                    assert_eq!(ExecutionInfo::current().unwrap().context_id, context_id);
                     assert_eq!(std::thread::current().id(), thread);
                     if *env.body() == 1 {
                         env.reply(**history.last().unwrap())
@@ -415,13 +444,13 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
     })
     .await
     .unwrap();
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let first_bus = bus.clone();
     let first = tokio::spawn(async move { first_bus.request::<_, u8>("serial-future", 1u8).await });
     started.await.unwrap();
     // Enqueue the second message, then run another task on the same EventLoop.
     bus.send("serial-future", 2u8).await.unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     ctx.spawn(async { Ok(()) }).unwrap().await.unwrap();
     assert_eq!(seen.load(Ordering::SeqCst), 1);
     release.send(()).unwrap();
@@ -436,7 +465,7 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
 #[tokio::test]
 async fn invalid_consumer_capacity_is_rejected(#[case] capacity: usize, vx: Vertx) {
     assert!(matches!(
-        vx.event_bus().consumer_with::<()>(
+        vx.event_bus().unwrap().consumer_with::<()>(
             "invalid",
             vertx_rs::ConsumerOptions::new().with_capacity(capacity)
         ),
@@ -456,7 +485,7 @@ async fn consumer_capacity_and_waiting_sender_accounting() {
         })
         .build()
         .unwrap();
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let mut consumer = bus
         .consumer_with::<u32>("small", vertx_rs::ConsumerOptions::new().with_capacity(1))
         .unwrap();
@@ -494,7 +523,7 @@ async fn publish_does_not_clone_for_a_full_consumer(vx: Vertx) {
             Self(self.0.clone())
         }
     }
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let full = bus
         .consumer_with::<CountClone>("copies", vertx_rs::ConsumerOptions::new().with_capacity(1))
         .unwrap();

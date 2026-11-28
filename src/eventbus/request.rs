@@ -26,7 +26,7 @@ type RequestTypes<Req, Resp> = PhantomData<fn(Req, Resp) -> (Req, Resp)>;
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<()> {
 /// let vertx = Vertx::builder().event_loop_threads(1).worker_threads(1).build()?;
-/// let bus = vertx.event_bus();
+/// let bus = vertx.event_bus()?;
 /// let mut consumer = LENGTH.consumer(&bus)?;
 /// let (length, handled) = tokio::join!(LENGTH.request(&bus, String::from("rust")), async {
 ///     let request = consumer.recv().await?.unwrap();

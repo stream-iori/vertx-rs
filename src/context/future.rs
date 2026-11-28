@@ -1,7 +1,7 @@
 use super::{Context, Target};
-use crate::deployment::TaskRegistration;
 use crate::diagnostics::{OperationGuard, TaskRecord, TaskStage};
 use crate::error::{panic_error, panic_error_ref};
+use crate::scope::TaskRegistration;
 use crate::{Result, TaskId, VertxError};
 use futures::FutureExt;
 use std::future::Future;
@@ -13,11 +13,11 @@ use tracing::{Dispatch, Span};
 impl Context {
     pub(super) fn frame(&self, id: TaskId) -> TaskFrame {
         let diagnostics = self.diagnostics();
-        let record = diagnostics.task(id, self.id(), self.scope().deployment, TaskStage::Ready);
+        let record = diagnostics.task(id, self.id(), self.deployment_id(), TaskStage::Ready);
         let span = if diagnostics.options.enabled {
             let span = tracing::info_span!(
                 "context_task", instance_id = diagnostics.instance,
-                deployment_id = %self.scope().deployment, context_id = %self.id(), task_id = %record.id
+                deployment_id = self.deployment_id().as_ref().map(tracing::field::display), context_id = %self.id(), task_id = %record.id
             );
             span.in_scope(|| tracing::debug!(task_id = %record.id, "task submitted"));
             span
@@ -35,14 +35,14 @@ impl Context {
         ContextFuture::new(self.clone(), self.frame(id), future)
     }
 
-    pub(super) fn track_future<F>(
+    pub(super) fn track_future<F, T>(
         self,
         frame: TaskFrame,
         registration: TaskRegistration,
         future: F,
-    ) -> impl Future<Output = Result<()>> + use<F>
+    ) -> impl Future<Output = Result<T>> + use<F, T>
     where
-        F: Future<Output = Result<()>>,
+        F: Future<Output = Result<T>>,
     {
         Tracked {
             future: ContextFuture::new(self.clone(), frame, run_managed(self, future)),
@@ -56,9 +56,9 @@ pub(crate) enum TaskResult<T> {
     Cancelled(VertxError),
 }
 
-async fn run_managed(ctx: Context, future: impl Future<Output = Result<()>>) -> TaskResult<()> {
+async fn run_managed<T>(ctx: Context, future: impl Future<Output = Result<T>>) -> TaskResult<T> {
     if ctx.scope().cancel.is_cancelled() {
-        return TaskResult::Cancelled(VertxError::DeploymentTerminated(ctx.scope().deployment));
+        return TaskResult::Cancelled(ctx.scope().terminated());
     }
     let result = AssertUnwindSafe(future)
         .catch_unwind()
@@ -67,7 +67,7 @@ async fn run_managed(ctx: Context, future: impl Future<Output = Result<()>>) -> 
     if let Err(error) = result {
         if ctx.is_expected_cancellation(&error) {
             let error = if matches!(error, VertxError::VertxClosed) {
-                VertxError::DeploymentTerminated(ctx.scope().deployment)
+                ctx.scope().terminated()
             } else {
                 error
             };
@@ -225,8 +225,8 @@ struct Tracked<F> {
     _registration: TaskRegistration,
 }
 
-impl<F: Future<Output = TaskResult<()>>> Future for Tracked<F> {
-    type Output = Result<()>;
+impl<F: Future<Output = TaskResult<T>>, T> Future for Tracked<F> {
+    type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.get_mut().future).poll(cx)

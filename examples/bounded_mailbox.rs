@@ -5,7 +5,7 @@ mod support;
 use vertx_rs::{ConsumerOptions, Result, Vertx, VertxError};
 
 async fn run(vx: &Vertx) -> Result<()> {
-    let bus = vx.event_bus();
+    let bus = vx.event_bus()?;
     let mut inbox = bus.consumer_with::<u32>("mailbox", ConsumerOptions::new().with_capacity(1))?;
     bus.try_send("mailbox", 1u32)?;
     assert!(matches!(

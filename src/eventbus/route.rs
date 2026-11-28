@@ -1,11 +1,12 @@
 use super::envelope::ErasedEnvelope;
 use super::queue::{QueueSender, QueueState};
-use crate::deployment::ResourceId;
 use crate::diagnostics::Diagnostics;
+use crate::scope::{ResourceId, WorkScope};
 use crate::{ContextId, DeploymentId, Result, VertxError};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::any::TypeId;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -85,7 +86,7 @@ impl SubscriptionRegistration {
 
 pub(super) struct SubscriptionOwner {
     pub context_id: ContextId,
-    pub deployment_id: DeploymentId,
+    pub deployment_id: Option<DeploymentId>,
 }
 
 pub(super) struct Router {
@@ -93,20 +94,22 @@ pub(super) struct Router {
     routes: DashMap<String, Route>,
     admission: RwLock<()>,
     pub(super) closed: CancellationToken,
+    instance_closing: Arc<AtomicBool>,
 }
 
 impl Router {
-    pub(super) fn new(closed: CancellationToken, diagnostics: Arc<Diagnostics>) -> Self {
+    pub(super) fn new(scope: &WorkScope, diagnostics: Arc<Diagnostics>) -> Self {
         Self {
             diagnostics,
             routes: DashMap::new(),
             admission: RwLock::new(()),
-            closed,
+            closed: scope.cancel.clone(),
+            instance_closing: scope.instance_closing_flag(),
         }
     }
 
     pub(super) fn ensure_open(&self) -> Result<()> {
-        if self.closed.is_cancelled() {
+        if self.instance_closing.load(Ordering::Acquire) || self.closed.is_cancelled() {
             Err(VertxError::VertxClosed)
         } else {
             Ok(())
@@ -134,7 +137,7 @@ impl Router {
             address,
             capacity,
             owner.as_ref().map(|owner| owner.context_id),
-            owner.map(|owner| owner.deployment_id),
+            owner.and_then(|owner| owner.deployment_id),
         );
         let (sender, rx) =
             QueueSender::channel(address, capacity, self.closed.clone(), cancel, stats);

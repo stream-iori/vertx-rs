@@ -5,7 +5,7 @@ mod support;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use vertx_rs::{Context, DeploymentOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{DeploymentOptions, Result, Verticle, Vertx, VertxError, VertxHandle};
 
 struct Config {
     fail_at: usize,
@@ -16,8 +16,8 @@ struct Instance {
     stopped: Arc<Mutex<Vec<usize>>>,
 }
 impl Verticle for Instance {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        ctx.event_bus()
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        ctx.event_bus()?
             .consumer::<()>("batch")?
             .handler(async |_| Ok(()))?;
         if self.fail {
@@ -28,7 +28,7 @@ impl Verticle for Instance {
         }
         Ok(())
     }
-    async fn stop(&mut self, _: Context) -> Result<()> {
+    async fn stop(&mut self, _: VertxHandle) -> Result<()> {
         self.stopped.lock().unwrap().push(self.index);
         Ok(())
     }
@@ -39,7 +39,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     let (count, stops) = (created.clone(), stopped.clone());
     let result = vx
         .deploy_with(
-            move |_, config| {
+            move |config| {
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 Instance {
                     index,
@@ -66,7 +66,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     stopped_indices.sort();
     assert_eq!(stopped_indices, [0, 1]);
     assert!(matches!(
-        vx.event_bus().try_send("batch", ()),
+        vx.event_bus()?.try_send("batch", ()),
         Err(VertxError::NoConsumer(_))
     ));
     println!("startup failed as expected; created=2, stopped=[0, 1], routes removed");

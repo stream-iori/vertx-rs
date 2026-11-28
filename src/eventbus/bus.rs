@@ -1,30 +1,22 @@
 use super::route::{RouteKind, Router, SubscriptionOwner};
 use super::{Consumer, ConsumerOptions};
-use crate::deployment::ResourceRegistration;
+use crate::Result;
+use crate::context::Context;
 use crate::diagnostics::Diagnostics;
-use crate::{Context, Result};
+use crate::scope::{ResourceRegistration, WorkScope};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
-/// Local typed address router. Context handles bind registration to a deployment;
-/// Instance handles bind registration to a matching current Context when present.
-/// Send awaits capacity; publish drops on full queues.
+/// Local typed address router. Consumers registered within managed execution
+/// of this instance inherit that scope. Send awaits capacity; publish drops on
+/// full queues.
 #[derive(Clone)]
 pub struct EventBus {
     router: Arc<Router>,
-    bound_context: Option<Context>,
 }
 impl EventBus {
-    pub(crate) fn new(cancel: CancellationToken, diagnostics: Arc<Diagnostics>) -> Self {
+    pub(crate) fn new(scope: &WorkScope, diagnostics: Arc<Diagnostics>) -> Self {
         Self {
-            router: Arc::new(Router::new(cancel, diagnostics)),
-            bound_context: None,
-        }
-    }
-    pub(crate) fn bound(&self, ctx: Context) -> Self {
-        Self {
-            router: self.router.clone(),
-            bound_context: Some(ctx),
+            router: Arc::new(Router::new(scope, diagnostics)),
         }
     }
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -38,8 +30,7 @@ impl EventBus {
     }
     /// Immediately registers with capacity 256. A live address with a different
     /// body type or a typed request protocol returns `TypeMismatch`.
-    /// Registration binds to the bus Context, or to this instance's current
-    /// Context when present. An unbound consumer supports pull receiving.
+    /// Registration uses this instance's current managed scope when present. An unbound consumer supports pull receiving.
     /// Dropping the consumer unregisters it.
     pub fn consumer<T: Send + 'static>(&self, address: &str) -> Result<Consumer<T>> {
         self.consumer_with(address, ConsumerOptions::default())
@@ -63,13 +54,11 @@ impl EventBus {
     ) -> Result<Consumer<T>> {
         options.validate()?;
         self.ensure_open()?;
-        let owner = self.bound_context.clone().or_else(|| {
-            Context::current()
-                .filter(|ctx| Arc::ptr_eq(&ctx.instance_event_bus().router, &self.router))
-        });
+        let owner = Context::current()
+            .filter(|ctx| Arc::ptr_eq(&ctx.instance_event_bus().router, &self.router));
         let cancel = owner
             .as_ref()
-            .map(Context::cancellation_token)
+            .map(|ctx| ctx.scope().cancel.clone())
             .unwrap_or_else(|| self.router.closed.clone())
             .child_token();
         let registration = {

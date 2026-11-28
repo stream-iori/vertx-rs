@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, RequestOptions, Result, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, RequestOptions, Result, Vertx, VertxError, VertxHandle};
 
 #[tokio::test]
 async fn span_creation_can_reenter_deployment_admission() {
@@ -18,7 +18,10 @@ async fn span_creation_can_reenter_deployment_admission() {
         return;
     }
 
-    struct Probe(Arc<AtomicUsize>);
+    struct Probe {
+        reentries: Arc<AtomicUsize>,
+        vertx: VertxHandle,
+    }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Probe {
         fn on_new_span(
             &self,
@@ -27,25 +30,26 @@ async fn span_creation_can_reenter_deployment_admission() {
             _: tracing_subscriber::layer::Context<'_, S>,
         ) {
             if attributes.metadata().name() == "context_task"
-                && let Some(ctx) = Context::current()
+                && self.vertx.current_execution().is_some()
             {
-                assert!(ctx.accepts_work());
-                self.0.fetch_add(1, Ordering::Relaxed);
+                self.vertx.timer(Duration::ZERO).unwrap();
+                self.reentries.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    let reentries = Arc::new(AtomicUsize::new(0));
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry().with(Probe(reentries.clone())),
-    )
-    .unwrap();
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(1)
         .build()
         .unwrap();
-    vx.deploy(|_| local(|ctx| async move { ctx.spawn_local(async { Ok(()) })?.await }))
+    let reentries = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Probe {
+        reentries: reentries.clone(),
+        vertx: vx.handle(),
+    }))
+    .unwrap();
+    vx.deploy(|| local(|ctx| async move { ctx.spawn_local(async { Ok(()) })?.await }))
         .await
         .unwrap();
     assert_eq!(reentries.load(Ordering::Relaxed), 1);
@@ -63,18 +67,18 @@ async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, a) = capture(&vx).with_subscriber(dispatch.clone()).await;
-    let (_, b) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let (a, first) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    let (b, second) = capture(&vx).with_subscriber(dispatch.clone()).await;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let alpha = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("alpha"));
     let beta = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("beta"));
     let gate = barrier.clone();
-    let aid = a.id();
+    let aid = first.context_id;
     let ah = async {
         a.spawn(async move {
             tracing::info!(probe = "alpha", "user probe before wait");
             gate.wait().await;
-            assert_eq!(Context::current().unwrap().id(), aid);
+            assert_eq!(ExecutionInfo::current().unwrap().context_id, aid);
             tracing::info!(probe = "alpha", "user probe after wait");
             Ok(())
         })
@@ -83,12 +87,12 @@ async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
     .with_subscriber(dispatch.clone())
     .await
     .unwrap();
-    let bid = b.id();
+    let bid = second.context_id;
     let bh = async {
         b.spawn(async move {
             tracing::info!(probe = "beta", "user probe before wait");
             barrier.wait().await;
-            assert_eq!(Context::current().unwrap().id(), bid);
+            assert_eq!(ExecutionInfo::current().unwrap().context_id, bid);
             tracing::info!(probe = "beta", "user probe after wait");
             Ok(())
         })
@@ -120,7 +124,7 @@ async fn scoped_tracing_follows_interleaved_contexts_without_span_leaks() {
         }
     }
     assert!(text.contains("task finished after user drop"));
-    assert!(Context::current().is_none());
+    assert!(ExecutionInfo::current().is_none());
 }
 
 #[tokio::test]
@@ -130,13 +134,14 @@ async fn diagnostic_logs_separate_admission_queue_timeout_and_user_hook() {
     let dispatch = output.dispatch();
     async {
         let vx = vx();
-        let mut consumer = vx.event_bus().consumer::<()>("stages").unwrap();
+        let mut consumer = vx.event_bus().unwrap().consumer::<()>("stages").unwrap();
         for _ in 0..256 {
-            vx.event_bus().try_send("stages", ()).unwrap();
+            vx.event_bus().unwrap().try_send("stages", ()).unwrap();
         }
-        vx.event_bus().publish("stages", ()).unwrap();
+        vx.event_bus().unwrap().publish("stages", ()).unwrap();
         let reply: Result<()> = vx
             .event_bus()
+            .unwrap()
             .request_with(
                 "stages",
                 (),
@@ -148,15 +153,16 @@ async fn diagnostic_logs_separate_admission_queue_timeout_and_user_hook() {
         assert_eq!(vx.diagnostics().broadcast_dropped, 1);
         let envelope = consumer.recv().await.unwrap().unwrap();
         drop(envelope);
-        vx.event_bus().send("stages", ()).await.unwrap();
-        let (_, ctx) = capture(&vx).await;
+        vx.event_bus().unwrap().send("stages", ()).await.unwrap();
+        let (ctx, _) = capture(&vx).await;
         let hook = Arc::new(AtomicUsize::new(0));
         let calls = hook.clone();
         ctx.set_exception_handler(move |_| {
             calls.fetch_add(1, Ordering::SeqCst);
-        });
+        })
+        .unwrap();
         assert!(
-            ctx.spawn(async { Err(VertxError::Other("diagnostic-hook-error".into())) })
+            ctx.spawn(async { Err::<(), _>(VertxError::Other("diagnostic-hook-error".into())) })
                 .unwrap()
                 .await
                 .is_err()
@@ -193,20 +199,21 @@ async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx)
     let output = TraceOutput::default();
     let dispatch = output.dispatch();
     let (send, receive) = oneshot::channel();
-    vx.deploy_worker(move |_| {
-        worker(move |ctx| async move {
-            send.send(ctx).ok();
-            Ok(())
+    let ctx = vx
+        .deploy_worker(move || {
+            worker(move |ctx| async move {
+                send.send(ctx.current_execution().unwrap()).ok();
+                Ok(())
+            })
         })
-    })
-    .await
-    .unwrap();
-    let ctx = receive.await.unwrap();
+        .await
+        .unwrap();
+    let execution = receive.await.unwrap();
     let (send, receive) = oneshot::channel();
     let mut send = Some(send);
     let mut first = None;
     let mut delivered = false;
-    let context_id = ctx.id();
+    let context_id = execution.context_id;
     let span = tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("worker_probe"));
     let task = async {
         ctx.spawn(vertx_rs::pipe_to(
@@ -214,7 +221,7 @@ async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx)
                 if delivered {
                     return std::task::Poll::Ready(None);
                 }
-                assert_eq!(Context::current().unwrap().id(), context_id);
+                assert_eq!(ExecutionInfo::current().unwrap().context_id, context_id);
                 let current = std::thread::current().id();
                 tracing::info!(thread_id = ?current, "migration probe");
                 if let Some(first) = first {
@@ -249,17 +256,18 @@ async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx)
     let blocked = Arc::new(Mutex::new(Some(blocked)));
     let mut jobs = Vec::new();
     for _ in 0..2 {
-        let (ctx, barrier, wait, blocked) =
-            (ctx.clone(), barrier.clone(), wait.clone(), blocked.clone());
+        let (vertx, barrier, wait, blocked) =
+            (vx.handle(), barrier.clone(), wait.clone(), blocked.clone());
         jobs.push(tokio::spawn(async move {
-            ctx.execute_blocking_unordered(move || {
-                barrier.wait();
-                if std::thread::current().id() == first {
-                    blocked.lock().unwrap().take().unwrap().send(()).ok();
-                    wait.lock().unwrap().recv().unwrap();
-                }
-            })
-            .await
+            vertx
+                .execute_blocking_unordered(move || {
+                    barrier.wait();
+                    if std::thread::current().id() == first {
+                        blocked.lock().unwrap().take().unwrap().send(()).ok();
+                        wait.lock().unwrap().recv().unwrap();
+                    }
+                })
+                .await
         }));
     }
     blocking.await.unwrap();
@@ -283,7 +291,7 @@ async fn scoped_tracing_follows_worker_migration_and_restores_context(vx: Vertx)
             "{line}"
         );
     }
-    assert!(Context::current().is_none());
+    assert!(ExecutionInfo::current().is_none());
 }
 
 #[rstest]
@@ -295,18 +303,19 @@ async fn handler_destructor_uses_message_dispatch_even_when_consumer_has_another
     struct DropProbe(vertx_rs::ContextId);
     impl Drop for DropProbe {
         fn drop(&mut self) {
-            assert_eq!(Context::current().unwrap().id(), self.0);
+            assert_eq!(ExecutionInfo::current().unwrap().context_id, self.0);
             tracing::info!("message destructor probe");
         }
     }
     let receiver = TraceOutput::default();
     let sender = TraceOutput::default();
     let (send, ready) = oneshot::channel();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let mut send = Some(send);
-            let id = ctx.id();
+            let id = ctx.current_execution().unwrap().context_id;
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("drop-trace")?
                 .handler(async move |_| {
                     let _probe = DropProbe(id);
@@ -321,6 +330,7 @@ async fn handler_destructor_uses_message_dispatch_even_when_consumer_has_another
     .await
     .unwrap();
     vx.event_bus()
+        .unwrap()
         .send("drop-trace", ())
         .with_subscriber(sender.dispatch())
         .await
@@ -338,14 +348,15 @@ async fn message_span_names_receiving_context_separately_from_sender_ancestry(vx
     let output = TraceOutput::default();
     let dispatch = output.dispatch();
     let (send, receive) = oneshot::channel();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
-            let id = ctx.id();
+            let id = ctx.current_execution().unwrap().context_id;
             send.send(id).ok();
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("trace-hop")?
                 .handler(async move |env| {
-                    assert_eq!(Context::current().unwrap().id(), id);
+                    assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
                     tracing::info!("receiver execution probe");
                     env.reply(())
                 })?;
@@ -356,9 +367,9 @@ async fn message_span_names_receiving_context_separately_from_sender_ancestry(vx
     .await
     .unwrap();
     let receiver_id = receive.await.unwrap();
-    let (_, source) = capture(&vx).with_subscriber(dispatch.clone()).await;
-    assert_ne!(source.id(), receiver_id);
-    let bus = source.event_bus();
+    let (source, execution) = capture(&vx).with_subscriber(dispatch.clone()).await;
+    assert_ne!(execution.context_id, receiver_id);
+    let bus = vx.event_bus().unwrap();
     let task = async { source.spawn(async move { bus.request::<_, ()>("trace-hop", ()).await }) }
         .with_subscriber(dispatch)
         .await

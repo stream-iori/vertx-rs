@@ -14,12 +14,12 @@ use tokio::{
     net::TcpStream,
     sync::Semaphore,
 };
-use vertx_rs::{Context, Result, TcpServerOptions, Verticle, Vertx};
+use vertx_rs::{ExecutionInfo, Result, TcpServerOptions, Verticle, Vertx, VertxHandle};
 
 struct Echo;
 impl Verticle for Echo {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        ctx.event_bus()
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        ctx.event_bus()?
             .consumer::<()>("work")?
             .handler(async |message| message.reply("pong".to_owned()))?;
         Ok(())
@@ -29,6 +29,7 @@ impl Verticle for Echo {
 struct RequestState {
     entered: Semaphore,
     finish: Semaphore,
+    vertx: VertxHandle,
 }
 
 async fn graceful() {
@@ -37,13 +38,14 @@ async fn graceful() {
         .worker_threads(1)
         .build()
         .unwrap();
-    vx.deploy(|_| Echo).await.unwrap();
+    vx.deploy(|| Echo).await.unwrap();
     let options = TcpServerOptions {
         max_connections: NonZeroUsize::new(8).unwrap(),
     };
     let request_state = Arc::new(RequestState {
         entered: Semaphore::new(0),
         finish: Semaphore::new(0),
+        vertx: vx.handle(),
     });
     let router = Router::new()
         .route(
@@ -51,15 +53,21 @@ async fn graceful() {
             get(
                 |ConnectInfo(peer): ConnectInfo<SocketAddr>,
                  State(state): State<Arc<RequestState>>| async move {
-                    let before = Context::current().unwrap();
+                    let before = ExecutionInfo::current().unwrap();
                     let thread = std::thread::current().id();
                     state.entered.add_permits(1);
                     state.finish.acquire().await.unwrap().forget();
-                    let response: String = before.event_bus().request("work", ()).await.unwrap();
-                    let after = Context::current().unwrap();
-                    assert_eq!(before.id(), after.id());
+                    let response: String = state
+                        .vertx
+                        .event_bus()
+                        .unwrap()
+                        .request("work", ())
+                        .await
+                        .unwrap();
+                    let after = ExecutionInfo::current().unwrap();
+                    assert_eq!(before.context_id, after.context_id);
                     assert_eq!(std::thread::current().id(), thread);
-                    format!("{response}:{peer}:{:?}", after.event_loop_id().unwrap())
+                    format!("{response}:{peer}:{:?}", after.event_loop_id.unwrap())
                 },
             ),
         )
@@ -78,12 +86,17 @@ async fn graceful() {
 
     let router = Router::new().route(
         "/",
-        get(|| async { format!("{:?}", Context::current().unwrap().event_loop_id().unwrap()) }),
+        get(|| async {
+            format!(
+                "{:?}",
+                ExecutionInfo::current().unwrap().event_loop_id.unwrap()
+            )
+        }),
     );
     let (second, ctx1) = support::deploy(&vx, addr, router, Some(options))
         .await
         .unwrap();
-    assert_ne!(ctx0.event_loop_id(), ctx1.event_loop_id());
+    assert_ne!(ctx0.event_loop_id, ctx1.event_loop_id);
     let grace = Duration::from_secs(2);
     let mut closing = std::pin::pin!(first.shutdown(grace));
     std::future::poll_fn(|cx| {
@@ -96,12 +109,12 @@ async fn graceful() {
     let mut response = String::new();
     client.read_to_string(&mut response).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 200 "));
-    let id = ctx0.event_loop_id().unwrap();
+    let id = ctx0.event_loop_id.unwrap();
     assert!(response.ends_with(&format!("pong:{peer}:{id:?}")));
     closing.await.unwrap();
 
     let response = support::request(addr).await.unwrap();
-    assert_eq!(response, format!("{:?}", ctx1.event_loop_id().unwrap()));
+    assert_eq!(response, format!("{:?}", ctx1.event_loop_id.unwrap()));
     second.shutdown(grace).await.unwrap();
     vx.close().await.unwrap();
 }
@@ -111,4 +124,29 @@ async fn http_drain_keeps_context_and_event_bus_alive() {
     tokio::time::timeout(Duration::from_secs(8), graceful())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn application_can_serve_a_router_without_deploying_a_verticle() {
+    let vertx = Vertx::builder()
+        .event_loop_threads(1)
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let router = Router::new().route(
+        "/",
+        get(|| async {
+            let execution = ExecutionInfo::current().unwrap();
+            assert_eq!(execution.deployment_id, None);
+            "instance service"
+        }),
+    );
+    let server = vertx_rs_axum::serve_axum(&vertx, support::loopback(), router)
+        .await
+        .unwrap();
+    let addr = server.local_addr();
+    assert_eq!(support::request(addr).await.unwrap(), "instance service");
+    vertx.close().await.unwrap();
+    server.wait_closed().await.unwrap();
+    drop(std::net::TcpListener::bind(addr).unwrap());
 }

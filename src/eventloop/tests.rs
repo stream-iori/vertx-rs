@@ -26,7 +26,10 @@ struct OwnerDrop {
 impl Drop for OwnerDrop {
     fn drop(&mut self) {
         assert_eq!(std::thread::current().id(), self.thread);
-        assert!(crate::context::Context::is_on_event_loop_thread());
+        assert!(matches!(
+            crate::context::thread_identity(),
+            Some(crate::context::ThreadIdentity::EventLoop(..))
+        ));
         self.dropped.store(true, Ordering::Release);
     }
 }

@@ -3,8 +3,8 @@
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, oneshot, watch};
-use vertx_rs::{Context, DiagnosticsOptions, Result, Verticle, Vertx};
+use tokio::sync::{Semaphore, watch};
+use vertx_rs::{DiagnosticsOptions, Result, Verticle, Vertx, VertxHandle};
 
 const WARMUPS: usize = 2;
 const SAMPLES: usize = 7;
@@ -13,7 +13,7 @@ const SNAPSHOTS: u32 = 128;
 struct Idle;
 
 impl Verticle for Idle {
-    async fn start(&mut self, _: Context) -> Result<()> {
+    async fn start(&mut self, _: VertxHandle) -> Result<()> {
         Ok(())
     }
 }
@@ -29,20 +29,9 @@ async fn sample(loops: usize, enabled: bool, tasks: usize) -> [Duration; 3] {
         })
         .build()
         .unwrap();
-    let mut contexts = Vec::with_capacity(loops);
     let mut deployments = Vec::with_capacity(loops);
     for _ in 0..loops {
-        let (tx, rx) = oneshot::channel();
-        deployments.push(
-            vertx
-                .deploy(move |ctx| {
-                    let _ = tx.send(ctx);
-                    Idle
-                })
-                .await
-                .unwrap(),
-        );
-        contexts.push(rx.await.unwrap());
+        deployments.push(vertx.deploy(|| Idle).await.unwrap());
     }
 
     let ready = Arc::new(Semaphore::new(0));
@@ -53,7 +42,7 @@ async fn sample(loops: usize, enabled: bool, tasks: usize) -> [Duration; 3] {
         let mut wait = wait.clone();
         let ready = ready.clone();
         handles.push(
-            contexts[index % loops]
+            deployments[index % loops]
                 .spawn(async move {
                     ready.add_permits(1);
                     wait.wait_for(|released| *released).await.unwrap();
@@ -72,7 +61,7 @@ async fn sample(loops: usize, enabled: bool, tasks: usize) -> [Duration; 3] {
     let active = Arc::new(Semaphore::new(0));
     let churn = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut sampling_tasks = Vec::new();
-    for ctx in &contexts {
+    for ctx in &deployments {
         let active = active.clone();
         let churn = churn.clone();
         sampling_tasks.push(
@@ -109,7 +98,7 @@ async fn sample(loops: usize, enabled: bool, tasks: usize) -> [Duration; 3] {
     let cleanup = started.elapsed();
 
     for id in deployments {
-        vertx.undeploy(id).await.unwrap();
+        id.stop().await.unwrap();
     }
     vertx.close().await.unwrap();
     [submit, snapshot, cleanup]

@@ -50,12 +50,19 @@ async fn vertx_periodic_ticks_multiple_times(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn bound_timer_cancels_on_undeploy(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
-    let timer = ctx.timer(Duration::from_secs(99)).unwrap();
-    let mut periodic = ctx
-        .periodic(Duration::ZERO, Duration::from_secs(1))
+    let (deployment, _) = capture(&vx).await;
+    let vertx = vx.handle();
+    let (timer, mut periodic) = deployment
+        .spawn(async move {
+            Ok((
+                vertx.timer(Duration::from_secs(99))?,
+                vertx.periodic(Duration::ZERO, Duration::from_secs(1))?,
+            ))
+        })
+        .unwrap()
+        .await
         .unwrap();
-    vx.undeploy(id).await.unwrap();
+    deployment.stop().await.unwrap();
     assert!(timer.is_cancelled());
     assert!(periodic.is_cancelled());
     assert!(matches!(timer.await, Err(VertxError::TimerCancelled)));
@@ -123,30 +130,29 @@ async fn completed_timer_does_not_become_cancelled_on_close(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn out_of_range_deadlines_leave_the_scope_usable(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
+    let (deployment, _) = capture(&vx).await;
+    let vertx = vx.handle();
+    let check = async move {
+        assert!(matches!(
+            vertx.timer(Duration::MAX),
+            Err(VertxError::InvalidOptions(_))
+        ));
+        for (initial, period) in [
+            (Duration::MAX, Duration::from_secs(1)),
+            (Duration::ZERO, Duration::MAX),
+        ] {
+            assert!(matches!(
+                vertx.periodic(initial, period),
+                Err(VertxError::InvalidOptions(_))
+            ));
+        }
+        vertx.timer(Duration::ZERO)?.await
+    };
     assert!(matches!(
         vx.timer(Duration::MAX),
         Err(VertxError::InvalidOptions(_))
     ));
-    assert!(matches!(
-        ctx.timer(Duration::MAX),
-        Err(VertxError::InvalidOptions(_))
-    ));
-    for (initial, period) in [
-        (Duration::MAX, Duration::from_secs(1)),
-        (Duration::ZERO, Duration::MAX),
-    ] {
-        assert!(matches!(
-            vx.periodic(initial, period),
-            Err(VertxError::InvalidOptions(_))
-        ));
-        assert!(matches!(
-            ctx.periodic(initial, period),
-            Err(VertxError::InvalidOptions(_))
-        ));
-    }
-    assert!(ctx.accepts_work());
-    ctx.timer(Duration::ZERO).unwrap().await.unwrap();
-    vx.undeploy(id).await.unwrap();
+    deployment.spawn(check).unwrap().await.unwrap();
+    deployment.stop().await.unwrap();
     vx.close().await.unwrap();
 }

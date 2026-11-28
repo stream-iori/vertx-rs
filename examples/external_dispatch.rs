@@ -1,52 +1,56 @@
-//! 外部 OS 线程提交任务到已有 Context；逻辑模型不描述提交方线程。
+//! 外部 OS 线程可以派发实例级任务，也可以指定部署。
 //! cargo run --example external_dispatch
 mod support;
 use std::thread::{JoinHandle, ThreadId};
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, ThreadingModel, Verticle, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, Result, Verticle, Vertx, VertxError, VertxHandle};
 
 struct Service {
-    ready: Option<oneshot::Sender<(Context, ThreadId)>>,
+    ready: Option<oneshot::Sender<(ExecutionInfo, ThreadId)>>,
 }
 impl Verticle for Service {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         self.ready
             .take()
             .expect("start called once")
-            .send((ctx, std::thread::current().id()))
+            .send((
+                ctx.current_execution().expect("managed start"),
+                std::thread::current().id(),
+            ))
             .map_err(|_| VertxError::ReplyClosed)
     }
 }
 async fn run(vx: &Vertx, external: &mut Option<JoinHandle<()>>) -> Result<()> {
     let (ready, context) = oneshot::channel();
-    let deployment = vx.deploy(|_| Service { ready: Some(ready) }).await?;
-    let (ctx, owner_thread) = context.await.map_err(|_| VertxError::ReplyClosed)?;
-    let (submitted, task) = oneshot::channel();
-    let target = ctx.clone();
+    let deployment = vx.deploy(|| Service { ready: Some(ready) }).await?;
+    let (execution, owner_thread) = context.await.map_err(|_| VertxError::ReplyClosed)?;
+    let (submitted, tasks) = oneshot::channel();
+    let target = deployment.clone();
+    let instance = vx.handle();
     *external = Some(std::thread::spawn(move || {
-        // 将提交阶段错误送回异步调用方；主线程最后仍会 join 并检查线程 panic。
-        assert!(Context::current().is_none());
-        assert!(!Context::is_on_vertx_thread());
-        assert_eq!(target.threading_model(), ThreadingModel::EventLoop);
-        let id = target.id();
-        let task = target.spawn(async move {
-            assert_eq!(Context::current().unwrap().id(), id);
-            assert_eq!(std::thread::current().id(), owner_thread);
-            assert!(Context::is_on_event_loop_thread());
-            println!("external submission ran on {owner_thread:?} in {id}");
-            Ok(())
+        assert!(instance.current_execution().is_none());
+        let instance_task = instance.spawn(async {
+            let current = ExecutionInfo::current().expect("managed task");
+            assert_eq!(current.deployment_id, None);
+            Ok(current.context_id)
         });
-        let _ = submitted.send(task);
+        let deployment_task = target.spawn(async move {
+            let current = ExecutionInfo::current().expect("managed task");
+            assert_eq!(current, execution);
+            assert_eq!(std::thread::current().id(), owner_thread);
+            Ok(current.context_id)
+        });
+        let _ = submitted.send((instance_task, deployment_task));
     }));
-    let task = task.await.map_err(|_| VertxError::ReplyClosed)??;
-    task.await?;
-    assert!(Context::current().is_none());
-    vx.undeploy(deployment).await?;
+    let (instance_task, deployment_task) = tasks.await.map_err(|_| VertxError::ReplyClosed)?;
+    let (instance_id, deployment_context_id) = tokio::try_join!(instance_task?, deployment_task?)?;
+    assert_ne!(instance_id, deployment_context_id);
+    println!("instance context {instance_id}, deployment context {deployment_context_id}");
+    deployment.stop().await?;
     assert!(matches!(
-        ctx.spawn(async { Ok(()) }),
+        deployment.spawn(async { Ok(()) }),
         Err(VertxError::DeploymentTerminated(_))
     ));
-    println!("submission after undeploy: DeploymentTerminated");
     Ok(())
 }
 fn main() -> Result<()> {

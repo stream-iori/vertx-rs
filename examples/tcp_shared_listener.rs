@@ -8,7 +8,9 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, EventLoopId, Result, TaskHandle, Verticle, Vertx, VertxError};
+use vertx_rs::{
+    EventLoopId, ExecutionInfo, Result, TaskHandle, Verticle, Vertx, VertxError, VertxHandle,
+};
 
 struct Echo {
     addr: SocketAddr,
@@ -16,7 +18,7 @@ struct Echo {
     served: Option<oneshot::Sender<EventLoopId>>,
 }
 impl Verticle for Echo {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let mut incoming = ctx.listen_tcp(self.addr).await?;
         let addr = incoming.local_addr();
         let served = self.served.take().expect("start called once");
@@ -26,7 +28,7 @@ impl Verticle for Echo {
             let mut byte = [0];
             socket.read_exact(&mut byte).await.map_err(io_error)?;
             socket.write_all(&byte).await.map_err(io_error)?;
-            let event_loop = Context::current().unwrap().event_loop_id().unwrap();
+            let event_loop = ExecutionInfo::current().unwrap().event_loop_id.unwrap();
             println!("{addr} accepted {peer} on {event_loop:?}");
             served.send(event_loop).map_err(|_| VertxError::ReplyClosed)
         })?;
@@ -44,7 +46,7 @@ async fn run(vx: &Vertx) -> Result<()> {
     for _ in 0..2 {
         let (ready, bound) = oneshot::channel();
         let (served, event_loop) = oneshot::channel();
-        vx.deploy(move |_| Echo {
+        vx.deploy(move || Echo {
             addr,
             ready: Some(ready),
             served: Some(served),

@@ -1,6 +1,6 @@
 use super::{BoundListener, ListenerRegistration, Member, OpenListener, Slot, TcpListeners};
-use crate::deployment::{DeploymentScope, ResourceId, ResourceRegistration};
-use crate::{Context, DeploymentId, Result};
+use crate::scope::{ResourceId, ResourceRegistration, WorkScope};
+use crate::{DeploymentId, Result, VertxHandle};
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io::{Read, Write};
@@ -14,7 +14,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -81,7 +80,7 @@ fn accepted_socket_uses_the_accepting_runtime_after_the_binding_runtime_exits() 
 #[tokio::test]
 async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_listener() {
     let registry = TcpListeners::default();
-    let scope = DeploymentScope::new(DeploymentId::next(), CancellationToken::new());
+    let scope = WorkScope::instance().deployment(DeploymentId::next());
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     let bound = Arc::new(BoundListener {
@@ -95,7 +94,7 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
         registry: Arc::downgrade(&registry.state),
         addr,
         id,
-        deployment: scope.deployment,
+        owner: scope.owner,
     };
     scope
         .admit()
@@ -106,7 +105,7 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
         Slot::Open(OpenListener {
             bound: bound.clone(),
             members: HashMap::from([(
-                scope.deployment,
+                scope.owner,
                 Member {
                     id,
                     tracked: scope.task_token(),
@@ -143,7 +142,7 @@ async fn unregistration_reserves_address_and_tracks_close_until_poll_releases_li
 async fn stale_registration_from_same_deployment_does_not_close_the_new_listener() {
     struct Rebind;
     impl crate::Verticle for Rebind {
-        async fn start(&mut self, ctx: Context) -> Result<()> {
+        async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
             let old = ctx.listen_tcp("127.0.0.1:0".parse().unwrap()).await?;
             let addr = old.local_addr();
             let registration = old.registration.clone();
@@ -162,6 +161,6 @@ async fn stale_registration_from_same_deployment_does_not_close_the_new_listener
         .worker_threads(1)
         .build()
         .unwrap();
-    vertx.deploy(|_| Rebind).await.unwrap();
+    vertx.deploy(|| Rebind).await.unwrap();
     vertx.close().await.unwrap();
 }

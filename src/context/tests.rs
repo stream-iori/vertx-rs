@@ -4,7 +4,6 @@ use crate::{DeploymentId, EventLoopId, Result, TaskId, Vertx, VertxError};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use tokio_util::sync::CancellationToken;
 
 #[rstest::rstest]
 #[case::normal_return(false)]
@@ -35,7 +34,7 @@ async fn context_restored_when_send_future_moves_between_os_threads() {
         .unwrap();
     let scope = Arc::new(DeploymentScope::new(
         DeploymentId::next(),
-        vx.inner.lifetime.cancel.child_token(),
+        &vx.inner.lifetime.scope,
     ));
     let ctx = Context::new_worker(&vx.inner, scope);
     let id = ctx.deployment_id();
@@ -89,7 +88,7 @@ async fn guard_restores_nested_context_and_panic(#[case] panic: bool) {
             &vx.inner,
             Arc::new(DeploymentScope::new(
                 DeploymentId::next(),
-                CancellationToken::new(),
+                &vx.inner.lifetime.scope,
             )),
         )
     };
@@ -122,7 +121,10 @@ async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] wor
     impl Drop for PanicDrop {
         fn drop(&mut self) {
             assert_eq!(Context::current().unwrap().id(), self.context);
-            assert_eq!(Context::is_on_worker_thread(), self.worker);
+            assert_eq!(
+                matches!(thread_identity(), Some(ThreadIdentity::Worker(_))),
+                self.worker
+            );
             panic!("injected user destructor panic");
         }
     }
@@ -133,12 +135,12 @@ async fn user_destructor_panic_releases_an_unpoisoned_execution_gate(#[case] wor
         .unwrap();
     let scope = Arc::new(DeploymentScope::new(
         DeploymentId::next(),
-        vx.inner.lifetime.cancel.child_token(),
+        &vx.inner.lifetime.scope,
     ));
     let ctx = if worker {
         Context::new_worker(&vx.inner, scope)
     } else {
-        Context::new_event_loop(EventLoopId(0), &vx.inner, scope)
+        Context::new_event_loop(EventLoopId(0), &vx.inner, Some(scope))
     };
     let (ready, started) = tokio::sync::oneshot::channel();
     let probe = PanicDrop {
@@ -188,7 +190,7 @@ async fn registration_and_stop_share_one_admission_transaction() {
     for _ in 0..50 {
         let scope = Arc::new(DeploymentScope::new(
             DeploymentId::next(),
-            vx.inner.lifetime.cancel.child_token(),
+            &vx.inner.lifetime.scope,
         ));
         let ctx = Context::new_worker(&vx.inner, scope.clone());
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -196,7 +198,8 @@ async fn registration_and_stop_share_one_admission_transaction() {
         let b = barrier.clone();
         let register = std::thread::spawn(move || {
             b.wait();
-            c.event_bus().consumer::<()>("race")
+            let _entered = c.enter();
+            c.instance_event_bus().consumer::<()>("race")
         });
         let c = ctx.clone();
         let b = barrier.clone();
@@ -209,7 +212,7 @@ async fn registration_and_stop_share_one_admission_transaction() {
         stop.join().unwrap();
         // Check the route while a successful registration still owns its receiver.
         assert!(matches!(
-            vx.event_bus().try_send("race", ()),
+            vx.event_bus().unwrap().try_send("race", ()),
             Err(crate::VertxError::NoConsumer(_))
         ));
         match result {
@@ -233,9 +236,9 @@ async fn rejected_dispatch_releases_its_task_registration() {
         .unwrap();
     let scope = Arc::new(DeploymentScope::new(
         DeploymentId::next(),
-        vx.inner.lifetime.cancel.child_token(),
+        &vx.inner.lifetime.scope,
     ));
-    let ctx = Context::new_event_loop(EventLoopId(0), &vx.inner, scope.clone());
+    let ctx = Context::new_event_loop(EventLoopId(0), &vx.inner, Some(scope.clone()));
     let (completion, mut joined) = tokio::sync::watch::channel(None);
     vx.inner
         .executors
@@ -247,8 +250,8 @@ async fn rejected_dispatch_releases_its_task_registration() {
         ctx.spawn(async { Ok(()) }),
         Err(VertxError::VertxClosed)
     ));
-    scope.request_stop();
-    let drain = scope.drain_tasks(std::time::Duration::from_secs(1));
+    scope.work.request_stop();
+    let drain = scope.work.drain_tasks(std::time::Duration::from_secs(1));
     tokio::pin!(drain);
     assert!(
         futures::poll!(&mut drain).is_ready(),

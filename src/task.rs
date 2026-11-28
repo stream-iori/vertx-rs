@@ -37,7 +37,7 @@ impl TaskControl for tokio::task::AbortHandle {
 }
 /// Awaiting yields one `Result<T>` after user state destruction.
 /// Dropping the handle detaches the waiter; it does not cancel the task.
-/// Use [`Self::abort`] or undeploy the owning deployment to request cancellation.
+/// Use [`Self::abort`] or stop the owning deployment to request cancellation.
 pub struct TaskHandle<T> {
     id: TaskId,
     backend: TaskBackend<T>,

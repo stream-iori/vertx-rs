@@ -1,4 +1,4 @@
-//! Logical Context isolation, physical thread affinity and managed dispatch.
+//! Logical context isolation, physical thread affinity and managed dispatch.
 
 use super::support::{capture, local, vx, worker};
 use rstest::rstest;
@@ -7,22 +7,24 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, ThreadingModel, Verticle, Vertx, VertxError};
+use vertx_rs::{
+    ExecutionInfo, ExecutorThread, Result, ThreadingModel, Verticle, Vertx, VertxError, VertxHandle,
+};
 
 #[rstest]
 #[tokio::test]
 async fn raw_tokio_task_can_dispatch_to_its_own_event_loop(vx: Vertx) {
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, execution) = capture(&vx).await;
     let target = ctx.clone();
     ctx.spawn(async move {
         let thread = std::thread::current().id();
-        let id = target.id();
+        let id = execution.context_id;
         tokio::spawn(async move {
-            assert!(Context::current().is_none());
+            assert!(ExecutionInfo::current().is_none());
             assert_eq!(std::thread::current().id(), thread);
             target
                 .spawn(async move {
-                    assert_eq!(Context::current().unwrap().id(), id);
+                    assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
                     assert_eq!(std::thread::current().id(), thread);
                     Ok(())
                 })?
@@ -50,30 +52,31 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
                 .lock()
                 .unwrap()
                 .push(std::thread::current().id());
-            assert!(Context::current().is_some());
+            assert!(ExecutionInfo::current().is_some());
         }
     }
     impl Verticle for Affinity {
-        async fn start(&mut self, ctx: Context) -> Result<()> {
+        async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
             self.samples
                 .lock()
                 .unwrap()
                 .push(std::thread::current().id());
+            let vertx = ctx.clone();
             let (samples, count) = (self.samples.clone(), self.non_send.clone());
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("affinity")?
                 .handler(async move |env| {
                     samples.lock().unwrap().push(std::thread::current().id());
                     tokio::task::yield_now().await;
-                    let ctx = Context::current().unwrap();
-                    ctx.execute_blocking(|| 42).await?;
+                    vertx.execute_blocking(|| 42).await?;
                     samples.lock().unwrap().push(std::thread::current().id());
                     count.set(count.get() + 1);
                     env.reply(count.get())
                 })?;
             Ok(())
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             tokio::task::yield_now().await;
             self.samples
                 .lock()
@@ -85,7 +88,7 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
     let samples = Arc::new(Mutex::new(Vec::new()));
     let s = samples.clone();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             s.lock().unwrap().push(std::thread::current().id());
             Affinity {
                 samples: s,
@@ -97,13 +100,14 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
     for i in 1..=20 {
         assert_eq!(
             vx.event_bus()
+                .unwrap()
                 .request::<_, u64>("affinity", ())
                 .await
                 .unwrap(),
             i
         );
     }
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     {
         let s = samples.lock().unwrap();
         assert!(s.len() >= 44);
@@ -115,10 +119,11 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn verticle_can_hold_non_send_state_directly(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             let count = Cell::new(0u64);
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("inc")?
                 .handler(async move |env| {
                     count.set(count.get() + 1);
@@ -132,7 +137,11 @@ async fn verticle_can_hold_non_send_state_directly(vx: Vertx) {
     .unwrap();
     for n in 1..=3 {
         assert_eq!(
-            vx.event_bus().request::<_, u64>("inc", ()).await.unwrap(),
+            vx.event_bus()
+                .unwrap()
+                .request::<_, u64>("inc", ())
+                .await
+                .unwrap(),
             n
         );
     }
@@ -141,32 +150,38 @@ async fn verticle_can_hold_non_send_state_directly(vx: Vertx) {
 
 #[tokio::test]
 async fn context_current_is_none_outside_vertx() {
-    assert!(Context::current().is_none());
-    assert!(!Context::is_on_vertx_thread());
+    assert!(ExecutionInfo::current().is_none());
 }
 
 #[rstest]
 #[tokio::test]
 async fn context_introspection_event_loop_full(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
-    assert_eq!(ctx.threading_model(), ThreadingModel::EventLoop);
-    assert_eq!(ctx.deployment_id(), id);
-    assert!(ctx.vertx().is_some());
-    assert!(ctx.event_loop_id().is_some());
+    let (deployment, info) = capture(&vx).await;
+    assert_eq!(info.threading_model, ThreadingModel::EventLoop);
+    assert_eq!(info.deployment_id, Some(deployment.id()));
+    assert_eq!(
+        info.thread,
+        ExecutorThread::EventLoop(info.event_loop_id.unwrap())
+    );
+    assert!(vx.current_execution().is_none());
     vx.close().await.unwrap();
 }
 
 #[rstest]
 #[tokio::test]
 async fn context_introspection_worker_full(vx: Vertx) {
-    vx.deploy_worker(|_| {
+    vx.deploy_worker(|| {
         worker(|ctx| async move {
-            assert_eq!(ctx.threading_model(), ThreadingModel::Worker);
-            assert!(ctx.event_loop_id().is_none());
-            assert!(Context::is_on_worker_thread());
-            let id = ctx.deployment_id();
+            let current = ctx.current_execution().unwrap();
+            assert_eq!(current.threading_model, ThreadingModel::Worker);
+            assert!(current.event_loop_id.is_none());
+            assert!(matches!(
+                ExecutionInfo::current().map(|info| info.thread),
+                Some(ExecutorThread::Worker)
+            ));
+            let id = ctx.current_execution().unwrap().deployment_id;
             tokio::task::yield_now().await;
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             Ok(())
         })
     })
@@ -178,13 +193,17 @@ async fn context_introspection_worker_full(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn external_thread_can_spawn_on_an_existing_event_loop(vx: Vertx) {
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let (tx, rx) = oneshot::channel();
-    let id = ctx.deployment_id();
+    let id = Some(ctx.id());
     std::thread::spawn(move || {
         ctx.spawn(async move {
-            assert!(Context::is_on_event_loop_thread());
-            tx.send(Context::current().unwrap().deployment_id()).ok();
+            assert!(matches!(
+                ExecutionInfo::current().map(|info| info.thread),
+                Some(ExecutorThread::EventLoop(_))
+            ));
+            tx.send(ExecutionInfo::current().unwrap().deployment_id)
+                .ok();
             Ok(())
         })
         .unwrap()
@@ -198,8 +217,8 @@ async fn external_thread_can_spawn_on_an_existing_event_loop(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn spawn_after_undeploy_returns_terminated(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
-    vx.undeploy(id).await.unwrap();
+    let (ctx, _) = capture(&vx).await;
+    ctx.stop().await.unwrap();
     assert!(matches!(
         ctx.spawn(async { Ok(()) }),
         Err(VertxError::DeploymentTerminated(_))
@@ -215,15 +234,16 @@ async fn two_contexts_on_one_event_loop_never_leak_identity() {
         .build()
         .unwrap();
     for address in ["a", "b"] {
-        vx.deploy(move |_| {
+        vx.deploy(move || {
             local(move |ctx| async move {
-                let id = ctx.deployment_id();
+                let id = ctx.current_deployment().unwrap().id();
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>(address)?
                     .handler(async move |env| {
                         for _ in 0..100 {
                             tokio::task::yield_now().await;
-                            assert_eq!(Context::current().unwrap().deployment_id(), id);
+                            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, Some(id));
                         }
                         env.reply(id)
                     })?;
@@ -233,7 +253,7 @@ async fn two_contexts_on_one_event_loop_never_leak_identity() {
         .await
         .unwrap();
     }
-    let bus = vx.event_bus();
+    let bus = vx.event_bus().unwrap();
     let (a, b) = tokio::join!(
         bus.request::<_, vertx_rs::DeploymentId>("a", ()),
         bus.request::<_, vertx_rs::DeploymentId>("b", ())
@@ -245,15 +265,16 @@ async fn two_contexts_on_one_event_loop_never_leak_identity() {
 #[rstest]
 #[tokio::test]
 async fn raw_tokio_spawn_has_no_logical_context(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
-            let own = ctx.deployment_id();
-            tokio::spawn(async {
-                assert!(Context::current().is_none());
-                assert!(Context::is_on_event_loop_thread());
+            let own = ctx.current_execution().unwrap().deployment_id;
+            let thread = std::thread::current().id();
+            tokio::spawn(async move {
+                assert!(ExecutionInfo::current().is_none());
+                assert_eq!(std::thread::current().id(), thread);
             })
             .await?;
-            assert_eq!(Context::current().unwrap().deployment_id(), own);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, own);
             Ok(())
         })
     })
@@ -263,43 +284,43 @@ async fn raw_tokio_spawn_has_no_logical_context(vx: Vertx) {
 }
 
 #[tokio::test]
-async fn spawn_local_rejects_other_context_even_on_same_thread() {
+async fn local_spawn_and_consumer_binding_on_one_event_loop() {
     let vx = Vertx::builder()
         .event_loop_threads(1)
         .worker_threads(2)
         .build()
         .unwrap();
-    let (_, a) = capture(&vx).await;
-    let (tx, rx) = oneshot::channel();
-    let other = a.clone();
-    vx.deploy(move |_| {
+    let (first, _) = capture(&vx).await;
+    let bus = vx.event_bus().unwrap();
+    let consumer = first
+        .spawn(async move { bus.consumer::<()>("first") })
+        .unwrap()
+        .await
+        .unwrap();
+    vx.deploy(move || {
         local(move |ctx| async move {
             assert!(matches!(
-                other.spawn_local(async { Ok(()) }),
+                consumer.handler(async |_| Ok(())),
                 Err(VertxError::ContextMismatch)
             ));
-            assert!(matches!(
-                other
-                    .event_bus()
-                    .consumer::<()>("wrong")?
-                    .handler(async |_| { Ok(()) }),
-                Err(VertxError::ContextMismatch)
-            ));
-            let id = ctx.deployment_id();
-            ctx.spawn_local(async move {
-                tokio::task::yield_now().await;
-                assert_eq!(Context::current().unwrap().deployment_id(), id);
-                tx.send(()).ok();
-                Ok(())
-            })?;
+            let current = ctx.current_execution().unwrap();
+            let state = Rc::new(Cell::new(0));
+            let result = ctx
+                .spawn_local(async move {
+                    tokio::task::yield_now().await;
+                    assert_eq!(ExecutionInfo::current(), Some(current));
+                    state.set(42);
+                    Ok(state)
+                })?
+                .await?;
+            assert_eq!(result.get(), 42);
             Ok(())
         })
     })
     .await
     .unwrap();
-    rx.await.unwrap();
     assert!(matches!(
-        a.spawn_local(async { Ok(()) }),
+        vx.spawn_local(async { Ok(()) }),
         Err(VertxError::ContextMismatch)
     ));
     vx.close().await.unwrap();
@@ -309,8 +330,8 @@ async fn spawn_local_rejects_other_context_even_on_same_thread() {
 async fn spawn_local_rejects_another_vertx_instance() {
     let a = vx();
     let b = vx();
-    let (_, ctx) = capture(&a).await;
-    b.deploy(move |_| {
+    let ctx = a.handle();
+    b.deploy(move || {
         local(move |_| async move {
             assert!(matches!(
                 ctx.spawn_local(async { Ok(()) }),
@@ -332,29 +353,29 @@ async fn same_eventloop_send_spawn_switches_context_without_running_inline() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, first) = capture(&vx).await;
-    let (_, second) = capture(&vx).await;
-    let first_id = first.deployment_id();
-    let second_id = second.deployment_id();
+    let (first, _) = capture(&vx).await;
+    let (second, _) = capture(&vx).await;
+    let first_id = Some(first.id());
+    let second_id = Some(second.id());
     let ran = Arc::new(AtomicUsize::new(0));
     let observed = ran.clone();
     first
         .spawn(async move {
             let thread = std::thread::current().id();
-            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, first_id);
             let task = second.spawn(async move {
                 assert_eq!(std::thread::current().id(), thread);
-                assert_eq!(Context::current().unwrap().deployment_id(), second_id);
+                assert_eq!(ExecutionInfo::current().unwrap().deployment_id, second_id);
                 ran.fetch_add(1, Ordering::SeqCst);
                 tokio::task::yield_now().await;
-                assert_eq!(Context::current().unwrap().deployment_id(), second_id);
+                assert_eq!(ExecutionInfo::current().unwrap().deployment_id, second_id);
                 Ok(())
             })?;
             assert_eq!(observed.load(Ordering::SeqCst), 0);
-            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, first_id);
             task.await?;
             assert_eq!(observed.load(Ordering::SeqCst), 1);
-            assert_eq!(Context::current().unwrap().deployment_id(), first_id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, first_id);
             Ok(())
         })
         .unwrap()
@@ -371,8 +392,14 @@ async fn queued_cross_thread_abort_preserves_target_context_during_destruction()
     }
     impl Drop for DropCheck {
         fn drop(&mut self) {
-            assert!(Context::is_on_event_loop_thread());
-            assert_eq!(Context::current().unwrap().deployment_id(), self.id);
+            assert!(matches!(
+                ExecutionInfo::current().map(|info| info.thread),
+                Some(ExecutorThread::EventLoop(_))
+            ));
+            assert_eq!(
+                ExecutionInfo::current().unwrap().deployment_id,
+                Some(self.id)
+            );
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -381,7 +408,7 @@ async fn queued_cross_thread_abort_preserves_target_context_during_destruction()
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     let blocker = ctx
@@ -394,7 +421,7 @@ async fn queued_cross_thread_abort_preserves_target_context_during_destruction()
     started.await.unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));
     let guard = DropCheck {
-        id: ctx.deployment_id(),
+        id: ctx.id(),
         dropped: dropped.clone(),
     };
     let task = ctx
@@ -414,6 +441,6 @@ async fn queued_cross_thread_abort_preserves_target_context_during_destruction()
     assert!(abort.is_finished());
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     blocker.await.unwrap();
-    assert!(Context::current().is_none());
+    assert!(ExecutionInfo::current().is_none());
     vx.close().await.unwrap();
 }

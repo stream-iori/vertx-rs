@@ -42,7 +42,7 @@ fn builder_rejects_invalid_options(
 #[tokio::test]
 async fn deployment_options_default_to_one_instance(vx: Vertx) {
     let ids = vx
-        .deploy_with(|_, _| local(|_| async { Ok(()) }), DeploymentOptions::new())
+        .deploy_with(|_| local(|_| async { Ok(()) }), DeploymentOptions::new())
         .await
         .unwrap();
     assert_eq!(ids.len(), 1);

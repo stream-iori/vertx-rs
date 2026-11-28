@@ -1,22 +1,26 @@
 //! Native Worker scheduling, parallelism, migration and destructor ownership.
 
-use super::support::{WorkerDropProbe, capture, capture_worker, vx, worker};
+use super::support::{WorkerDropProbe, capture_worker, vx, worker};
 use rstest::rstest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, ExecutorThread, Result, Vertx, VertxError};
 
 #[rstest]
 #[tokio::test]
 async fn worker_verticle_processes_messages(vx: Vertx) {
-    vx.deploy_worker(|_| {
+    vx.deploy_worker(|| {
         worker(|ctx| async move {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<u64>("worker")?
                 .handler_worker(|env| async move {
-                    assert!(Context::is_on_worker_thread());
+                    assert!(matches!(
+                        ExecutionInfo::current().map(|info| info.thread),
+                        Some(ExecutorThread::Worker)
+                    ));
                     let n = *env.body() * 2;
                     env.reply(n)
                 })?;
@@ -27,6 +31,7 @@ async fn worker_verticle_processes_messages(vx: Vertx) {
     .unwrap();
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, u64>("worker", 21u64)
             .await
             .unwrap(),
@@ -46,9 +51,9 @@ async fn worker_context_serializes_all_ordinary_executions() {
     let maximum = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = oneshot::channel();
     let (a, m) = (active.clone(), maximum.clone());
-    vx.deploy_worker(move |_| {
+    vx.deploy_worker(move || {
         worker(move |ctx| async move {
-            let id = ctx.deployment_id();
+            let id = ctx.current_execution().unwrap().deployment_id;
             let mut handles = Vec::new();
             for _ in 0..32 {
                 let (a, m) = (a.clone(), m.clone());
@@ -56,7 +61,7 @@ async fn worker_context_serializes_all_ordinary_executions() {
                     for _ in 0..5 {
                         let n = a.fetch_add(1, Ordering::SeqCst) + 1;
                         m.fetch_max(n, Ordering::SeqCst);
-                        assert_eq!(Context::current().unwrap().deployment_id(), id);
+                        assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
                         std::thread::sleep(Duration::from_micros(100));
                         a.fetch_sub(1, Ordering::SeqCst);
                         tokio::task::yield_now().await;
@@ -97,7 +102,7 @@ async fn worker_contexts_can_execute_in_parallel() {
         let v = vx.clone();
         let b = barrier.clone();
         jobs.push(tokio::spawn(async move {
-            v.deploy_worker(move |_| {
+            v.deploy_worker(move || {
                 worker(move |_| async move {
                     b.wait();
                     Ok(())
@@ -123,20 +128,20 @@ async fn single_worker_reuses_thread_while_future_waits_and_can_await_blocking()
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = oneshot::channel();
-    let id = ctx.deployment_id();
+    let id = Some(ctx.id());
     let first = ctx
         .spawn(async move {
             entered.send(std::thread::current().id()).ok();
             wait.await.unwrap();
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             Ok(())
         })
         .unwrap();
     let thread = started.await.unwrap();
-    let c = ctx.clone();
+    let c = vx.handle();
     let second = ctx
         .spawn(async move {
             assert_eq!(std::thread::current().id(), thread);
@@ -147,13 +152,16 @@ async fn single_worker_reuses_thread_while_future_waits_and_can_await_blocking()
             let result = c
                 .execute_blocking(move || {
                     assert_eq!(std::thread::current().id(), thread);
-                    assert!(Context::is_on_worker_thread());
-                    assert_eq!(Context::current().unwrap().deployment_id(), id);
+                    assert!(matches!(
+                        ExecutionInfo::current().map(|info| info.thread),
+                        Some(ExecutorThread::Worker)
+                    ));
+                    assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
                     42
                 })
                 .await?;
             assert_eq!(result, 42);
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             release.send(()).ok();
             Ok(())
         })
@@ -182,7 +190,7 @@ async fn worker_and_blocking_use_exactly_the_same_fixed_thread_set() {
     for _ in 0..2 {
         let (v, threads, barrier) = (vx.clone(), threads.clone(), barrier.clone());
         deployments.push(tokio::spawn(async move {
-            v.deploy_worker(move |_| {
+            v.deploy_worker(move || {
                 worker(move |_| async move {
                     threads.lock().unwrap().insert(std::thread::current().id());
                     barrier.wait();
@@ -195,12 +203,11 @@ async fn worker_and_blocking_use_exactly_the_same_fixed_thread_set() {
     for deployment in deployments {
         deployment.await.unwrap().unwrap();
     }
-    let (_, ctx) = capture(&vx).await;
     let blocking_threads = Arc::new(Mutex::new(HashSet::new()));
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let jobs = (0..2).map(|_| {
         let (barrier, threads) = (barrier.clone(), blocking_threads.clone());
-        ctx.execute_blocking_unordered(move || {
+        vx.execute_blocking(move || {
             threads.lock().unwrap().insert(std::thread::current().id());
             barrier.wait();
         })
@@ -229,9 +236,9 @@ async fn worker_can_use_eventloop_io_and_timer_drivers_without_changing_executor
         socket.read_exact(&mut byte).await.unwrap();
         socket.write_all(&[byte[0] + 1]).await.unwrap();
     });
-    vx.deploy_worker(move |_| {
+    vx.deploy_worker(move || {
         worker(move |ctx| async move {
-            let id = ctx.deployment_id();
+            let id = ctx.current_execution().unwrap().deployment_id;
             let thread = std::thread::current().id();
             let mut socket = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -247,9 +254,12 @@ async fn worker_can_use_eventloop_io_and_timer_drivers_without_changing_executor
             ctx.timer(Duration::from_millis(1))?.await?;
             let mut periodic = ctx.periodic(Duration::ZERO, Duration::from_millis(1))?;
             periodic.tick().await?;
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             assert_eq!(std::thread::current().id(), thread);
-            assert!(Context::is_on_worker_thread());
+            assert!(matches!(
+                ExecutionInfo::current().map(|info| info.thread),
+                Some(ExecutorThread::Worker)
+            ));
             Ok(())
         })
     })
@@ -266,10 +276,10 @@ async fn worker_abort_before_first_poll_drops_on_owner_and_finishes_after_drop()
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
-    let c = ctx.clone();
+    let c = vx.handle();
     let blocker = tokio::spawn(async move {
         c.execute_blocking(move || {
             entered.send(()).ok();
@@ -280,7 +290,7 @@ async fn worker_abort_before_first_poll_drops_on_owner_and_finishes_after_drop()
     started.await.unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));
     let probe = WorkerDropProbe {
-        id: ctx.deployment_id(),
+        id: ctx.id(),
         dropped: dropped.clone(),
         panic: false,
     };
@@ -311,10 +321,10 @@ async fn worker_destructor_panic_does_not_kill_thread_or_leak_context() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
     let dropped = Arc::new(AtomicUsize::new(0));
     let probe = WorkerDropProbe {
-        id: ctx.deployment_id(),
+        id: ctx.id(),
         dropped: dropped.clone(),
         panic: true,
     };
@@ -331,13 +341,13 @@ async fn worker_destructor_panic_does_not_kill_thread_or_leak_context() {
     assert!(matches!(task.await, Err(VertxError::Panic(_))));
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     ctx.spawn(async {
-        assert!(Context::current().is_some());
+        assert!(ExecutionInfo::current().is_some());
         Ok(())
     })
     .unwrap()
     .await
     .unwrap();
-    assert!(Context::current().is_none());
+    assert!(ExecutionInfo::current().is_none());
     vx.close().await.unwrap();
 }
 
@@ -349,13 +359,13 @@ async fn future_combinations_preserve_worker_context_and_keep_spawned_tasks_inde
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
     let owner = ctx.clone();
     ctx.spawn(async move {
-        let id = Context::current().unwrap().deployment_id();
+        let id = ExecutionInfo::current().unwrap().deployment_id;
         let futures = (0..3u8).map(|n| async move {
             tokio::task::yield_now().await;
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             Ok::<_, VertxError>(n)
         });
         assert_eq!(future::try_join_all(futures).await?, vec![0, 1, 2]);
@@ -370,7 +380,7 @@ async fn future_combinations_preserve_worker_context_and_keep_spawned_tasks_inde
             future::ready(Err::<u8, _>(VertxError::Other("first failed".into()))).boxed(),
             async move {
                 tokio::task::yield_now().await;
-                assert_eq!(Context::current().unwrap().deployment_id(), id);
+                assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
                 Ok(42u8)
             }
             .boxed(),
@@ -407,7 +417,7 @@ async fn future_combinations_preserve_worker_context_and_keep_spawned_tasks_inde
         assert!(!abort.is_finished());
         release.send(()).ok();
         finished.await.unwrap();
-        assert_eq!(Context::current().unwrap().deployment_id(), id);
+        assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
         Ok(())
     })
     .unwrap()
@@ -426,7 +436,10 @@ async fn worker_cancellation_destructor_serializes_with_ordinary_polls() {
     }
     impl Drop for DropGate {
         fn drop(&mut self) {
-            assert_eq!(Context::current().unwrap().deployment_id(), self.id);
+            assert_eq!(
+                ExecutionInfo::current().unwrap().deployment_id,
+                Some(self.id)
+            );
             self.active.store(1, Ordering::SeqCst);
             self.entered.take().unwrap().send(()).ok();
             self.release.recv().unwrap();
@@ -438,8 +451,8 @@ async fn worker_cancellation_destructor_serializes_with_ordinary_polls() {
         .worker_threads(2)
         .build()
         .unwrap();
-    let (_, ctx) = capture_worker(&vx).await;
-    let (_, other) = capture_worker(&vx).await;
+    let (ctx, _) = capture_worker(&vx).await;
+    let (other, _) = capture_worker(&vx).await;
     let active = Arc::new(AtomicUsize::new(0));
     let (entered, dropping) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
@@ -447,7 +460,7 @@ async fn worker_cancellation_destructor_serializes_with_ordinary_polls() {
         entered: Some(entered),
         release: wait,
         active: active.clone(),
-        id: ctx.deployment_id(),
+        id: ctx.id(),
     };
     let (entered, running) = oneshot::channel();
     let task = ctx

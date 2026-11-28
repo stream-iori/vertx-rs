@@ -1,7 +1,7 @@
 //! 字符串地址上传输四字节大端整数，调用方和 handler 各自编解码。
 mod support;
 
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{Result, Verticle, Vertx, VertxError, VertxHandle};
 
 const ADDRESS: &str = "codec.double";
 
@@ -16,8 +16,8 @@ fn decode(bytes: &[u8]) -> Option<u32> {
 
 struct Double;
 impl Verticle for Double {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        ctx.event_bus()
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        ctx.event_bus()?
             .consumer::<Vec<u8>>(ADDRESS)?
             .handler(async |request| {
                 let Some(value) = decode(request.body()) else {
@@ -33,8 +33,8 @@ impl Verticle for Double {
 }
 
 async fn run(vertx: &Vertx) -> Result<()> {
-    vertx.deploy(|_| Double).await?;
-    let bus = vertx.event_bus();
+    vertx.deploy(|| Double).await?;
+    let bus = vertx.event_bus()?;
     let response: Vec<u8> = bus.request(ADDRESS, encode(21)).await?;
     assert_eq!(decode(&response), Some(42));
 

@@ -10,9 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use vertx_rs::{
-    Context, DeploymentId, Result, TcpConnection, TcpServer, TcpServerOptions, Vertx, VertxError,
-};
+use vertx_rs::{Deployment, Result, TcpConnection, TcpServer, TcpServerOptions, Vertx, VertxError};
 
 const GRACE: Duration = Duration::from_secs(2);
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -41,22 +39,22 @@ async fn start<F, H>(
     addr: SocketAddr,
     opts: TcpServerOptions,
     factory: F,
-) -> Result<(DeploymentId, TcpServer, Context)>
+) -> Result<(Deployment, TcpServer)>
 where
     F: FnOnce() -> H + Send + 'static,
     H: for<'a> AsyncFn(TcpConnection<'a>) -> Result<()> + 'static,
 {
     let (tx, rx) = oneshot::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
-                let server = ctx.serve_tcp(addr, opts, factory()).await?;
-                tx.send((server, ctx)).map_err(|_| VertxError::ReplyClosed)
+                let server = ctx.serve_tcp_local(addr, opts, factory()).await?;
+                tx.send(server).map_err(|_| VertxError::ReplyClosed)
             })
         })
         .await?;
-    let (server, ctx) = rx.await.map_err(|_| VertxError::ReplyClosed)?;
-    Ok((id, server, ctx))
+    let server = rx.await.map_err(|_| VertxError::ReplyClosed)?;
+    Ok((id, server))
 }
 
 #[tokio::test]
@@ -79,7 +77,7 @@ async fn one_capacity_budget_covers_all_registrations_and_replacement() {
     let vx = instance();
     let (entered, mut connections) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));
-    let (_, first, _) = start(&vx, ephemeral(), options(1), {
+    let (_, first) = start(&vx, ephemeral(), options(1), {
         let entered = entered.clone();
         let release = release.clone();
         move || {
@@ -119,7 +117,7 @@ async fn one_capacity_budget_covers_all_registrations_and_replacement() {
     )
     .await;
     assert!(matches!(conflict, Err(VertxError::InvalidOptions(_))));
-    let (_, second, _) = start(&vx, addr, options(1), {
+    let (_, second) = start(&vx, addr, options(1), {
         let entered = entered.clone();
         move || {
             async move |mut connection: TcpConnection<'_>| {
@@ -131,7 +129,7 @@ async fn one_capacity_budget_covers_all_registrations_and_replacement() {
     })
     .await
     .unwrap();
-    let (_, third, _) = start(&vx, addr, options(1), move || {
+    let (_, third) = start(&vx, addr, options(1), move || {
         async move |mut connection: TcpConnection<'_>| {
             entered.send(3).unwrap();
             connection.write_u8(42).await.unwrap();
@@ -172,7 +170,7 @@ async fn timeout_cancels_connections_even_after_shutdown_waiter_is_dropped() {
     let vx = instance();
     let dropped = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Semaphore::new(0));
-    let (_, server, ctx) = start(&vx, ephemeral(), options(1), {
+    let (ctx, server) = start(&vx, ephemeral(), options(1), {
         let dropped = dropped.clone();
         let ready = ready.clone();
         move || {
@@ -240,11 +238,11 @@ async fn bind_failure_rolls_back_and_raw_registration_conflicts() {
     ));
     drop(reserve);
 
-    let (id, server, ctx) = start(&vx, addr, opts, || async |_: TcpConnection<'_>| Ok(()))
+    let (id, server) = start(&vx, addr, opts, || async |_: TcpConnection<'_>| Ok(()))
         .await
         .unwrap();
-    ctx.spawn(async move {
-        let ctx = Context::current().unwrap();
+    let ctx = vx.handle();
+    id.spawn(async move {
         assert!(matches!(
             ctx.listen_tcp(addr).await,
             Err(VertxError::InvalidOptions(_))
@@ -254,9 +252,42 @@ async fn bind_failure_rolls_back_and_raw_registration_conflicts() {
     .unwrap()
     .await
     .unwrap();
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     server.wait_closed().await.unwrap();
     let rebound = std::net::TcpListener::bind(addr).unwrap();
     drop(rebound);
     vx.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_server_runs_a_local_connection_future_and_closes_with_vertx() {
+    let vx = instance();
+    let started = vx.serve_tcp(
+        ephemeral(),
+        options(1),
+        async move |mut connection: TcpConnection<'_>| {
+            let state = Rc::new(42u8);
+            let before = vertx_rs::ExecutionInfo::current().unwrap();
+            assert!(before.deployment_id.is_none());
+            assert_eq!(connection.read_u8().await.unwrap(), *state);
+            assert_eq!(vertx_rs::ExecutionInfo::current(), Some(before));
+            connection.write_u8(*state).await.unwrap();
+            Ok(())
+        },
+    );
+    let server = tokio::spawn(started).await.unwrap().unwrap();
+    let addr = server.local_addr();
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_u8(42).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, client.read_u8())
+            .await
+            .unwrap()
+            .unwrap(),
+        42
+    );
+
+    vx.close().await.unwrap();
+    server.wait_closed().await.unwrap();
+    drop(std::net::TcpListener::bind(addr).unwrap());
 }

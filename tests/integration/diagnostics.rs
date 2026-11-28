@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, DiagnosticsOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{DiagnosticsOptions, Result, Verticle, Vertx, VertxError, VertxHandle};
 
 #[tokio::test]
 async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
@@ -21,12 +21,12 @@ async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
         })
         .build()
         .unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let before = vx.diagnostics();
     let ok = ctx.spawn(async { Ok(()) }).unwrap();
     ok.await.unwrap();
     let err = ctx
-        .spawn(async { Err(VertxError::Other("task failed".into())) })
+        .spawn(async { Err::<(), _>(VertxError::Other("task failed".into())) })
         .unwrap();
     assert!(err.await.is_err());
     let panic = ctx
@@ -39,7 +39,7 @@ async fn diagnostics_are_bounded_and_counts_follow_actual_task_drop() {
     assert!(matches!(panic.await, Err(VertxError::Panic(_))));
     let mut handles = Vec::new();
     for _ in 0..4 {
-        handles.push(ctx.spawn(futures::future::pending()).unwrap());
+        handles.push(ctx.spawn(futures::future::pending::<Result<()>>()).unwrap());
     }
     let snapshot = vx.diagnostics();
     assert_eq!(snapshot.active_tasks, before.active_tasks + 4);
@@ -75,7 +75,7 @@ async fn diagnostics_read_current_poll_without_waiting_for_blocked_eventloop() {
         })
         .build()
         .unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, execution) = capture(&vx).await;
     let dispatch = output.dispatch();
     let (entered, ready) = oneshot::channel();
     let (release, gate) = std::sync::mpsc::channel();
@@ -97,7 +97,8 @@ async fn diagnostics_read_current_poll_without_waiting_for_blocked_eventloop() {
         .iter()
         .find(|t| t.task_id == task.id())
         .unwrap();
-    let correct = operation.context_id == ctx.id() && operation.operation == "future_poll";
+    let correct =
+        operation.context_id == execution.context_id && operation.operation == "future_poll";
     release.send(()).unwrap();
     task.await.unwrap();
     assert!(correct);
@@ -129,7 +130,7 @@ async fn handle_and_diagnostics_use_the_same_task_id(#[case] submission: TaskSub
         })
         .build()
         .unwrap();
-    let (deployment, ctx) = if matches!(submission, TaskSubmission::Worker) {
+    let (deployment, execution) = if matches!(submission, TaskSubmission::Worker) {
         capture_worker(&vx).await
     } else {
         capture(&vx).await
@@ -153,31 +154,32 @@ async fn handle_and_diagnostics_use_the_same_task_id(#[case] submission: TaskSub
     let handle = match submission {
         TaskSubmission::Local | TaskSubmission::SameEventLoop => {
             let (send, recv) = oneshot::channel();
-            let target = ctx.clone();
-            ctx.spawn(async move {
-                let handle = match submission {
-                    TaskSubmission::Local => target.spawn_local(task),
-                    _ => target.spawn(task),
-                }?;
-                send.send(handle).map_err(|_| VertxError::ReplyClosed)?;
-                Ok(())
-            })
-            .unwrap()
-            .await
-            .unwrap();
+            let target = vx.handle();
+            deployment
+                .spawn(async move {
+                    let handle = match submission {
+                        TaskSubmission::Local => target.spawn_local(task),
+                        _ => target.spawn(task),
+                    }?;
+                    send.send(handle).map_err(|_| VertxError::ReplyClosed)?;
+                    Ok(())
+                })
+                .unwrap()
+                .await
+                .unwrap();
             recv.await.unwrap()
         }
-        TaskSubmission::CrossThread | TaskSubmission::Worker => ctx.spawn(task).unwrap(),
+        TaskSubmission::CrossThread | TaskSubmission::Worker => deployment.spawn(task).unwrap(),
     };
 
     let operation = observed.await.unwrap();
     assert_eq!(operation.task_id, handle.id());
-    assert_eq!(operation.context_id, ctx.id());
+    assert_eq!(operation.context_id, execution.context_id);
     assert_eq!(operation.operation, "future_poll");
     assert!(vx.diagnostics().tasks.iter().any(|record| {
         record.task_id == handle.id()
-            && record.context_id == ctx.id()
-            && record.deployment_id == deployment
+            && record.context_id == execution.context_id
+            && record.deployment_id == Some(deployment.id())
     }));
     release.send(()).unwrap();
     handle.await.unwrap();
@@ -205,7 +207,11 @@ async fn diagnostics_can_be_disabled_and_consumers_do_not_double_decrement(#[cas
         })
         .build()
         .unwrap();
-    let consumer = vx.event_bus().consumer::<()>("diagnostic-count").unwrap();
+    let consumer = vx
+        .event_bus()
+        .unwrap()
+        .consumer::<()>("diagnostic-count")
+        .unwrap();
     assert_eq!(vx.diagnostics().active_consumers, usize::from(enabled));
     vx.close().await.unwrap();
     drop(consumer);
@@ -231,10 +237,10 @@ async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
             })
             .build()
             .unwrap();
-        let (_, ctx) = capture(&vx).await;
+        let (ctx, _) = capture(&vx).await;
         let (entered, ready) = oneshot::channel();
         let (release, gate) = std::sync::mpsc::channel();
-        let c = ctx.clone();
+        let c = vx.handle();
         let first = ctx
             .spawn(async move {
                 c.execute_blocking(move || {
@@ -245,7 +251,7 @@ async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
             })
             .unwrap();
         ready.await.unwrap();
-        let c = ctx.clone();
+        let c = vx.handle();
         let (submitted, observed) = oneshot::channel();
         let second = ctx
             .spawn(async move {
@@ -254,7 +260,7 @@ async fn diagnostics_distinguish_ordered_wait_worker_queue_and_running_work() {
             })
             .unwrap();
         observed.await.unwrap();
-        let c = ctx.clone();
+        let c = vx.handle();
         let (submitted, observed) = oneshot::channel();
         let third = ctx
             .spawn(async move {
@@ -307,10 +313,10 @@ async fn diagnostics_show_cleanup_stage_while_stop_is_pending(vx: Vertx) {
         release: Option<oneshot::Receiver<()>>,
     }
     impl Verticle for StopGate {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Ok(())
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             self.entered.take().unwrap().send(()).ok();
             self.release
                 .take()
@@ -322,7 +328,7 @@ async fn diagnostics_show_cleanup_stage_while_stop_is_pending(vx: Vertx) {
     let (entered, ready) = oneshot::channel();
     let (release, wait) = oneshot::channel();
     let id = vx
-        .deploy(|_| StopGate {
+        .deploy(|| StopGate {
             entered: Some(entered),
             release: Some(wait),
         })
@@ -339,7 +345,7 @@ async fn diagnostics_show_cleanup_stage_while_stop_is_pending(vx: Vertx) {
         snapshot
             .deployments
             .iter()
-            .any(|d| d.deployment_id == id && d.stage == "stopping")
+            .any(|d| d.deployment_id == id.id() && d.stage == "stopping")
     );
     assert!(vx.diagnostics().deployments.is_empty());
 }
@@ -347,10 +353,10 @@ async fn diagnostics_show_cleanup_stage_while_stop_is_pending(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn diagnostics_keep_detached_blocking_work_until_its_actual_completion(vx: Vertx) {
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let (send, ready) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
-    let c = ctx.clone();
+    let c = vx.handle();
     let task = ctx
         .spawn(async move {
             c.execute_blocking(move || {
@@ -388,13 +394,14 @@ async fn diagnostics_mark_destructor_panics_failed_and_invoke_hook_once(vx: Vert
             panic!("diagnostic drop panic");
         }
     }
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let before = vx.diagnostics().failed;
     let calls = Arc::new(AtomicUsize::new(0));
     let hook = calls.clone();
     ctx.set_exception_handler(move |_| {
         hook.fetch_add(1, Ordering::SeqCst);
-    });
+    })
+    .unwrap();
     let result = ctx.spawn(DropPanic).unwrap().await;
     assert!(matches!(result, Err(VertxError::Panic(_))));
     assert_eq!(vx.diagnostics().failed, before + 1);
@@ -418,9 +425,9 @@ async fn queue_details_are_bounded_and_optional(#[case] enabled: bool) {
         })
         .build()
         .unwrap();
-    let a = vx.event_bus().consumer::<()>("a").unwrap();
-    let b = vx.event_bus().consumer::<()>("b").unwrap();
-    vx.event_bus().send("a", ()).await.unwrap();
+    let a = vx.event_bus().unwrap().consumer::<()>("a").unwrap();
+    let b = vx.event_bus().unwrap().consumer::<()>("b").unwrap();
+    vx.event_bus().unwrap().send("a", ()).await.unwrap();
     let snapshot = vx.diagnostics();
     assert_eq!(snapshot.queues.len(), usize::from(enabled));
     assert_eq!(snapshot.queue_details_truncated, enabled);

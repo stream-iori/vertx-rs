@@ -11,17 +11,19 @@ use vertx_rs::Vertx;
 #[rstest]
 #[tokio::test]
 async fn rc_refcell_shared_state_across_handlers(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             let values = Rc::new(RefCell::new(Vec::<u32>::new()));
             let a = values.clone();
             ctx.event_bus()
+                .unwrap()
                 .consumer::<u32>("put")?
                 .handler(async move |env| {
                     a.borrow_mut().push(*env.body());
                     env.reply(())
                 })?;
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("get")?
                 .handler(async move |env| {
                     let n = values.borrow().len();
@@ -32,9 +34,17 @@ async fn rc_refcell_shared_state_across_handlers(vx: Vertx) {
     })
     .await
     .unwrap();
-    vx.event_bus().request::<_, ()>("put", 1u32).await.unwrap();
+    vx.event_bus()
+        .unwrap()
+        .request::<_, ()>("put", 1u32)
+        .await
+        .unwrap();
     assert_eq!(
-        vx.event_bus().request::<_, usize>("get", ()).await.unwrap(),
+        vx.event_bus()
+            .unwrap()
+            .request::<_, usize>("get", ())
+            .await
+            .unwrap(),
         1
     );
     vx.close().await.unwrap();
@@ -43,17 +53,19 @@ async fn rc_refcell_shared_state_across_handlers(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn rc_cell_shared_scalar_across_handlers(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             let value = Rc::new(Cell::new(0u32));
             let a = value.clone();
             ctx.event_bus()
+                .unwrap()
                 .consumer::<u32>("put")?
                 .handler(async move |env| {
                     a.set(*env.body());
                     env.reply(())
                 })?;
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("get")?
                 .handler(async move |env| {
                     let n = value.get();
@@ -64,9 +76,17 @@ async fn rc_cell_shared_scalar_across_handlers(vx: Vertx) {
     })
     .await
     .unwrap();
-    vx.event_bus().request::<_, ()>("put", 42u32).await.unwrap();
+    vx.event_bus()
+        .unwrap()
+        .request::<_, ()>("put", 42u32)
+        .await
+        .unwrap();
     assert_eq!(
-        vx.event_bus().request::<_, u32>("get", ()).await.unwrap(),
+        vx.event_bus()
+            .unwrap()
+            .request::<_, u32>("get", ())
+            .await
+            .unwrap(),
         42
     );
     vx.close().await.unwrap();
@@ -78,9 +98,10 @@ async fn arc_atomic_counter_shared_across_verticles(vx: Vertx) {
     let count = Arc::new(AtomicUsize::new(0));
     for _ in 0..3 {
         let count = count.clone();
-        vx.deploy(move |_| {
+        vx.deploy(move || {
             local(move |ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("count")?
                     .handler(async move |env| {
                         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -95,6 +116,7 @@ async fn arc_atomic_counter_shared_across_verticles(vx: Vertx) {
     for n in 1..=9 {
         assert_eq!(
             vx.event_bus()
+                .unwrap()
                 .request::<_, usize>("count", ())
                 .await
                 .unwrap(),
@@ -110,9 +132,10 @@ async fn arc_immutable_snapshot_shared_across_verticles(vx: Vertx) {
     let snapshot = Arc::new(vec![1, 2, 3]);
     for _ in 0..2 {
         let snapshot = snapshot.clone();
-        vx.deploy(move |_| {
+        vx.deploy(move || {
             local(move |ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<()>("snapshot")?
                     .handler(async move |env| {
                         let values = (*snapshot).clone();
@@ -126,6 +149,7 @@ async fn arc_immutable_snapshot_shared_across_verticles(vx: Vertx) {
     }
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, Vec<i32>>("snapshot", ())
             .await
             .unwrap(),

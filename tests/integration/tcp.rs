@@ -12,7 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Barrier, oneshot};
 use vertx_rs::{
-    Context, DeploymentId, EventLoopId, Result, TaskHandle, TcpIncoming, Vertx, VertxError,
+    Deployment, EventLoopId, ExecutionInfo, ExecutorThread, Result, TaskHandle, TcpIncoming, Vertx,
+    VertxError, VertxHandle,
 };
 
 const EPHEMERAL: SocketAddr =
@@ -35,14 +36,14 @@ async fn serve<F, Fut>(
     vx: &Vertx,
     addr: SocketAddr,
     run: F,
-) -> (DeploymentId, SocketAddr, TaskHandle<()>)
+) -> (Deployment, SocketAddr, TaskHandle<()>)
 where
-    F: FnOnce(Context, TcpIncoming) -> Fut + Send + 'static,
+    F: FnOnce(VertxHandle, TcpIncoming) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + 'static,
 {
     let (ready, started) = oneshot::channel();
     let deployment = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let incoming = ctx.listen_tcp(addr).await?;
                 let addr = incoming.local_addr();
@@ -67,12 +68,10 @@ async fn confirm_pending(mut future: Pin<&mut impl Future>) {
     .await;
 }
 
-fn assert_owner(ctx: &Context, thread: ThreadId) {
-    let current = Context::current().unwrap();
-    assert_eq!(current.id(), ctx.id());
-    assert_eq!(current.event_loop_id(), ctx.event_loop_id());
+fn assert_owner(expected: ExecutionInfo, thread: ThreadId) {
+    assert_eq!(ExecutionInfo::current(), Some(expected));
     assert_eq!(std::thread::current().id(), thread);
-    assert!(Context::is_on_event_loop_thread());
+    assert!(matches!(expected.thread, ExecutorThread::EventLoop(_)));
 }
 
 async fn reply(mut socket: TcpStream, tag: u8) {
@@ -92,21 +91,24 @@ async fn request(addr: SocketAddr, tag: u8) {
 }
 
 async fn waiting_echo(
-    ctx: Context,
+    ctx: VertxHandle,
     mut incoming: TcpIncoming,
     tag: u8,
     ready: oneshot::Sender<(EventLoopId, ThreadId)>,
 ) -> Result<()> {
     let thread = thread::current().id();
-    assert_owner(&ctx, thread);
+    let execution = ctx.current_execution().unwrap();
+    assert_owner(execution, thread);
     let mut accept = pin!(incoming.accept());
     confirm_pending(accept.as_mut()).await;
-    ready.send((ctx.event_loop_id().unwrap(), thread)).unwrap();
+    ready
+        .send((execution.event_loop_id.unwrap(), thread))
+        .unwrap();
     let (socket, peer) = accept.await?;
     assert!(peer.ip().is_loopback());
-    assert_owner(&ctx, thread);
+    assert_owner(execution, thread);
     reply(socket, tag).await;
-    assert_owner(&ctx, thread);
+    assert_owner(execution, thread);
     Ok(())
 }
 
@@ -185,7 +187,7 @@ async fn cancelling_accept_releases_its_place_and_allows_retry(#[case] cancel_he
     let (released, turn_released) = oneshot::channel();
     let (retry, retrying) = oneshot::channel();
     let (peer_ready, peer_waiting) = oneshot::channel();
-    let candidate = |_: Context, mut incoming: TcpIncoming| async move {
+    let candidate = |_: VertxHandle, mut incoming: TcpIncoming| async move {
         {
             let mut accept = pin!(incoming.accept());
             confirm_pending(accept.as_mut()).await;
@@ -230,7 +232,7 @@ async fn worker_rejects_managed_listener_before_binding() {
     let vx = instance(1);
     let reservation = std::net::TcpListener::bind(EPHEMERAL).unwrap();
     let occupied = reservation.local_addr().unwrap();
-    vx.deploy_worker(move |_| {
+    vx.deploy_worker(move || {
         worker(move |ctx| async move {
             assert!(matches!(
                 ctx.listen_tcp(occupied).await,
@@ -255,19 +257,24 @@ async fn worker_rejects_managed_listener_before_binding() {
 async fn different_context_on_same_event_loop_cannot_accept() {
     let vx = instance(1);
     let (owner, owning_thread) = oneshot::channel();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             retain(ctx.listen_tcp(EPHEMERAL).await?);
-            owner.send((ctx.id(), thread::current().id())).unwrap();
+            owner
+                .send((
+                    ctx.current_execution().unwrap().context_id,
+                    thread::current().id(),
+                ))
+                .unwrap();
             Ok(())
         })
     })
     .await
     .unwrap();
     let (id, thread) = owning_thread.await.unwrap();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
-            assert_ne!(ctx.id(), id);
+            assert_ne!(ctx.current_execution().unwrap().context_id, id);
             assert_eq!(std::thread::current().id(), thread);
             let mut incoming = RETAINED.take().unwrap();
             assert!(matches!(
@@ -287,7 +294,7 @@ async fn occupied_port_and_duplicate_registration_report_distinct_errors() {
     let vx = instance(1);
     let occupied = std::net::TcpListener::bind(EPHEMERAL).unwrap();
     let addr = occupied.local_addr().unwrap();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             assert!(matches!(
                 ctx.listen_tcp(addr).await,
@@ -339,7 +346,7 @@ async fn undeploying_first_member_wakes_it_and_keeps_the_listener() {
         Ok(())
     })
     .await;
-    vx.undeploy(first_id).await.unwrap();
+    first_id.stop().await.unwrap();
     first.await.unwrap();
     assert!(std::net::TcpListener::bind(addr).is_err());
     request(addr, 2).await;
@@ -356,7 +363,7 @@ async fn last_undeploy_releases_port_even_with_retained_receiver() {
     let vx = instance(1);
     let (ready, bound) = oneshot::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let incoming = ctx.listen_tcp(EPHEMERAL).await?;
                 let addr = incoming.local_addr();
@@ -368,17 +375,17 @@ async fn last_undeploy_releases_port_even_with_retained_receiver() {
         .await
         .unwrap();
     let addr = bound.await.unwrap();
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     let rebound = std::net::TcpListener::bind(addr).unwrap();
     drop(rebound);
 
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let replacement = ctx.listen_tcp(addr).await?;
             let mut stale = RETAINED.take().unwrap();
             assert!(matches!(
                 stale.accept().await,
-                Err(VertxError::DeploymentTerminated(owner)) if owner == id
+                Err(VertxError::DeploymentTerminated(owner)) if owner == id.id()
             ));
             drop(stale);
             assert!(std::net::TcpListener::bind(replacement.local_addr()).is_err());
@@ -395,7 +402,7 @@ async fn start_panic_releases_listener_even_if_its_handle_is_retained() {
     let vx = instance(1);
     let (ready, bound) = oneshot::channel();
     let result = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let listener = ctx.listen_tcp(EPHEMERAL).await?;
                 ready.send(listener.local_addr()).unwrap();
@@ -416,7 +423,7 @@ async fn failed_start_rolls_back_listener_before_returning() {
     let vx = instance(1);
     let (ready, bound) = oneshot::channel();
     let result = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let incoming = ctx.listen_tcp(EPHEMERAL).await?;
                 let addr = incoming.local_addr();
@@ -442,12 +449,14 @@ async fn cancelling_deploy_rolls_back_its_registration() {
     let (ready, bound) = oneshot::channel();
     let deploy = tokio::spawn(async move {
         owner
-            .deploy(move |_| {
+            .deploy(move || {
                 local(move |ctx| async move {
                     let incoming = ctx.listen_tcp(EPHEMERAL).await?;
                     let addr = incoming.local_addr();
                     retain(incoming);
-                    ready.send((ctx.deployment_id(), addr)).unwrap();
+                    ready
+                        .send((ctx.current_deployment().unwrap(), addr))
+                        .unwrap();
                     pending::<Result<()>>().await
                 })
             })
@@ -456,11 +465,7 @@ async fn cancelling_deploy_rolls_back_its_registration() {
     let (id, addr) = bound.await.unwrap();
     deploy.abort();
     assert!(deploy.await.unwrap_err().is_cancelled());
-    match vx.undeploy(id).await {
-        Ok(()) => {}
-        Err(VertxError::DeploymentNotFound(removed)) if removed == id => {}
-        result => panic!("unexpected undeploy result: {result:?}"),
-    }
+    id.wait_stopped().await.unwrap();
     let rebound = std::net::TcpListener::bind(addr).unwrap();
     drop(rebound);
     vx.close().await.unwrap();
@@ -469,16 +474,16 @@ async fn cancelling_deploy_rolls_back_its_registration() {
 #[tokio::test]
 async fn registration_racing_with_close_leaves_no_bound_port() {
     let vx = instance(2);
-    let (_, ctx) = super::support::capture(&vx).await;
+    let (ctx, _) = super::support::capture(&vx).await;
     let barrier = std::sync::Arc::new(Barrier::new(2));
     let (reported, observed) = oneshot::channel();
+    let vertx = vx.handle();
     let task = ctx
         .spawn({
             let barrier = barrier.clone();
             async move {
                 barrier.wait().await;
-                let ctx = Context::current().unwrap();
-                match ctx.listen_tcp(EPHEMERAL).await {
+                match vertx.listen_tcp(EPHEMERAL).await {
                     Ok(incoming) => {
                         let addr = incoming.local_addr();
                         retain(incoming);

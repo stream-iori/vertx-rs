@@ -3,7 +3,8 @@
 //! handler 本身仍然串行；并发来自应用主动 spawn，输入固定为三个请求。
 mod support;
 use vertx_rs::{
-    Context, DeliveryOptions, RequestAddress, RequestOptions, Result, Verticle, Vertx, VertxError,
+    DeliveryOptions, RequestAddress, RequestOptions, Result, Verticle, Vertx, VertxError,
+    VertxHandle,
 };
 
 const TRANSFORM: RequestAddress<String, String> = RequestAddress::new("transform");
@@ -16,9 +17,9 @@ fn transform(body: &str) -> String {
 }
 struct Transformer;
 impl Verticle for Transformer {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         TRANSFORM
-            .consumer(&ctx.event_bus())?
+            .consumer(&ctx.event_bus()?)?
             .handler(async move |env| {
                 let (body, headers, reply) = env.into_parts();
                 // Headers/reply 不会自动转发，应用明确选择需要返回的关联字段。
@@ -42,8 +43,8 @@ impl Verticle for Transformer {
     }
 }
 async fn run(vx: &Vertx) -> Result<()> {
-    vx.deploy(|_| Transformer).await?;
-    let bus = vx.event_bus();
+    vx.deploy(|| Transformer).await?;
+    let bus = vx.event_bus()?;
     let requests = ["alpha", "beta", "gamma"]
         .into_iter()
         .enumerate()

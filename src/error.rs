@@ -29,9 +29,6 @@ pub enum VertxError {
     /// The selected consumer queue or local send adapter has closed.
     #[error("channel closed: {0}")]
     ChannelClosed(String),
-    /// No registered deployment matches the specified ID.
-    #[error("deployment not found: {0}")]
-    DeploymentNotFound(crate::DeploymentId),
     /// The owning deployment is stopping or has already finished.
     #[error("deployment {0} has been terminated")]
     DeploymentTerminated(crate::DeploymentId),
@@ -152,7 +149,6 @@ impl VertxError {
             Self::RecipientFailure { .. } => "recipient_failure",
             Self::QueueFull(_) => "queue_full",
             Self::ChannelClosed(_) => "channel_closed",
-            Self::DeploymentNotFound(_) => "deployment_not_found",
             Self::DeploymentTerminated(_) => "deployment_terminated",
             Self::VertxClosed => "vertx_closed",
             Self::ContextMismatch => "context_mismatch",

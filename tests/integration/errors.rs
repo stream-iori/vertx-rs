@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, Result, Verticle, Vertx, VertxError, VertxHandle};
 
 struct OnDrop<F: FnOnce()>(Option<F>);
 
@@ -26,7 +26,7 @@ async fn exception_handler_destructor_can_reenter_its_slot() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (_, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
 
     let owner = vx.clone();
     let global = OnDrop(Some(move || owner.clear_exception_handler()));
@@ -36,11 +36,12 @@ async fn exception_handler_destructor_can_reenter_its_slot() {
     vx.set_exception_handler(|_| {});
 
     let handle = ctx.clone();
-    let local = OnDrop(Some(move || handle.set_exception_handler(|_| {})));
+    let local = OnDrop(Some(move || handle.set_exception_handler(|_| {}).unwrap()));
     ctx.set_exception_handler(move |_| {
         std::hint::black_box(&local);
-    });
-    ctx.clear_exception_handler();
+    })
+    .unwrap();
+    ctx.clear_exception_handler().unwrap();
     vx.close().await.unwrap();
 }
 
@@ -49,7 +50,7 @@ async fn exception_handler_destructor_can_reenter_its_slot() {
 #[case::global(true)]
 #[tokio::test]
 async fn exception_handler_destructor_panic_is_a_cleanup_error(vx: Vertx, #[case] global: bool) {
-    let (id, ctx) = capture(&vx).await;
+    let (ctx, _) = capture(&vx).await;
     let probe = OnDrop(Some(|| panic!("hook destructor")));
     let hook = move |_: &VertxError| {
         std::hint::black_box(&probe);
@@ -67,9 +68,9 @@ async fn exception_handler_destructor_panic_is_a_cleanup_error(vx: Vertx, #[case
         assert_eq!(snapshot.active_tasks, 0);
         assert!(snapshot.threads.is_empty());
     } else {
-        ctx.set_exception_handler(hook);
+        ctx.set_exception_handler(hook).unwrap();
         assert!(
-            matches!(vx.undeploy(id).await, Err(VertxError::Panic(message)) if message == "hook destructor")
+            matches!(ctx.stop().await, Err(VertxError::Panic(message)) if message == "hook destructor")
         );
         assert_eq!(vx.diagnostics().active_deployments, 0);
         // The next deployment exercises the instance after the isolated panic.
@@ -85,9 +86,10 @@ async fn exception_handler_receives_handler_errors(vx: Vertx) {
     vx.set_exception_handler(move |e| {
         tx.send(e.to_string()).ok();
     });
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("error")?
                 .handler(async |_| Err(VertxError::Other("expected".into())))?;
             Ok(())
@@ -95,7 +97,7 @@ async fn exception_handler_receives_handler_errors(vx: Vertx) {
     })
     .await
     .unwrap();
-    vx.event_bus().send("error", ()).await.unwrap();
+    vx.event_bus().unwrap().send("error", ()).await.unwrap();
     assert!(rx.recv().await.unwrap().contains("expected"));
     vx.close().await.unwrap();
 }
@@ -114,7 +116,7 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     vx.set_exception_handler(move |error| {
         tx.send((
-            Context::current().unwrap().deployment_id(),
+            ExecutionInfo::current().unwrap().deployment_id,
             error.to_string(),
         ))
         .ok();
@@ -127,9 +129,10 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
         env.reply(42u32)
     };
     let id = if worker_context {
-        vx.deploy_worker(move |_| {
+        vx.deploy_worker(move || {
             worker(move |ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<bool>("panic")?
                     .handler_worker(handler)?;
                 Ok(())
@@ -138,9 +141,10 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
         .await
         .unwrap()
     } else {
-        vx.deploy(move |_| {
+        vx.deploy(move || {
             local(move |ctx| async move {
                 ctx.event_bus()
+                    .unwrap()
                     .consumer::<bool>("panic")?
                     .handler(handler)?;
                 Ok(())
@@ -150,11 +154,14 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
         .unwrap()
     };
     assert!(matches!(
-        vx.event_bus().request::<_, u32>("panic", true).await,
+        vx.event_bus()
+            .unwrap()
+            .request::<_, u32>("panic", true)
+            .await,
         Err(VertxError::ReplyClosed)
     ));
     let (owner, message) = rx.recv().await.unwrap();
-    assert_eq!(owner, id);
+    assert_eq!(owner, Some(id.id()));
     assert!(message.contains(if panic {
         "test panic"
     } else {
@@ -162,6 +169,7 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
     }));
     assert_eq!(
         vx.event_bus()
+            .unwrap()
             .request::<_, u32>("panic", false)
             .await
             .unwrap(),
@@ -175,14 +183,14 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
         ),
         "each failed message must report exactly once"
     );
-    vx.undeploy(id).await.unwrap();
+    id.stop().await.unwrap();
     let snapshot = vx.diagnostics();
     assert_eq!(snapshot.active_deployments, 0);
     assert!(
         snapshot
             .deployments
             .iter()
-            .all(|deployment| deployment.deployment_id != id)
+            .all(|deployment| deployment.deployment_id != id.id())
     );
     vx.close().await.unwrap();
 }
@@ -196,17 +204,19 @@ async fn context_exception_handler_can_clear_itself_without_deadlock(vx: Vertx) 
         g.fetch_add(1, Ordering::SeqCst);
     });
     let (tx, rx) = oneshot::channel();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let tx = Mutex::new(Some(tx));
-            let own = ctx.clone();
-            ctx.set_exception_handler(move |_| {
-                own.clear_exception_handler();
+            let deployment = ctx.current_deployment().unwrap();
+            let own = deployment.clone();
+            deployment.set_exception_handler(move |_| {
+                own.clear_exception_handler().unwrap();
                 if let Some(tx) = tx.lock().unwrap().take() {
                     tx.send(()).ok();
                 }
-            });
+            })?;
             ctx.event_bus()
+                .unwrap()
                 .consumer::<()>("fail")?
                 .handler(async |_| Err(VertxError::Other("error".into())))?;
             Ok(())
@@ -214,7 +224,7 @@ async fn context_exception_handler_can_clear_itself_without_deadlock(vx: Vertx) 
     })
     .await
     .unwrap();
-    vx.event_bus().send("fail", ()).await.unwrap();
+    vx.event_bus().unwrap().send("fail", ()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), rx)
         .await
         .unwrap()
@@ -233,14 +243,14 @@ async fn lifecycle_keeps_start_stop_and_drop_errors_and_source(vx: Vertx) {
         }
     }
     impl Verticle for Broken {
-        async fn start(&mut self, _: Context) -> Result<()> {
+        async fn start(&mut self, _: VertxHandle) -> Result<()> {
             Err(VertxError::StartFailed("start failure".into()))
         }
-        async fn stop(&mut self, _: Context) -> Result<()> {
+        async fn stop(&mut self, _: VertxHandle) -> Result<()> {
             Err(VertxError::Other("stop failure".into()))
         }
     }
-    let error = vx.deploy(|_| Broken).await.unwrap_err();
+    let error = vx.deploy(|| Broken).await.unwrap_err();
     assert!(
         std::error::Error::source(&error)
             .unwrap()

@@ -18,7 +18,7 @@ impl Diagnostics {
         self: &Arc<Self>,
         id: TaskId,
         context_id: ContextId,
-        deployment_id: DeploymentId,
+        deployment_id: Option<DeploymentId>,
         stage: TaskStage,
     ) -> TaskRecord {
         let record = TaskRecord {
@@ -138,7 +138,7 @@ pub(crate) struct TaskRecord {
     diagnostics: Arc<Diagnostics>,
     pub id: TaskId,
     context_id: ContextId,
-    deployment_id: DeploymentId,
+    deployment_id: Option<DeploymentId>,
     stage: Arc<Mutex<StageState>>,
     outcome: Option<TaskOutcome>,
     error_kind: Option<&'static str>,
@@ -230,7 +230,7 @@ impl TaskRecord {
         drop(state);
         drop(current);
         tracing::debug!(
-            instance_id = self.diagnostics.instance, deployment_id = %self.deployment_id,
+            instance_id = self.diagnostics.instance, deployment_id = self.deployment_id.as_ref().map(tracing::field::display),
             context_id = %self.context_id, task_id = %self.id, outcome = outcome.as_str(),
             error_kind = self.error_kind, total_elapsed = ?self.started.elapsed(),
             "task finished after user drop"

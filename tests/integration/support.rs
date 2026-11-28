@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Result, Verticle, Vertx, VertxError, WorkerVerticle};
+use vertx_rs::{
+    Deployment, ExecutionInfo, ExecutorThread, Result, Verticle, Vertx, VertxError, VertxHandle,
+    WorkerVerticle,
+};
 
 #[fixture]
 pub(super) fn vx() -> Vertx {
@@ -46,17 +49,17 @@ pub(super) struct Local<F>(Option<F>);
 
 pub(super) fn local<F, Fut>(f: F) -> Local<F>
 where
-    F: FnOnce(Context) -> Fut,
+    F: FnOnce(VertxHandle) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     Local(Some(f))
 }
 impl<F, Fut> Verticle for Local<F>
 where
-    F: FnOnce(Context) -> Fut + 'static,
+    F: FnOnce(VertxHandle) -> Fut + 'static,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         self.0.take().unwrap()(ctx).await
     }
 }
@@ -65,27 +68,28 @@ pub(super) struct Worker<F>(Option<F>);
 
 pub(super) fn worker<F, Fut>(f: F) -> Worker<F>
 where
-    F: FnOnce(Context) -> Fut,
+    F: FnOnce(VertxHandle) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     Worker(Some(f))
 }
 impl<F, Fut> WorkerVerticle for Worker<F>
 where
-    F: FnOnce(Context) -> Fut + Send + 'static,
+    F: FnOnce(VertxHandle) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         self.0.take().unwrap()(ctx).await
     }
 }
 
-pub(super) async fn capture(vx: &Vertx) -> (vertx_rs::DeploymentId, Context) {
+pub(super) async fn capture(vx: &Vertx) -> (Deployment, ExecutionInfo) {
     let (tx, rx) = oneshot::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
-                tx.send(ctx).ok();
+                tx.send(ctx.current_execution().expect("managed start"))
+                    .ok();
                 Ok(())
             })
         })
@@ -94,10 +98,10 @@ pub(super) async fn capture(vx: &Vertx) -> (vertx_rs::DeploymentId, Context) {
     (id, rx.await.unwrap())
 }
 
-pub(super) async fn echo(vx: &Vertx, address: &'static str) -> vertx_rs::DeploymentId {
-    vx.deploy(move |_| {
+pub(super) async fn echo(vx: &Vertx, address: &'static str) -> Deployment {
+    vx.deploy(move || {
         local(move |ctx| async move {
-            ctx.event_bus()
+            ctx.event_bus()?
                 .consumer::<String>(address)?
                 .handler(async |env| {
                     let body = env.body().clone();
@@ -110,12 +114,13 @@ pub(super) async fn echo(vx: &Vertx, address: &'static str) -> vertx_rs::Deploym
     .unwrap()
 }
 
-pub(super) async fn capture_worker(vx: &Vertx) -> (vertx_rs::DeploymentId, Context) {
+pub(super) async fn capture_worker(vx: &Vertx) -> (Deployment, ExecutionInfo) {
     let (tx, rx) = oneshot::channel();
     let id = vx
-        .deploy_worker(move |_| {
+        .deploy_worker(move || {
             worker(move |ctx| async move {
-                tx.send(ctx).ok();
+                tx.send(ctx.current_execution().expect("managed start"))
+                    .ok();
                 Ok(())
             })
         })
@@ -132,8 +137,14 @@ pub(super) struct WorkerDropProbe {
 
 impl Drop for WorkerDropProbe {
     fn drop(&mut self) {
-        assert!(Context::is_on_worker_thread());
-        assert_eq!(Context::current().unwrap().deployment_id(), self.id);
+        assert!(matches!(
+            ExecutionInfo::current().map(|info| info.thread),
+            Some(ExecutorThread::Worker)
+        ));
+        assert_eq!(
+            ExecutionInfo::current().unwrap().deployment_id,
+            Some(self.id)
+        );
         self.dropped.fetch_add(1, Ordering::SeqCst);
         assert!(!self.panic, "worker destructor panic");
     }

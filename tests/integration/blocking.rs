@@ -6,27 +6,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, Vertx, VertxError};
+use vertx_rs::{ExecutionInfo, ExecutorThread, ThreadingModel, Vertx, VertxError};
 
 #[rstest]
 #[tokio::test]
 async fn execute_blocking_from_event_loop_verticle(vx: Vertx) {
-    vx.deploy(|_| {
+    vx.deploy(|| {
         local(|ctx| async move {
             let thread = std::thread::current().id();
-            let id = ctx.deployment_id();
+            let id = ctx.current_execution().unwrap().deployment_id;
             let result = ctx
                 .execute_blocking(move || {
-                    assert_eq!(Context::current().unwrap().deployment_id(), id);
-                    assert!(Context::current().unwrap().is_event_loop());
-                    assert!(Context::is_on_worker_thread());
-                    assert!(!Context::is_on_event_loop_thread());
+                    assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
+                    assert_eq!(
+                        ExecutionInfo::current().unwrap().threading_model,
+                        ThreadingModel::EventLoop
+                    );
+                    assert!(matches!(
+                        ExecutionInfo::current().map(|info| info.thread),
+                        Some(ExecutorThread::Worker)
+                    ));
                     42
                 })
                 .await?;
             assert_eq!(result, 42);
             assert_eq!(std::thread::current().id(), thread);
-            assert_eq!(Context::current().unwrap().deployment_id(), id);
+            assert_eq!(ExecutionInfo::current().unwrap().deployment_id, id);
             Ok(())
         })
     })
@@ -38,11 +43,17 @@ async fn execute_blocking_from_event_loop_verticle(vx: Vertx) {
 #[rstest]
 #[tokio::test]
 async fn execute_blocking_after_undeploy_returns_terminated(vx: Vertx) {
-    let (id, ctx) = capture(&vx).await;
-    vx.undeploy(id).await.unwrap();
+    let (deployment, _) = capture(&vx).await;
+    let vertx = vx.handle();
+    let blocking = deployment
+        .spawn(async move { Ok(vertx.execute_blocking(|| panic!("stopped work ran"))) })
+        .unwrap()
+        .await
+        .unwrap();
+    deployment.stop().await.unwrap();
     assert!(matches!(
-        ctx.execute_blocking(|| 1).await,
-        Err(VertxError::DeploymentTerminated(_))
+        blocking.await,
+        Err(VertxError::DeploymentTerminated(id)) if id == deployment.id()
     ));
     vx.close().await.unwrap();
 }
@@ -52,7 +63,7 @@ async fn execute_blocking_after_undeploy_returns_terminated(vx: Vertx) {
 async fn execute_blocking_is_fifo_by_default(vx: Vertx) {
     let order = Arc::new(Mutex::new(Vec::new()));
     let o = order.clone();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let (a, b, c) = (o.clone(), o.clone(), o.clone());
             let (x, y, z) = tokio::join!(
@@ -85,17 +96,20 @@ async fn unordered_blocking_obeys_configured_limit_and_can_overlap(vx: Vertx) {
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let m = maximum.clone();
-    vx.deploy(move |_| {
+    vx.deploy(move || {
         local(move |ctx| async move {
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let jobs = (0..8).map(|_| {
                 let (a, m, b) = (active.clone(), m.clone(), barrier.clone());
                 let ctx = &ctx;
                 async move {
-                    let id = ctx.id();
+                    let id = ctx.current_execution().unwrap().context_id;
                     let operation = move || {
-                        assert_eq!(Context::current().unwrap().id(), id);
-                        assert!(Context::is_on_worker_thread());
+                        assert_eq!(ExecutionInfo::current().unwrap().context_id, id);
+                        assert!(matches!(
+                            ExecutionInfo::current().map(|info| info.thread),
+                            Some(ExecutorThread::Worker)
+                        ));
                         let n = a.fetch_add(1, Ordering::SeqCst) + 1;
                         m.fetch_max(n, Ordering::SeqCst);
                         b.wait();
@@ -127,7 +141,7 @@ async fn started_blocking_task_is_not_reported_as_aborted() {
     let (started_tx, started_rx) = oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let id = vx
-        .deploy(move |_| {
+        .deploy(move || {
             local(move |ctx| async move {
                 let c = ctx.clone();
                 ctx.spawn_local(async move {
@@ -145,7 +159,7 @@ async fn started_blocking_task_is_not_reported_as_aborted() {
         .unwrap();
     started_rx.await.unwrap();
     assert!(matches!(
-        vx.undeploy(id).await,
+        id.stop().await,
         Err(VertxError::ShutdownTimeout(_))
     ));
     release_tx.send(()).unwrap();
@@ -159,41 +173,53 @@ async fn queued_blocking_operation_is_skipped_after_scope_cancellation() {
         .worker_threads(1)
         .build()
         .unwrap();
-    let (id, ctx) = capture(&vx).await;
+    let (deployment, _) = capture(&vx).await;
     let (entered, started) = oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
-    let first = ctx.execute_blocking_unordered(move || {
-        entered.send(()).ok();
-        wait.recv().unwrap();
-        42
-    });
-    tokio::pin!(first);
-    assert!(futures::poll!(&mut first).is_pending());
+    let vertx = vx.handle();
+    let first = deployment
+        .spawn(async move {
+            vertx
+                .execute_blocking_unordered(move || {
+                    entered.send(()).ok();
+                    wait.recv().unwrap();
+                    42
+                })
+                .await
+        })
+        .unwrap();
     started.await.unwrap();
     let executed = Arc::new(AtomicUsize::new(0));
     let count = executed.clone();
     let dropped = Arc::new(AtomicUsize::new(0));
     let probe = WorkerDropProbe {
-        id: ctx.deployment_id(),
+        id: deployment.id(),
         dropped: dropped.clone(),
         panic: false,
     };
-    let queued = ctx.execute_blocking_unordered(move || {
-        let _probe = probe;
-        count.fetch_add(1, Ordering::SeqCst);
-    });
-    tokio::pin!(queued);
-    assert!(futures::poll!(&mut queued).is_pending());
-    let undeploy = vx.undeploy(id);
-    tokio::pin!(undeploy);
-    assert!(futures::poll!(&mut undeploy).is_pending());
+    let vertx = vx.handle();
+    let (submitted, ready) = oneshot::channel();
+    let queued = deployment
+        .spawn(async move {
+            let job = vertx.execute_blocking_unordered(move || {
+                let _probe = probe;
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            tokio::pin!(job);
+            assert!(futures::poll!(&mut job).is_pending());
+            submitted.send(()).unwrap();
+            job.await
+        })
+        .unwrap();
+    ready.await.unwrap();
+    deployment.request_stop();
     release.send(()).unwrap();
     assert_eq!(first.await.unwrap(), 42);
     assert!(matches!(
         queued.await,
-        Err(VertxError::DeploymentTerminated(_))
+        Err(VertxError::DeploymentTerminated(id)) if id == deployment.id()
     ));
-    undeploy.await.unwrap();
+    deployment.wait_stopped().await.unwrap();
     assert_eq!(executed.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     vx.close().await.unwrap();

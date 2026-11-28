@@ -3,7 +3,7 @@
 //! 运行：RUST_LOG=vertx_rs=debug cargo run --example pipeline
 //! LOG_FORMAT=json 输出结构化日志；预期：五个校验和，close 后 active_tasks=0。
 //! Source 使用 pipe_to，Sink 使用 Stream::take 定义有限传输；小容量队列向上游传递背压。
-//! ordered 只保证同来源 Context 的 blocking FIFO，不保证全流水线输出顺序。
+//! ordered 只保证同来源 VertxHandle 的 blocking FIFO，不保证全流水线输出顺序。
 //! handler 等待上一条处理结束后才消费下一条；增加消费者才会增加消息并行度。
 //! deploy_with 用同一份强类型配置部署两个 Hasher；结果按 seed 排序后展示。
 mod support;
@@ -12,13 +12,13 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use vertx_rs::{
-    ConsumerOptions, Context, DeploymentOptions, DiagnosticsOptions, Result, Verticle, Vertx,
-    VertxError, WorkerVerticle, pipe_to,
+    ConsumerOptions, DeploymentOptions, DiagnosticsOptions, Result, Verticle, Vertx, VertxError,
+    VertxHandle, WorkerVerticle, pipe_to,
 };
 struct Source;
 impl Verticle for Source {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
-        let bus = ctx.event_bus();
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
+        let bus = ctx.event_bus()?;
         // Finite source: EOF flushes and closes only this address-bound adapter.
         let source = futures::stream::iter((1..=5u64).map(Ok));
         let handle = ctx.spawn_local(pipe_to(source, bus.sink("hash")?))?;
@@ -39,9 +39,9 @@ struct Hasher {
     salt: u64,
 }
 impl Verticle for Hasher {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let salt = self.salt;
-        ctx.event_bus()
+        ctx.event_bus()?
             .consumer_with::<u64>("hash", ConsumerOptions::new().with_capacity(1))?
             .handler(async move |env| {
                 let seed = env.into_body();
@@ -51,7 +51,7 @@ impl Verticle for Hasher {
                     ctx.execute_blocking_unordered(move || checksum(seed ^ salt)),
                 )?;
                 assert_eq!(ordered, unordered);
-                ctx.event_bus().send("sink", (seed, ordered)).await
+                ctx.event_bus()?.send("sink", (seed, ordered)).await
             })?;
         Ok(())
     }
@@ -60,10 +60,10 @@ struct Sink {
     done: Option<oneshot::Sender<Vec<(u64, u64)>>>,
 }
 impl WorkerVerticle for Sink {
-    async fn start(&mut self, ctx: Context) -> Result<()> {
+    async fn start(&mut self, ctx: VertxHandle) -> Result<()> {
         let done = self.done.take().expect("start is called once");
         let consumer = ctx
-            .event_bus()
+            .event_bus()?
             .consumer_with::<(u64, u64)>("sink", ConsumerOptions::new().with_capacity(1))?;
         ctx.spawn(async move {
             // EventBus has no natural EOF: take(5) defines this operation's end.
@@ -81,12 +81,12 @@ impl WorkerVerticle for Sink {
 }
 async fn run(vx: &Vertx) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    vx.deploy_worker(|_| Sink { done: Some(tx) }).await?;
+    vx.deploy_worker(|| Sink { done: Some(tx) }).await?;
     let config = HashConfig { salt: 0x5a5a };
     let salt = config.salt;
     let hashers = vx
         .deploy_with(
-            |_, config| Hasher { salt: config.salt },
+            |config| Hasher { salt: config.salt },
             DeploymentOptions::new()
                 .instances(NonZeroUsize::new(2).unwrap())
                 .config(config),
@@ -97,7 +97,7 @@ async fn run(vx: &Vertx) -> Result<()> {
         "deployed {} hashers with shared salt={salt:#x}",
         hashers.len()
     );
-    vx.deploy(|_| Source).await?;
+    vx.deploy(|| Source).await?;
     print_snapshot("running", vx);
     let mut results = tokio::time::timeout(Duration::from_secs(2), rx)
         .await

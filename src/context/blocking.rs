@@ -65,7 +65,6 @@ struct BlockingTask {
     dispatch: tracing::Dispatch,
     span: tracing::Span,
     scope_token: TaskTrackerToken,
-    instance_token: TaskTrackerToken,
 }
 
 impl BlockingTask {
@@ -73,22 +72,19 @@ impl BlockingTask {
         let in_stop_callback = ctx.stopping
             && Context::current().is_some_and(|current| current.stopping && current.same(ctx));
         // Track queued work before the first await.
-        let scope_token = ctx
-            .scope()
-            .admit_blocking(&ctx.data.lifetime.cancel, in_stop_callback)?;
-        let instance_token = ctx.data.lifetime.blocking.token();
+        let scope_token = ctx.scope().admit_blocking(in_stop_callback)?;
         let diagnostics = ctx.diagnostics();
         let record = diagnostics.task(
             TaskId::next(),
             ctx.id(),
-            ctx.scope().deployment,
+            ctx.deployment_id(),
             TaskStage::BlockingOrderedWait,
         );
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = if diagnostics.options.enabled {
             tracing::info_span!(
                 "blocking_task", instance_id = diagnostics.instance,
-                deployment_id = %ctx.scope().deployment, context_id = %ctx.id(), task_id = %record.id
+                deployment_id = ctx.deployment_id().as_ref().map(tracing::field::display), context_id = %ctx.id(), task_id = %record.id
             )
         } else {
             tracing::Span::none()
@@ -99,7 +95,6 @@ impl BlockingTask {
             dispatch,
             span,
             scope_token,
-            instance_token,
         })
     }
 
@@ -110,7 +105,7 @@ impl BlockingTask {
         let order = if ordered {
             Some(tokio::select! { biased;
                 _ = ctx.scope().cancel.cancelled(), if !ctx.stopping => {
-                    return Err(VertxError::DeploymentTerminated(ctx.scope().deployment));
+                    return Err(ctx.scope().terminated());
                 }
                 guard = ctx.data.blocking_order_lock.clone().lock_owned() => guard,
             })
@@ -138,7 +133,6 @@ impl BlockingTask {
             dispatch,
             span,
             scope_token,
-            instance_token,
         } = self;
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
         let _span = span.enter();
@@ -155,7 +149,7 @@ impl BlockingTask {
         );
 
         // Keep tracking and FIFO ownership until the closure and diagnostics are finished.
-        let _tracking_and_order = (scope_token, instance_token, order);
+        let _tracking_and_order = (scope_token, order);
         let mut blocking_context = ctx.clone();
         blocking_context.stopping = false;
         let _context = blocking_context.enter();
@@ -175,7 +169,7 @@ fn call_blocking<R>(ctx: &Context, f: impl FnOnce() -> R) -> Result<R> {
         if !ctx.stopping && ctx.scope().cancel.is_cancelled() {
             // Drop skipped work under the same Context and panic boundary.
             drop(f);
-            Err(VertxError::DeploymentTerminated(ctx.scope().deployment))
+            Err(ctx.scope().terminated())
         } else {
             Ok(f())
         }

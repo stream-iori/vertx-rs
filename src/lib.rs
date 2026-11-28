@@ -9,6 +9,8 @@ mod diagnostics;
 mod error;
 mod eventbus;
 mod eventloop;
+mod execution_info;
+mod scope;
 mod streams;
 mod task;
 mod tcp;
@@ -18,8 +20,8 @@ mod verticle;
 mod vertx;
 mod worker_pool;
 
-pub use context::{Context, ContextId};
-pub use deployment::DeploymentId;
+pub use context::ContextId;
+pub use deployment::{Deployment, DeploymentId};
 pub use deployment_options::DeploymentOptions;
 pub use diagnostics::{
     DeploymentSnapshot, DiagnosticsOptions, DiagnosticsSnapshot, QueueSnapshot, TaskSnapshot,
@@ -31,10 +33,11 @@ pub use eventbus::{
     MessageSink, ReplyHandle, RequestAddress, RequestConsumer, RequestOptions, TypedReplyHandle,
 };
 pub use eventloop::EventLoopId;
+pub use execution_info::{ExecutionInfo, ExecutorThread};
 pub use streams::{PipeOptions, pipe_to, pipe_to_with};
 pub use task::{TaskAbortHandle, TaskHandle, TaskId};
 pub use tcp::{TcpConnection, TcpIncoming, TcpServer, TcpServerOptions};
 pub use threading_model::ThreadingModel;
 pub use timer::{Periodic, Timer};
 pub use verticle::{Verticle, WorkerVerticle};
-pub use vertx::{Vertx, VertxBuilder};
+pub use vertx::{Vertx, VertxBuilder, VertxHandle};

@@ -1,5 +1,6 @@
-use crate::deployment::{ResourceId, ResourceRegistration};
-use crate::{Context, DeploymentId, Result, VertxError};
+use crate::context::Context;
+use crate::scope::{ResourceId, ResourceRegistration, ScopeOwner};
+use crate::{Result, VertxError};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::poll_fn;
@@ -16,9 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
-/// A deployment's registration on a shared TCP listener.
+/// A scope's registration on a shared TCP listener.
 ///
-/// Dropping it unregisters this deployment from the address. An accepted
+/// Dropping it unregisters this scope from the address. An accepted
 /// stream belongs to its caller and can be owned by a managed task.
 ///
 /// ```compile_fail,E0277
@@ -43,7 +44,7 @@ impl Context {
     /// on the same address returns [`VertxError::InvalidOptions`].
     /// Port zero requests a new address. Use [`TcpIncoming::local_addr`] to
     /// get the address that other deployments can register on.
-    pub async fn listen_tcp(&self, addr: SocketAddr) -> Result<TcpIncoming> {
+    pub(crate) async fn listen_tcp(&self, addr: SocketAddr) -> Result<TcpIncoming> {
         let (incoming, _) = open_tcp(self, addr, ListenMode::Raw).await?;
         Ok(incoming)
     }
@@ -152,7 +153,7 @@ enum Slot {
 
 struct OpenListener {
     bound: Arc<BoundListener>,
-    members: HashMap<DeploymentId, Member>,
+    members: HashMap<ScopeOwner, Member>,
     budget: Option<Arc<PortBudget>>,
 }
 
@@ -213,7 +214,7 @@ struct Member {
 pub(crate) struct ListenerRegistration {
     registry: Weak<Mutex<State>>,
     addr: SocketAddr,
-    deployment: DeploymentId,
+    owner: ScopeOwner,
     id: ResourceId,
 }
 
@@ -332,7 +333,7 @@ impl TcpListeners {
         let registration = ListenerRegistration {
             registry: Arc::downgrade(&self.state),
             addr,
-            deployment: scope.deployment,
+            owner: scope.owner,
             id: ResourceId::next(),
         };
         let new_member = || Member {
@@ -345,9 +346,9 @@ impl TcpListeners {
                     if open.budget.as_ref().map(|budget| budget.limit) != limit {
                         return Err(incompatible(addr));
                     }
-                    let Entry::Vacant(member) = open.members.entry(scope.deployment) else {
+                    let Entry::Vacant(member) = open.members.entry(scope.owner) else {
                         return Err(VertxError::InvalidOptions(format!(
-                            "deployment already listens on {addr}"
+                            "scope already listens on {addr}"
                         )));
                     };
                     member.insert(new_member());
@@ -371,7 +372,7 @@ impl TcpListeners {
                 });
                 entry.insert(Slot::Open(OpenListener {
                     bound,
-                    members: HashMap::from([(scope.deployment, new_member())]),
+                    members: HashMap::from([(scope.owner, new_member())]),
                     budget: budget.clone(),
                 }));
                 if let Some(budget) = &budget {
@@ -406,12 +407,12 @@ impl TcpListeners {
             Some(Slot::Open(open))
                 if open
                     .members
-                    .get(&registration.deployment)
+                    .get(&registration.owner)
                     .is_some_and(|member| member.id == registration.id) =>
             {
                 Ok(open.bound.clone())
             }
-            _ => Err(VertxError::DeploymentTerminated(ctx.scope().deployment)),
+            _ => Err(ctx.scope().terminated()),
         }
     }
 
@@ -432,7 +433,7 @@ impl ListenerRegistration {
                     _ => None,
                 };
             };
-            let member = match open.members.entry(self.deployment) {
+            let member = match open.members.entry(self.owner) {
                 Entry::Occupied(entry) if entry.get().id == self.id => entry.remove(),
                 _ => return None,
             };
@@ -474,7 +475,7 @@ fn stopped(ctx: &Context) -> VertxError {
     if ctx.instance_admission_closed() {
         VertxError::VertxClosed
     } else {
-        VertxError::DeploymentTerminated(ctx.scope().deployment)
+        ctx.scope().terminated()
     }
 }
 
