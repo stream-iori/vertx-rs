@@ -70,7 +70,8 @@ async fn verticle_pinned_to_single_thread(vx: Vertx) {
                     samples.lock().unwrap().push(std::thread::current().id());
                     count.set(count.get() + 1);
                     env.reply(count.get())
-                })
+                })?;
+            Ok(())
         }
         async fn stop(&mut self, _: Context) -> Result<()> {
             tokio::task::yield_now().await;
@@ -123,7 +124,8 @@ async fn verticle_can_hold_non_send_state_directly(vx: Vertx) {
                     count.set(count.get() + 1);
                     let n = count.get();
                     env.reply(n)
-                })
+                })?;
+            Ok(())
         })
     })
     .await
@@ -224,7 +226,8 @@ async fn two_contexts_on_one_event_loop_never_leak_identity() {
                             assert_eq!(Context::current().unwrap().deployment_id(), id);
                         }
                         env.reply(id)
-                    })
+                    })?;
+                Ok(())
             })
         })
         .await

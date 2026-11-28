@@ -6,7 +6,7 @@
 地址路由、投递、消费和队列各自在对应子模块实现。
 
 ```text
-address → Route { TypeId, subscribers, round-robin cursor }
+address → Route { protocol, subscribers, round-robin cursor }
                        ↓
              每消费者 mpsc 队列，默认容量 256，可单独配置
                        ↓
@@ -26,6 +26,8 @@ address → Route { TypeId, subscribers, round-robin cursor }
 | sink / sink_with | 地址绑定的 MessageSink<T>，实现 futures::Sink；后者配置固定 headers |
 | request / request_with | 返回响应体；默认 30 秒；一个 deadline 覆盖入队和回复 |
 | request_message / request_message_with | 返回完整响应 Envelope，可读取响应 headers |
+| RequestAddress<Req, Resp> | 共享固定地址及请求和回复类型。通过地址本身请求和订阅 |
+| handler / handler_worker | 返回 TaskHandle<()>，可以单独取消该订阅并等待清理 |
 | reply / reply_with | 一次性响应，后者支持响应 headers |
 | fail(code, message) | 返回 RecipientFailure |
 | into_parts | 拆出 body、Headers 和可跨任务移动的 ReplyHandle |
@@ -34,6 +36,24 @@ address → Route { TypeId, subscribers, round-robin cursor }
 请求取消或超时后，已入队的消息仍可被消费。迟到 reply 返回 `ReplyClosed`。
 Headers 按插入顺序保存，键大小写敏感且可重复。`get` 返回第一个值的 `&str`，`get_all` 遍历所有匹配的值。
 
+## 固定请求地址
+
+```rust
+use vertx_rs::RequestAddress;
+
+const LOOKUP: RequestAddress<u64, String> = RequestAddress::new("lookup");
+```
+
+调用方用 `LOOKUP.request(&bus, id).await` 获取 `String`，需要响应 headers 时用 `LOOKUP.request_message(&bus, id)`。
+服务端用 `LOOKUP.consumer(&ctx.event_bus())?` 取得 `RequestConsumer`，可拉取 `IncomingRequest<u64, String>` 或启动 handler。
+`reply` 消耗请求并接受 `String`。需要延迟回复时，`into_parts` 可拆出保留同一类型约束的 `TypedReplyHandle<String>`。
+
+首个存活的订阅确定地址协议。普通字符串地址记录消息体类型，固定请求地址同时记录请求和回复类型。
+在同一实例中，把同一个字符串用于两种入口，或者独立声明了不同请求或回复类型，都会在注册或入队前得到 `TypeMismatch`。
+最后一个订阅注销后可以重新绑定地址。队列和请求超时使用同一套规则，等待超时后已入队的消息仍可被消费。
+
+字节协议的编码和解码可以由应用完成。可运行示例把 `Vec<u8>` 作为普通消息体，并显式检查字节长度。 [eventbus_codec](examples.md#eventbus_codec-字节编解码)
+
 ## 归属与竞态
 
 - Context::event_bus 注册始终绑定该 Context。
@@ -41,6 +61,7 @@ Headers 按插入顺序保存，键大小写敏感且可重复。`get` 返回第
 - 外部 unbound Consumer 使用 recv；需要 handler 时在所属 Context 内创建 Consumer。
 - `handler` 在所属 EventLoop 逐条等待异步闭包完成。用 `async move |env|` 把状态交给回调，同一个回调可反复调用，也可以跨 `.await` 可变借用自己持有的 `!Send` 状态。
 - `handler_worker` 使用 `FnMut -> Future`，闭包和返回的 Future 都要求 `Send`。两个入口都校验调用 Context。
+- 丢弃 handler 返回的 `TaskHandle` 会分离等待者，部署仍负责管理任务。调用 `abort()` 后等待句柄，确认当前处理 Future 已析构且订阅已注销。取消在执行器取得执行权后生效。
 - EventBus 路由表拥有订阅和队列。绑定消费者在部署作用域登记地址和注册 ID，生命周期可以按登记准确注销。
 - 绑定部署时，在同一次准入内写入路由和作用域登记。进入 Stopping 后拒绝新订阅。
 - 撤销部署只处理属于它的登记。关闭 EventBus 清除所有路由，包括框架外的注册。发送始终按地址查表。

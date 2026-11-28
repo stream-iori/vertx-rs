@@ -16,22 +16,41 @@ struct Subscription {
 }
 
 struct Route {
-    kind: TypeId,
+    kind: RouteKind,
     subscribers: Vec<Subscription>,
     cursor: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RouteKind {
+    Message(TypeId),
+    Request { body: TypeId, reply: TypeId },
+}
+
+impl RouteKind {
+    pub(super) fn message<T: 'static>() -> Self {
+        Self::Message(TypeId::of::<T>())
+    }
+
+    pub(super) fn request<T: 'static, R: 'static>() -> Self {
+        Self::Request {
+            body: TypeId::of::<T>(),
+            reply: TypeId::of::<R>(),
+        }
+    }
+}
+
 impl Route {
-    fn new<T: 'static>() -> Self {
+    fn new(kind: RouteKind) -> Self {
         Self {
-            kind: TypeId::of::<T>(),
+            kind,
             subscribers: Vec::new(),
             cursor: 0,
         }
     }
 
-    fn check_type<T: 'static>(&self, address: &str) -> Result<()> {
-        if self.kind == TypeId::of::<T>() {
+    fn check_kind(&self, address: &str, kind: RouteKind) -> Result<()> {
+        if self.kind == kind {
             Ok(())
         } else {
             Err(VertxError::TypeMismatch(address.into()))
@@ -94,9 +113,10 @@ impl Router {
         }
     }
 
-    pub(super) fn register<T: 'static>(
+    pub(super) fn register(
         self: &Arc<Self>,
         address: &str,
+        kind: RouteKind,
         owner: Option<SubscriptionOwner>,
         cancel: CancellationToken,
         capacity: usize,
@@ -107,8 +127,8 @@ impl Router {
         let mut route = self
             .routes
             .entry(address.into())
-            .or_insert_with(Route::new::<T>);
-        route.check_type::<T>(address)?;
+            .or_insert_with(|| Route::new(kind));
+        route.check_kind(address, kind)?;
         let stats = self.diagnostics.register_queue(
             id.0,
             address,
@@ -182,13 +202,13 @@ impl Router {
         self.diagnostics.unregister_queue(sub.id.0);
     }
 
-    pub(super) fn select<T: 'static>(&self, address: &str) -> Result<QueueSender> {
+    pub(super) fn select(&self, address: &str, kind: RouteKind) -> Result<QueueSender> {
         self.ensure_open()?;
         let mut route = self
             .routes
             .get_mut(address)
             .ok_or_else(|| VertxError::NoConsumer(address.into()))?;
-        route.check_type::<T>(address)?;
+        route.check_kind(address, kind)?;
         let index = route.cursor % route.subscribers.len();
         route.cursor = route.cursor.wrapping_add(1);
         Ok(route.subscribers[index].sender.clone())
@@ -199,7 +219,7 @@ impl Router {
         let Some(route) = self.routes.get(address) else {
             return Ok(Vec::new());
         };
-        route.check_type::<T>(address)?;
+        route.check_kind(address, RouteKind::message::<T>())?;
         Ok(route
             .subscribers
             .iter()

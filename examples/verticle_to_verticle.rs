@@ -4,14 +4,21 @@
 //! LOG_FORMAT=json 输出 JSON；预期：HELLO、VERTX、RUST，以及 join_all 的业务失败。
 //! try_join_all 遇错提前返回，join_all 保留每个结果，select_ok 等第一个成功。
 //! 组合器丢弃普通 Future 会停止继续 poll；不会撤回已入队消息。
-//! 实际演示丢弃 TaskHandle 后继续运行、abort 后等待析构、undeploy 后路由移除。
+//! 实际演示丢弃 TaskHandle 后继续运行，以及单独取消一个类型化 handler。
 //! 未获选服务的迟到回复可能返回 ReplyClosed；服务显式处理这个预期结果。
 mod support;
 use futures::FutureExt;
 use futures::future::{join_all, select_ok, try_join_all};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use vertx_rs::{Context, RequestOptions, Result, Verticle, Vertx, VertxError};
+use vertx_rs::{
+    Context, RequestAddress, RequestOptions, Result, TaskHandle, Verticle, Vertx, VertxError,
+};
+
+const UPPER: RequestAddress<String, String> = RequestAddress::new("upper");
+const REJECT: RequestAddress<String, String> = RequestAddress::new("reject");
+const CALLER: RequestAddress<String, String> = RequestAddress::new("caller");
+
 fn allow_late_reply(result: Result<()>) -> Result<()> {
     match result {
         Err(VertxError::ReplyClosed) => {
@@ -24,46 +31,46 @@ fn allow_late_reply(result: Result<()>) -> Result<()> {
 struct Upper;
 impl Verticle for Upper {
     async fn start(&mut self, ctx: Context) -> Result<()> {
-        ctx.event_bus()
-            .consumer::<String>("upper")?
-            .handler(async |env| {
-                let response = env.body().to_uppercase();
-                allow_late_reply(env.reply(response))
-            })
+        UPPER.consumer(&ctx.event_bus())?.handler(async |env| {
+            let response = env.body().to_uppercase();
+            allow_late_reply(env.reply(response))
+        })?;
+        Ok(())
     }
 }
 struct Reject;
 impl Verticle for Reject {
     async fn start(&mut self, ctx: Context) -> Result<()> {
-        ctx.event_bus()
-            .consumer::<String>("reject")?
-            .handler(async |env| allow_late_reply(env.fail(503, "service unavailable")))
+        REJECT
+            .consumer(&ctx.event_bus())?
+            .handler(async |env| allow_late_reply(env.fail(503, "service unavailable")))?;
+        Ok(())
     }
 }
 struct Caller {
-    context: Option<oneshot::Sender<Context>>,
+    ready: Option<oneshot::Sender<(Context, TaskHandle<()>)>>,
 }
 impl Verticle for Caller {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         let bus = ctx.event_bus();
-        bus.consumer::<String>("caller")?
-            .handler(async move |env| {
-                let candidates = ["reject", "upper"].into_iter().map(|address| {
-                    bus.request_with::<_, String>(
-                        address,
+        let handler = CALLER.consumer(&bus)?.handler(async move |env| {
+            let candidates = [&REJECT, &UPPER].into_iter().map(|address| {
+                address
+                    .request_with(
+                        &bus,
                         env.body().clone(),
                         RequestOptions::new().with_timeout(Duration::from_secs(1)),
                     )
                     .boxed()
-                });
-                let (response, remaining) = select_ok(candidates).await?;
-                drop(remaining);
-                env.reply(response)
-            })?;
-        self.context
+            });
+            let (response, remaining) = select_ok(candidates).await?;
+            drop(remaining);
+            env.reply(response)
+        })?;
+        self.ready
             .take()
             .expect("start is called once")
-            .send(ctx)
+            .send((ctx, handler))
             .map_err(|_| VertxError::ReplyClosed)?;
         Ok(())
     }
@@ -118,18 +125,14 @@ async fn run(vx: &Vertx) -> Result<()> {
     vx.deploy(|_| Upper).await?;
     vx.deploy(|_| Reject).await?;
     let (ready, context) = oneshot::channel();
-    let caller = vx
-        .deploy(|_| Caller {
-            context: Some(ready),
-        })
-        .await?;
-    let ctx = context.await.map_err(|_| VertxError::ReplyClosed)?;
+    let caller = vx.deploy(|_| Caller { ready: Some(ready) }).await?;
+    let (ctx, caller_handler) = context.await.map_err(|_| VertxError::ReplyClosed)?;
     task_lifecycle(&ctx).await?;
     // 单个任务结束或取消都不会撤销 Caller，下面仍能处理业务请求。
     let bus = vx.event_bus();
     let responses = try_join_all(["hello", "vertx", "rust"].into_iter().map(|word| {
-        bus.request_with::<_, String>(
-            "caller",
+        CALLER.request_with(
+            &bus,
             word.to_owned(),
             RequestOptions::new().with_timeout(Duration::from_secs(1)),
         )
@@ -137,9 +140,9 @@ async fn run(vx: &Vertx) -> Result<()> {
     .await?;
     assert_eq!(responses, ["HELLO", "VERTX", "RUST"]);
     println!("all successful: {responses:?}");
-    let outcomes = join_all(["upper", "reject"].into_iter().map(|address| {
-        bus.request_with::<_, String>(
-            address,
+    let outcomes = join_all([&UPPER, &REJECT].into_iter().map(|address| {
+        address.request_with(
+            &bus,
             "example".to_owned(),
             RequestOptions::new().with_timeout(Duration::from_secs(1)),
         )
@@ -150,10 +153,20 @@ async fn run(vx: &Vertx) -> Result<()> {
         Err(VertxError::RecipientFailure { code: 503, .. })
     ));
     println!("all finished: {outcomes:?}");
-    vx.undeploy(caller).await?;
-    let after_stop: Result<String> = bus.request("caller", "after stop".to_owned()).await;
+    caller_handler.abort();
+    assert!(matches!(
+        caller_handler.await,
+        Err(VertxError::TaskCancelled)
+    ));
+    let after_stop = CALLER.request(&bus, "after stop".to_owned()).await;
     assert!(matches!(after_stop, Err(VertxError::NoConsumer(_))));
-    println!("caller undeployed; its route was removed");
+    assert!(ctx.accepts_work());
+    assert_eq!(
+        UPPER.request(&bus, "still running".to_owned()).await?,
+        "STILL RUNNING"
+    );
+    println!("caller handler cancelled; its deployment still accepts work");
+    vx.undeploy(caller).await?;
     Ok(())
 }
 

@@ -89,7 +89,8 @@ async fn exception_handler_receives_handler_errors(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<()>("error")?
-                .handler(async |_| Err(VertxError::Other("expected".into())))
+                .handler(async |_| Err(VertxError::Other("expected".into())))?;
+            Ok(())
         })
     })
     .await
@@ -130,7 +131,8 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
             worker(move |ctx| async move {
                 ctx.event_bus()
                     .consumer::<bool>("panic")?
-                    .handler_worker(handler)
+                    .handler_worker(handler)?;
+                Ok(())
             })
         })
         .await
@@ -138,7 +140,10 @@ async fn task_error_and_handler_panic_preserve_context_and_subscription(
     } else {
         vx.deploy(move |_| {
             local(move |ctx| async move {
-                ctx.event_bus().consumer::<bool>("panic")?.handler(handler)
+                ctx.event_bus()
+                    .consumer::<bool>("panic")?
+                    .handler(handler)?;
+                Ok(())
             })
         })
         .await
@@ -203,7 +208,8 @@ async fn context_exception_handler_can_clear_itself_without_deadlock(vx: Vertx) 
             });
             ctx.event_bus()
                 .consumer::<()>("fail")?
-                .handler(async |_| Err(VertxError::Other("error".into())))
+                .handler(async |_| Err(VertxError::Other("error".into())))?;
+            Ok(())
         })
     })
     .await

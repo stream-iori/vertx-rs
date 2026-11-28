@@ -16,10 +16,12 @@ async fn verticles_communicate_through_their_bound_buses(vx: Vertx) {
     vx.deploy(|_| {
         local(|ctx| async move {
             let bus = ctx.event_bus();
-            bus.consumer::<String>("caller")?.handler(async move |env| {
-                let response: String = bus.request("upstream", env.body().clone()).await?;
-                env.reply(response)
-            })
+            bus.consumer::<String>("caller")?
+                .handler(async move |env| {
+                    let response: String = bus.request("upstream", env.body().clone()).await?;
+                    env.reply(response)
+                })?;
+            Ok(())
         })
     })
     .await
@@ -204,7 +206,8 @@ async fn message_passing_between_handlers(vx: Vertx) {
             bus.consumer::<u32>("forward")?.handler(async move |env| {
                 let n: u32 = bus.request("double", *env.body()).await?;
                 env.reply(n)
-            })
+            })?;
+            Ok(())
         })
     })
     .await
@@ -232,7 +235,8 @@ async fn delivery_options_headers_round_trip(vx: Vertx) {
                         vec!["a", "b"]
                     );
                     env.reply_with(42u32, DeliveryOptions::new().header("reply", "yes"))
-                })
+                })?;
+            Ok(())
         })
     })
     .await
@@ -284,7 +288,8 @@ async fn recipient_failure_and_late_reply_are_explicit(vx: Vertx) {
         local(|ctx| async move {
             ctx.event_bus()
                 .consumer::<()>("business")?
-                .handler(async |env| env.fail(409, "conflict"))
+                .handler(async |env| env.fail(409, "conflict"))?;
+            Ok(())
         })
     })
     .await
@@ -404,7 +409,8 @@ async fn consumer_waits_for_message_future_completion_before_next_message() {
                         done.take().unwrap().send(values).unwrap();
                         Ok(())
                     }
-                })
+                })?;
+            Ok(())
         })
     })
     .await

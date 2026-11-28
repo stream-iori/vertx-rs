@@ -10,6 +10,7 @@
 | start/stop 就绪与关闭 | 异步钩子；框架增加受管任务取消及明确的等待超时 |
 | executeBlocking ordered | 默认有序；与 Worker Future 共用固定 OS 线程池 |
 | send/publish/request/reply/fail | 提供；send 的有界背压和 pull Consumer 是 Rust 扩展 |
+| 固定请求地址 | 共享 RequestAddress，在编译期校验请求与回复类型 |
 | Consumer 注册时点 | consumer 调用立即注册，支持 recv；与 Java 在 handler 注册后生效有差异 |
 | ReadStream / WriteStream / Pipe | 使用 futures::Stream / Sink 和 pipe_to 表达拉取、背压、结束及失败；无需另造 handler/pause/fetch 门面 |
 | TCP 共享监听 | 同实例内多部署共享同一绑定地址。普通 Verticle 按等待顺序领取原生 Tokio TCP 连接 |

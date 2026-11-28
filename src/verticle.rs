@@ -14,7 +14,8 @@ use std::future::{Future, ready};
 ///             tokio::task::yield_now().await;
 ///             let greeting = format!("{prefix} {}", message.body());
 ///             message.reply(greeting)
-///         })
+///         })?;
+///         Ok(())
 ///     }
 /// }
 /// ```

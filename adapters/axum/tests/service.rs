@@ -21,7 +21,8 @@ impl Verticle for Echo {
     async fn start(&mut self, ctx: Context) -> Result<()> {
         ctx.event_bus()
             .consumer::<()>("work")?
-            .handler(async |message| message.reply("pong".to_owned()))
+            .handler(async |message| message.reply("pong".to_owned()))?;
+        Ok(())
     }
 }
 

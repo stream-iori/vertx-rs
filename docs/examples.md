@@ -16,14 +16,15 @@
 |---|---|---|
 | [ping_pong](../examples/ping_pong.rs) | 请求服务 + 周期心跳 + 两个观察者 | request/reply/fail、headers、publish、periodic |
 | [pipeline](../examples/pipeline.rs) | 有限数据源 → 两个校验节点 → Worker 汇总 | deploy_with、强类型配置、pipe_to、Stream、blocking、diagnostics |
-| [verticle_to_verticle](../examples/verticle_to_verticle.rs) | 服务组合 + 受管任务 + 撤销 | try_join_all、join_all、select_ok、TaskHandle、abort、undeploy |
+| [verticle_to_verticle](../examples/verticle_to_verticle.rs) | 类型化服务组合与独立取消 handler | RequestAddress、try_join_all、join_all、select_ok、TaskHandle |
 
 ### 消息与背压
 
 | 示例 | 场景 | 重点 API |
 |---|---|---|
 | [bounded_mailbox](../examples/bounded_mailbox.rs) | 满队列下三种发送策略 | ConsumerOptions、try_send、send、publish、diagnostics |
-| [deferred_reply](../examples/deferred_reply.rs) | 把响应能力交给后台任务 | into_parts、ReplyHandle、spawn_local、reply_with |
+| [deferred_reply](../examples/deferred_reply.rs) | 把类型化回复能力交给后台任务 | into_parts、TypedReplyHandle、spawn_local、reply_with |
+| [eventbus_codec](../examples/eventbus_codec.rs) | 经由 EventBus 传输和校验字节 | Vec<u8>、to_be_bytes、from_be_bytes、fail |
 
 ### 生命周期与外部接入
 
@@ -54,6 +55,7 @@ cargo run --example deployment_rollback
 cargo run --example external_dispatch
 cargo run --example graceful_shutdown
 cargo run --example deferred_reply
+cargo run --example eventbus_codec
 cargo run --example error_handling
 cargo run --example tcp_shared_listener
 ```
@@ -130,7 +132,8 @@ main ──→ Caller ── select_ok ──→ Upper / Reject
 - 单个任务结束或取消后，Caller 继续处理请求，返回 `HELLO`、`VERTX`、`RUST`。
 - `try_join_all` 等待全部成功；`join_all` 同时保留 Upper 成功结果和 Reject 的业务失败。
 - Caller 使用 `select_ok` 等待第一个成功，显式丢弃剩余请求 Future；服务允许预期的迟到回复。
-- 从部署外部执行 undeploy，等待 stop 与清理；再次请求 Caller 得到 `NoConsumer`，确认路由已移除。
+- 用共享的 `RequestAddress` 声明三个服务的地址和响应类型，调用时由编译器推断返回类型。
+- 单独取消 Caller 的 handler 并等待结束，再次请求 Caller 得到 `NoConsumer`。此时 Caller 部署仍接收工作，最后从外部调用 undeploy。
 
 abort 只能在执行器重新取得执行权后生效，不能抢占同步死循环或中断已开始的 blocking 闭包。
 取消时序由 channel 握手控制，没有依赖 sleep 猜测任务是否已经执行。
@@ -198,15 +201,19 @@ gate 的发送端在失败或业务超时时被丢弃，也能解除 Worker 的�
 ```text
 三个请求 → handler.into_parts → 每请求一个受管任务
                                  → blocking 计算
-                                 → ReplyHandle.reply_with → 请求方
+                                 → TypedReplyHandle.reply_with → 请求方
 ```
 
-handler 显式拆出消息体、headers 和 ReplyHandle，校验请求具备响应通道及 `correlation-id`，
+handler 显式拆出消息体、headers 和 TypedReplyHandle，校验 `correlation-id`，
 再把工作交给 `spawn_local` 任务。任务通过共享 Worker 池做有限校验和计算，返回大写文本及校验和。
 使用 `request_message_with` 的调用方检查响应体和相同的关联 header；预期看到 `job-0` 至 `job-2` 的结果，输出顺序不固定。
 
 headers 不会自动传播。handler 自身仍然逐消息串行，并发来自应用主动派发受管任务；
 输入只有三个请求，本例不是一个无限并发、无限接收的后台任务服务。
+
+## eventbus_codec 字节编解码
+
+调用方把 `u32` 编码成四字节大端序的 `Vec<u8>`，handler 解码后将数值翻倍，再编码回复。示例断言 21 的回复解码为 42，并验证三字节的请求返回 `RecipientFailure`。编解码发生在应用层，EventBus 校验消息体类型并负责投递。
 
 ## error_handling：三种失败的不同去向
 

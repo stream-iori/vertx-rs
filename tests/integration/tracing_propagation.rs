@@ -313,7 +313,8 @@ async fn handler_destructor_uses_message_dispatch_even_when_consumer_has_another
                     send.take().unwrap().send(()).ok();
                     futures::future::pending::<()>().await;
                     Ok(())
-                })
+                })?;
+            Ok(())
         })
     })
     .with_subscriber(receiver.dispatch())
@@ -347,7 +348,8 @@ async fn message_span_names_receiving_context_separately_from_sender_ancestry(vx
                     assert_eq!(Context::current().unwrap().id(), id);
                     tracing::info!("receiver execution probe");
                     env.reply(())
-                })
+                })?;
+            Ok(())
         })
     })
     .with_subscriber(dispatch.clone())

@@ -102,7 +102,8 @@ pub(super) async fn echo(vx: &Vertx, address: &'static str) -> vertx_rs::Deploym
                 .handler(async |env| {
                     let body = env.body().clone();
                     env.reply(body)
-                })
+                })?;
+            Ok(())
         })
     })
     .await

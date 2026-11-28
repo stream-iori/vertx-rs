@@ -227,7 +227,8 @@ async fn stop_error_is_returned_and_resources_still_close(vx: Vertx) {
         async fn start(&mut self, ctx: Context) -> Result<()> {
             ctx.event_bus()
                 .consumer::<()>("bad-stop")?
-                .handler(async |_| Ok(()))
+                .handler(async |_| Ok(()))?;
+            Ok(())
         }
         async fn stop(&mut self, _: Context) -> Result<()> {
             Err(VertxError::Other("stop failed".into()))

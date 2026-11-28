@@ -26,7 +26,8 @@ async fn rc_refcell_shared_state_across_handlers(vx: Vertx) {
                 .handler(async move |env| {
                     let n = values.borrow().len();
                     env.reply(n)
-                })
+                })?;
+            Ok(())
         })
     })
     .await
@@ -57,7 +58,8 @@ async fn rc_cell_shared_scalar_across_handlers(vx: Vertx) {
                 .handler(async move |env| {
                     let n = value.get();
                     env.reply(n)
-                })
+                })?;
+            Ok(())
         })
     })
     .await
@@ -83,7 +85,8 @@ async fn arc_atomic_counter_shared_across_verticles(vx: Vertx) {
                     .handler(async move |env| {
                         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
                         env.reply(n)
-                    })
+                    })?;
+                Ok(())
             })
         })
         .await
@@ -114,7 +117,8 @@ async fn arc_immutable_snapshot_shared_across_verticles(vx: Vertx) {
                     .handler(async move |env| {
                         let values = (*snapshot).clone();
                         env.reply(values)
-                    })
+                    })?;
+                Ok(())
             })
         })
         .await

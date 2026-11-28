@@ -3,7 +3,7 @@ use super::queue::QueueState;
 use super::route::{Registration, SubscriptionRegistration};
 use crate::error::panic_error;
 use crate::task::TracedFuture;
-use crate::{Context, Envelope, Result, VertxError};
+use crate::{Context, Envelope, Result, TaskHandle, VertxError};
 use futures::stream::FusedStream;
 use futures::{FutureExt, Stream, StreamExt};
 use std::future::Future;
@@ -73,6 +73,7 @@ impl<T: Send + 'static> Consumer<T> {
     }
     /// Attach an async handler on its owning EventLoop. Messages are processed
     /// one at a time, so the handler can borrow its captured state across await.
+    /// Dropping the returned handle detaches it; abort and await it to stop this consumer.
     ///
     /// ```
     /// # use vertx_rs::{Context, Result, Verticle};
@@ -91,7 +92,7 @@ impl<T: Send + 'static> Consumer<T> {
     pub fn handler(
         mut self,
         mut handler: impl AsyncFnMut(Envelope<T>) -> Result<()> + 'static,
-    ) -> Result<()> {
+    ) -> Result<TaskHandle<()>> {
         let ctx = self.handler_context()?;
         ctx.ensure_current_event_loop_context()?;
         ctx.clone().spawn_local(async move {
@@ -99,10 +100,10 @@ impl<T: Send + 'static> Consumer<T> {
                 dispatch_message(&ctx, env.trace.clone(), async { handler(env).await }).await;
             }
             Ok(())
-        })?;
-        Ok(())
+        })
     }
-    /// Worker counterpart; the closure and its future must be Send.
+    /// Worker counterpart of [`Self::handler`]. Both the closure and its future
+    /// must be `Send`. The returned task handle has the same cancellation behavior.
     ///
     /// ```
     /// use vertx_rs::{Context, Result, WorkerVerticle};
@@ -112,15 +113,16 @@ impl<T: Send + 'static> Consumer<T> {
     ///         ctx.event_bus().consumer::<u32>("worker")?.handler_worker(|env| async move {
     ///             let answer = *env.body() * 2;
     ///             env.reply(answer)
-    ///         })
+    ///         })?;
+    ///         Ok(())
     ///     }
     /// }
     /// ```
     ///
     /// ```compile_fail,E0277
-    /// use vertx_rs::{Consumer, Result};
+    /// use vertx_rs::{Consumer, Result, TaskHandle};
     ///
-    /// fn register(consumer: Consumer<()>) -> Result<()> {
+    /// fn register(consumer: Consumer<()>) -> Result<TaskHandle<()>> {
     ///     consumer.handler_worker(|env| async move {
     ///         let value = std::rc::Rc::new(1u32);
     ///         tokio::task::yield_now().await;
@@ -128,7 +130,7 @@ impl<T: Send + 'static> Consumer<T> {
     ///     })
     /// }
     /// ```
-    pub fn handler_worker<F, Fut>(mut self, mut handler: F) -> Result<()>
+    pub fn handler_worker<F, Fut>(mut self, mut handler: F) -> Result<TaskHandle<()>>
     where
         F: FnMut(Envelope<T>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -143,8 +145,7 @@ impl<T: Send + 'static> Consumer<T> {
                 dispatch_message(&ctx, env.trace.clone(), async { handler(env).await }).await;
             }
             Ok(())
-        })?;
-        Ok(())
+        })
     }
 }
 
@@ -178,7 +179,7 @@ impl<T> Consumer<T> {
             ctx.scope().forget_resource(self.registration.id);
         }
     }
-    fn terminate(&mut self) {
+    pub(super) fn terminate(&mut self) {
         self.terminal = true;
         self.rx.close();
         self.unregister();

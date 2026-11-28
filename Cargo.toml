@@ -57,6 +57,10 @@ name = "deferred_reply"
 path = "examples/deferred_reply.rs"
 
 [[example]]
+name = "eventbus_codec"
+path = "examples/eventbus_codec.rs"
+
+[[example]]
 name = "error_handling"
 path = "examples/error_handling.rs"
 

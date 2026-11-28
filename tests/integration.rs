@@ -32,5 +32,7 @@ mod tcp_server;
 mod timers;
 #[path = "integration/tracing_propagation.rs"]
 mod tracing_propagation;
+#[path = "integration/typed_request.rs"]
+mod typed_request;
 #[path = "integration/worker.rs"]
 mod worker;

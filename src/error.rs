@@ -6,7 +6,7 @@ pub enum VertxError {
     /// No consumer was registered when the address was resolved.
     #[error("no consumer registered for address: {0}")]
     NoConsumer(String),
-    /// The body or reply type differs from the type expected at the address.
+    /// The address protocol, message body, or reply type differs from the expected one.
     #[error("message type mismatch on address: {0}")]
     TypeMismatch(String),
     /// The total request budget elapsed during admission or reply waiting.

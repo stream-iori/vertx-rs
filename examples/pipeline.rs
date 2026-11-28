@@ -52,7 +52,8 @@ impl Verticle for Hasher {
                 )?;
                 assert_eq!(ordered, unordered);
                 ctx.event_bus().send("sink", (seed, ordered)).await
-            })
+            })?;
+        Ok(())
     }
 }
 struct Sink {

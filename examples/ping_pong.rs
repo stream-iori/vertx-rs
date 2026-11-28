@@ -55,7 +55,8 @@ impl Verticle for Pinger {
                     format!("pong#{}", count.get()),
                     DeliveryOptions::new().header("served-by", ctx.id().to_string()),
                 )
-            })
+            })?;
+        Ok(())
     }
     async fn stop(&mut self, ctx: Context) -> Result<()> {
         println!(

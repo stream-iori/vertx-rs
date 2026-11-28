@@ -1,6 +1,6 @@
 use super::envelope::{ErasedEnvelope, MessageTrace};
 use super::queue::Reservation;
-use super::route::Router;
+use super::route::{RouteKind, Router};
 use super::{DeliveryOptions, EventBus, Headers};
 use crate::{Result, VertxError};
 use futures::Sink;
@@ -55,7 +55,9 @@ struct PendingSend {
 impl<T: Send + 'static> MessageSink<T> {
     fn pending_send(&mut self) -> Result<&mut PendingSend> {
         if self.pending.is_none() {
-            let sender = self.router.select::<T>(&self.address)?;
+            let sender = self
+                .router
+                .select(&self.address, RouteKind::message::<T>())?;
             let trace = MessageTrace::new(&self.router.diagnostics, &self.address, None);
             self.pending = Some(PendingSend {
                 reservation: sender.reserve(),

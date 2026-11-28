@@ -266,12 +266,13 @@ async fn deploy_with_instances_and_typed_config(vx: Vertx) {
         .deploy_with(
             |_, cfg: Arc<String>| {
                 local(move |ctx| async move {
-                    ctx.event_bus()
-                        .consumer::<String>("configured")?
-                        .handler(async move |env| {
+                    ctx.event_bus().consumer::<String>("configured")?.handler(
+                        async move |env| {
                             let body = format!("{}:{}", cfg, env.body());
                             env.reply(body)
-                        })
+                        },
+                    )?;
+                    Ok(())
                 })
             },
             DeploymentOptions::new()
@@ -428,7 +429,8 @@ async fn multi_instance_failure_rolls_back_successful_instances(vx: Vertx) {
             }
             ctx.event_bus()
                 .consumer::<()>("group")?
-                .handler(async |_| Ok(()))
+                .handler(async |_| Ok(()))?;
+            Ok(())
         }
 
         async fn stop(&mut self, _: Context) -> Result<()> {
@@ -495,7 +497,8 @@ async fn undeploy_waits_for_inflight_handler_to_be_dropped(vx: Vertx) {
                         let _guard = OnDrop(d.clone());
                         start.send(()).ok();
                         std::future::pending::<Result<()>>().await
-                    })
+                    })?;
+                Ok(())
             })
         })
         .await

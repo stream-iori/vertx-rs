@@ -1,5 +1,6 @@
 use super::envelope::{self, ErasedEnvelope, MessageTrace};
 use super::queue::QueueSender;
+use super::route::RouteKind;
 use super::{DeliveryOptions, Envelope, EventBus, Headers, RequestOptions};
 use crate::{Result, VertxError};
 use tokio::sync::oneshot;
@@ -62,7 +63,14 @@ impl EventBus {
         body: T,
         options: DeliveryOptions,
     ) -> Result<()> {
-        let (sender, envelope) = self.prepare(address, body, options.into_headers(), None, None)?;
+        let (sender, envelope) = self.prepare(
+            address,
+            RouteKind::message::<T>(),
+            body,
+            options.into_headers(),
+            None,
+            None,
+        )?;
         sender.send(envelope).await
     }
     /// Attempts immediate admission to one consumer.
@@ -77,7 +85,14 @@ impl EventBus {
         body: T,
         options: DeliveryOptions,
     ) -> Result<()> {
-        let (sender, envelope) = self.prepare(address, body, options.into_headers(), None, None)?;
+        let (sender, envelope) = self.prepare(
+            address,
+            RouteKind::message::<T>(),
+            body,
+            options.into_headers(),
+            None,
+            None,
+        )?;
         sender.try_reserve()?.send(envelope)
     }
     /// Waits for a typed reply; one default 30-second timeout covers admission and reply.
@@ -123,9 +138,20 @@ impl EventBus {
         body: T,
         options: RequestOptions,
     ) -> Result<Envelope<R>> {
+        self.request_for(address, RouteKind::message::<T>(), body, options)
+            .await
+    }
+
+    pub(super) async fn request_for<T: Send + 'static, R: Send + 'static>(
+        &self,
+        address: &str,
+        kind: RouteKind,
+        body: T,
+        options: RequestOptions,
+    ) -> Result<Envelope<R>> {
         let request_id = envelope::next_message_id();
         let timeout = options.timeout();
-        let request = self.request_reply(request_id, address, body, options.into_headers());
+        let request = self.request_reply(request_id, address, kind, body, options.into_headers());
         tokio::time::timeout(timeout, request).await.map_err(|_| {
             let diagnostics = &self.router().diagnostics;
             diagnostics.timeout();
@@ -147,12 +173,19 @@ impl EventBus {
         &self,
         request_id: u64,
         address: &str,
+        kind: RouteKind,
         body: T,
         headers: Headers,
     ) -> Result<Envelope<R>> {
         let (reply_to, reply) = oneshot::channel();
-        let (sender, envelope) =
-            self.prepare(address, body, headers, Some(reply_to), Some(request_id))?;
+        let (sender, envelope) = self.prepare(
+            address,
+            kind,
+            body,
+            headers,
+            Some(reply_to),
+            Some(request_id),
+        )?;
         sender.send(envelope).await?;
         let response = tokio::select! { biased;
             _ = self.router().closed.cancelled() => return Err(VertxError::VertxClosed),
@@ -165,12 +198,13 @@ impl EventBus {
     fn prepare<T: Send + 'static>(
         &self,
         address: &str,
+        kind: RouteKind,
         body: T,
         headers: Headers,
         reply_to: Option<oneshot::Sender<Result<ErasedEnvelope>>>,
         request_id: Option<u64>,
     ) -> Result<(QueueSender, ErasedEnvelope)> {
-        let sender = self.router().select::<T>(address)?;
+        let sender = self.router().select(address, kind)?;
         let envelope = ErasedEnvelope {
             trace: MessageTrace::new(&self.router().diagnostics, address, request_id),
             body: Box::new(body),

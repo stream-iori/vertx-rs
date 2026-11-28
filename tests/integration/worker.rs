@@ -19,7 +19,8 @@ async fn worker_verticle_processes_messages(vx: Vertx) {
                     assert!(Context::is_on_worker_thread());
                     let n = *env.body() * 2;
                     env.reply(n)
-                })
+                })?;
+            Ok(())
         })
     })
     .await

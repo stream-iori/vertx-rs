@@ -1,6 +1,6 @@
 //! Route lifecycle, reentrant wakeups and admission accounting.
 
-use super::Router;
+use super::{RouteKind, Router};
 use crate::diagnostics::Diagnostics;
 use crate::eventbus::envelope::{ErasedEnvelope, MessageTrace};
 use crate::{ConsumerOptions, EventBus, Headers, VertxError};
@@ -23,7 +23,7 @@ async fn malformed_envelope_reports_conversion_failure_once(bus: EventBus) {
         .consumer_with::<u32>("typed", ConsumerOptions::new().with_capacity(1))
         .unwrap();
     bus.router()
-        .select::<u32>("typed")
+        .select("typed", RouteKind::message::<u32>())
         .unwrap()
         .try_reserve()
         .unwrap()
@@ -86,7 +86,11 @@ fn unregister_wakes_waiters_after_releasing_the_route_lock(bus: EventBus) {
         .consumer_with::<u32>("wake", ConsumerOptions::new().with_capacity(1))
         .unwrap();
     bus.try_send("wake", 1u32).unwrap();
-    let mut reservation = bus.router().select::<u32>("wake").unwrap().reserve();
+    let mut reservation = bus
+        .router()
+        .select("wake", RouteKind::message::<u32>())
+        .unwrap()
+        .reserve();
     let reenter = Arc::new(Reenter {
         router: bus.router().clone(),
         wakes: std::sync::atomic::AtomicUsize::new(0),

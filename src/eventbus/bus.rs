@@ -1,4 +1,4 @@
-use super::route::{Router, SubscriptionOwner};
+use super::route::{RouteKind, Router, SubscriptionOwner};
 use super::{Consumer, ConsumerOptions};
 use crate::deployment::ResourceRegistration;
 use crate::diagnostics::Diagnostics;
@@ -37,9 +37,10 @@ impl EventBus {
         &self.router
     }
     /// Immediately registers with capacity 256. A live address with a different
-    /// body type returns `TypeMismatch`. Registration binds to the bus Context, or
-    /// this instance's current Context; otherwise it is unbound and supports pull
-    /// receiving. Dropping the consumer unregisters it.
+    /// body type or a typed request protocol returns `TypeMismatch`.
+    /// Registration binds to the bus Context, or to this instance's current
+    /// Context when present. An unbound consumer supports pull receiving.
+    /// Dropping the consumer unregisters it.
     pub fn consumer<T: Send + 'static>(&self, address: &str) -> Result<Consumer<T>> {
         self.consumer_with(address, ConsumerOptions::default())
     }
@@ -50,6 +51,15 @@ impl EventBus {
         &self,
         address: &str,
         options: ConsumerOptions,
+    ) -> Result<Consumer<T>> {
+        self.consumer_for(address, options, RouteKind::message::<T>())
+    }
+
+    pub(super) fn consumer_for<T: Send + 'static>(
+        &self,
+        address: &str,
+        options: ConsumerOptions,
+        kind: RouteKind,
     ) -> Result<Consumer<T>> {
         options.validate()?;
         self.ensure_open()?;
@@ -70,7 +80,7 @@ impl EventBus {
             });
             let registration =
                 self.router
-                    .register::<T>(address, metadata, cancel, options.capacity())?;
+                    .register(address, kind, metadata, cancel, options.capacity())?;
             if let Some(admission) = &mut admission {
                 admission.register_resource(
                     registration.subscription.id,
